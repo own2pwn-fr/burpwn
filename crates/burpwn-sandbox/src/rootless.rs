@@ -1,27 +1,33 @@
 //! The production rootless [`SandboxRuntime`].
 //!
-//! ## Mechanism (validated by a spike on Fedora 43 / kernel 6.17, RUN AS THE
+//! ## Mechanism (validated end-to-end on Fedora 43 / kernel 6.17, RUN AS THE
 //! UNPRIVILEGED USER — do not redesign)
 //!
-//! 1. `fork()`. The CHILD calls
-//!    `unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWPID)`, then
-//!    blocks on a pipe waiting for the PARENT to write its uid/gid maps.
+//! 1. `fork()`. The CHILD calls `unshare(CLONE_NEWUSER | CLONE_NEWNET)` (we need
+//!    only the user namespace for scoped `CAP_NET_ADMIN` and the network
+//!    namespace for isolation; bwrap handles mount/pid isolation for the
+//!    command). It then signals the parent and blocks waiting for the maps.
 //! 2. The PARENT writes `/proc/<child>/uid_map = "0 <hostuid> 1"`,
 //!    `/proc/<child>/setgroups = "deny"`, `/proc/<child>/gid_map =
 //!    "0 <hostgid> 1"` — mapping the caller's uid→0 inside the new userns. This
 //!    grants `CAP_NET_ADMIN` SCOPED TO THE CHILD's netns, so `ip`/`nft` succeed
-//!    rootless inside it. The parent then signals the child via the pipe.
-//! 3. The CHILD, now uid 0 in its userns, sets up the netns with the EXACT
-//!    sequence the spike proved (a dummy `burp0` + default route is essential
-//!    for a sane source address), loads the [`crate::nft`] REDIRECT ruleset,
-//!    spawns the in-netns acceptor (binds `127.0.0.1:proxy_tcp_port`, recovers
-//!    `SO_ORIGINAL_DST`, fd-passes each client to the host proxy over
-//!    `proxy_sock`), and finally execs `bwrap` with the user command (NO
-//!    `--unshare-net`: bwrap must inherit the netns we created). CA env vars are
-//!    injected so HTTPS MITM is trusted.
-//! 4. Teardown is RAII: when the command exits the acceptor is killed, the child
-//!    reaped, and the netns + nft ruleset are freed when the child's namespace
-//!    fds drop. A `closed` guard makes Drop idempotent.
+//!    rootless inside it. The write is permitted ONLY after the child's unshare
+//!    lands, hence the handshake (writing earlier races → EPERM).
+//! 3. The CHILD does NO heavy work in the forked image (it was forked from a
+//!    multithreaded tokio process, so spawning subprocesses there fails — glibc
+//!    locks held by other threads at fork time; observed as `ip: ENOMEM`).
+//!    Instead it `execve`s itself as `burpwn __netns-agent`
+//!    ([`netns_agent_main`]). That FRESH, single-threaded image sets up the
+//!    netns with the EXACT sequence the spike proved (a dummy `burp0` + default
+//!    route is essential for a sane source address), loads the [`crate::nft`]
+//!    REDIRECT ruleset, binds the in-netns acceptor (`127.0.0.1:proxy_tcp_port`,
+//!    recovers `SO_ORIGINAL_DST`, fd-passes each client to the host proxy over
+//!    `proxy_sock`), then forks `bwrap` (NO `--unshare-net`: it inherits our
+//!    netns) for the user command while the agent keeps the acceptor alive. CA
+//!    env vars are injected so HTTPS MITM is trusted.
+//! 4. Teardown is RAII: when the command exits the acceptor is stopped, the
+//!    processes reaped, and the netns + nft ruleset are freed when the namespace
+//!    fds drop.
 //!
 //! ## CONFIRMED CONSTRAINT
 //!
@@ -44,6 +50,22 @@ use async_trait::async_trait;
 
 use crate::nft::redirect_ruleset;
 use crate::runtime::{ExecOutcome, ExecSpec, SandboxError, SandboxRuntime};
+
+/// argv[1] value the rootless runtime re-execs itself with: the binary's
+/// `main` must route this to [`netns_agent_main`] BEFORE clap parsing.
+pub const NETNS_AGENT_ARG: &str = "__netns-agent";
+
+/// Environment variable carrying the JSON-serialized [`ExecSpec`] to the
+/// re-exec'd `__netns-agent` helper.
+pub const SPEC_ENV: &str = "BURPWN_NETNS_SPEC";
+
+/// Entry point for the re-exec'd `__netns-agent` helper process. The binary's
+/// `main` calls this (and `std::process::exit`s with the returned code) when
+/// invoked as `burpwn __netns-agent`. Runs in a clean single-threaded image
+/// inside the userns+netns the parent created. See [`privileged::netns_agent_main`].
+pub fn netns_agent_main() -> i32 {
+    privileged::netns_agent_main()
+}
 
 /// Result of probing the host for the capabilities the rootless runtime needs.
 /// Backs the `burpwn doctor` CLI command.
@@ -294,27 +316,82 @@ mod privileged {
     use super::{gid_map_line, netns_setup_commands, uid_map_line};
 
     /// Run one command inside fresh namespaces and return its outcome. Blocking.
+    ///
+    /// Structure (the key to correctness): the forked child does ONLY
+    /// async-signal-safe work (unshare, two pipe syscalls, execve). All of the
+    /// heavy lifting — spawning `ip`/`nft`, binding the acceptor, forking bwrap —
+    /// happens AFTER the child `execve`s the clean [`netns_agent_main`] image.
+    /// Doing that work directly in the forked child of a multithreaded tokio
+    /// process is unsound: glibc locks held by other threads at fork time make
+    /// `std::process::Command` spawns fail (observed as `ip: ENOMEM`).
     pub fn run_command(spec: ExecSpec) -> Result<ExecOutcome, SandboxError> {
-        // Sync pipe: parent writes uid/gid maps, then signals the child to go on.
-        let (sync_r, sync_w) =
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        // Build the helper's argv + envp BEFORE forking (allocation in the
+        // multithreaded parent is safe; in the forked child it is not).
+        let spec_json = serde_json::to_string(&spec)
+            .map_err(|e| SandboxError::Runtime(format!("serialize spec: {e}")))?;
+        let exe = CString::new("/proc/self/exe").expect("no NUL");
+        let argv: Vec<CString> = vec![
+            CString::new("burpwn").expect("no NUL"),
+            CString::new(super::NETNS_AGENT_ARG).expect("no NUL"),
+        ];
+        let mut envp: Vec<CString> = std::env::vars_os()
+            .filter_map(|(k, v)| {
+                if k.as_bytes() == super::SPEC_ENV.as_bytes() {
+                    return None; // never inherit a stale spec var
+                }
+                let mut buf = k.as_bytes().to_vec();
+                buf.push(b'=');
+                buf.extend_from_slice(v.as_bytes());
+                CString::new(buf).ok()
+            })
+            .collect();
+        envp.push(
+            CString::new(format!("{}={}", super::SPEC_ENV, spec_json))
+                .map_err(|e| SandboxError::Runtime(format!("spec env: {e}")))?,
+        );
+
+        // Two pipes form a handshake. `ready`: child -> parent ("I have entered
+        // the new userns"). `go`: parent -> child ("your uid/gid maps are
+        // written, proceed"). The ordering is load-bearing: the kernel only
+        // permits the unprivileged single-uid map write AFTER the child has
+        // actually unshared CLONE_NEWUSER. Writing the map immediately after
+        // fork (before the child's unshare lands) races and fails with EPERM.
+        let (ready_r, ready_w) =
+            nix::unistd::pipe().map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
+        let (go_r, go_w) =
             nix::unistd::pipe().map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
 
         let host_uid = nix::unistd::getuid().as_raw();
         let host_gid = nix::unistd::getgid().as_raw();
 
-        // SAFETY: between fork and exec the child only calls async-signal-safe-ish
-        // operations; it does not touch the tokio runtime (we are inside
-        // spawn_blocking, not an async context).
+        // SAFETY: between fork and execve the child only calls async-signal-safe
+        // operations (unshare, write, read, execve); it does not allocate or
+        // touch the tokio runtime.
         match unsafe { fork() }.map_err(|e| SandboxError::Runtime(format!("fork: {e}")))? {
             ForkResult::Child => {
-                drop(sync_w);
-                child_after_fork(sync_r, spec);
-                // child_after_fork execs or _exit()s; if it returns we failed.
+                drop(ready_r);
+                drop(go_w);
+                // We need only NEWUSER (for scoped CAP_NET_ADMIN) + NEWNET (the
+                // isolated network). bwrap handles mount/pid isolation for the
+                // command itself.
+                if unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET).is_err() {
+                    unsafe { libc::_exit(126) };
+                }
+                let _ = nix::unistd::write(&ready_w, &[1u8]);
+                let mut b = [0u8; 1];
+                let _ = nix::unistd::read(go_r.as_raw_fd(), &mut b);
+                // Become the clean single-threaded helper image. uid/gid maps
+                // are now in place, so we are uid 0 in the userns.
+                let _ = nix::unistd::execve(&exe, &argv, &envp);
                 unsafe { libc::_exit(127) };
             }
             ForkResult::Parent { child } => {
-                drop(sync_r);
-                let res = parent_setup_maps(child, host_uid, host_gid, sync_w);
+                drop(ready_w);
+                drop(go_r);
+                let res = parent_setup_maps(child, host_uid, host_gid, ready_r, go_w);
                 if let Err(e) = res {
                     let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(child, None);
@@ -325,21 +402,102 @@ mod privileged {
         }
     }
 
-    /// PARENT: write the uid/gid maps for the child userns then close the pipe
-    /// (closing signals the blocked child to proceed).
+    /// Entry point of the re-exec'd `__netns-agent` helper. Runs in a FRESH,
+    /// single-threaded process image inside the userns+netns the parent set up,
+    /// so spawning `ip`/`nft`/`bwrap` is safe. Reads the [`ExecSpec`] from the
+    /// environment, configures the netns, binds the acceptor, forks the command
+    /// under bwrap, and serves connection hand-offs until it exits. Returns the
+    /// command's exit code (the binary calls `std::process::exit` with it).
+    pub fn netns_agent_main() -> i32 {
+        let spec: ExecSpec = match std::env::var(super::SPEC_ENV)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(s) => s,
+            None => {
+                eprintln!("burpwn __netns-agent: missing/invalid {}", super::SPEC_ENV);
+                return 125;
+            }
+        };
+
+        if let Err(e) = setup_netns(&spec) {
+            eprintln!("burpwn __netns-agent: netns setup failed: {e}");
+            return 124;
+        }
+
+        let tcp_port = spec.proxy_tcp_port;
+        let listener = match TcpListener::bind(("127.0.0.1", tcp_port)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("burpwn __netns-agent: bind 127.0.0.1:{tcp_port} failed: {e}");
+                return 123;
+            }
+        };
+
+        // Fork the command under bwrap as a separate process — the acceptor must
+        // live in a process that does NOT exec (exec replaces the whole image,
+        // killing the listener the instant the command starts).
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                drop(listener);
+                exec_bwrap(&spec);
+                unsafe { libc::_exit(127) };
+            }
+            Ok(ForkResult::Parent { child: cmd_pid }) => {
+                let proxy_sock = spec.proxy_sock.clone();
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_thread = Arc::clone(&stop);
+                let acceptor =
+                    thread::spawn(move || run_acceptor(listener, &proxy_sock, &stop_thread));
+
+                let code = match nix::sys::wait::waitpid(cmd_pid, None) {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, c)) => c,
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                    _ => 127,
+                };
+                stop.store(true, Ordering::Relaxed);
+                // Nudge the blocking accept() so the loop observes `stop`.
+                let _ = std::net::TcpStream::connect(("127.0.0.1", tcp_port));
+                let _ = acceptor.join();
+                code
+            }
+            Err(e) => {
+                eprintln!("burpwn __netns-agent: command fork failed: {e}");
+                122
+            }
+        }
+    }
+
+    /// PARENT: wait until the child has entered its new userns, write the
+    /// uid/gid maps, then signal the child to proceed (by closing `go_w`).
     fn parent_setup_maps(
         child: nix::unistd::Pid,
         host_uid: u32,
         host_gid: u32,
-        sync_w: std::os::fd::OwnedFd,
+        ready_r: std::os::fd::OwnedFd,
+        go_w: std::os::fd::OwnedFd,
     ) -> Result<(), SandboxError> {
+        // Block until the child signals it has unshared CLONE_NEWUSER. A
+        // zero-length read (EOF) means the child died before signalling.
+        let mut ready = std::fs::File::from(ready_r);
+        let mut buf = [0u8; 1];
+        match ready.read(&mut buf) {
+            Ok(0) => {
+                return Err(SandboxError::Runtime(
+                    "child exited before entering the user namespace (unshare failed)".into(),
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => return Err(SandboxError::Runtime(format!("ready pipe: {e}"))),
+        }
+
         let pid = child.as_raw();
         write_proc(pid, "uid_map", &uid_map_line(host_uid))?;
         // setgroups must be denied before writing gid_map in a single-uid userns.
         write_proc(pid, "setgroups", "deny")?;
         write_proc(pid, "gid_map", &gid_map_line(host_gid))?;
-        // Closing the pipe signals the child.
-        drop(sync_w);
+        // Closing `go_w` (drop) signals the child to proceed.
+        drop(go_w);
         Ok(())
     }
 
@@ -347,46 +505,6 @@ mod privileged {
         let path = format!("/proc/{pid}/{file}");
         std::fs::write(&path, contents)
             .map_err(|e| SandboxError::Runtime(format!("write {path}: {e}")))
-    }
-
-    /// CHILD (after fork): unshare the namespaces, wait for the parent's maps,
-    /// set up the netns, spawn the acceptor, and exec bwrap. Never returns on
-    /// success (execs); on failure it _exit()s with 127 via the caller.
-    fn child_after_fork(sync_r: std::os::fd::OwnedFd, spec: ExecSpec) {
-        let flags = CloneFlags::CLONE_NEWUSER
-            | CloneFlags::CLONE_NEWNET
-            | CloneFlags::CLONE_NEWNS
-            | CloneFlags::CLONE_NEWPID;
-        if unshare(flags).is_err() {
-            return;
-        }
-        // Block until the parent has written our uid/gid maps (it closes the
-        // pipe to signal us — a zero-length read returns).
-        let mut f = std::fs::File::from(sync_r);
-        let mut buf = [0u8; 1];
-        let _ = f.read(&mut buf);
-
-        // We are now uid 0 in our userns with CAP_NET_ADMIN scoped to this netns.
-        if setup_netns(&spec).is_err() {
-            return;
-        }
-
-        // Spawn the in-netns acceptor (its own thread; lives until the child
-        // exits, which the kernel tears down with the netns).
-        let proxy_sock = spec.proxy_sock.clone();
-        let tcp_port = spec.proxy_tcp_port;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = Arc::clone(&stop);
-        let _acceptor = thread::spawn(move || {
-            run_acceptor(tcp_port, &proxy_sock, &stop_thread);
-        });
-
-        // Exec bwrap with the user command (replaces this process image, so the
-        // acceptor thread dies with the netns when bwrap exits — handled by the
-        // parent reaping and the kernel reclaiming the namespace).
-        exec_bwrap(&spec);
-        stop.store(true, Ordering::Relaxed);
-        // If exec returns we failed; caller _exit()s.
     }
 
     /// Run the EXACT spike-proven `ip` sequence then load the nft ruleset.
@@ -438,10 +556,7 @@ mod privileged {
     /// The in-netns acceptor: bind `127.0.0.1:tcp_port`, accept clients, recover
     /// `SO_ORIGINAL_DST`, and hand each client fd to the host proxy over the
     /// unix socket using SCM_RIGHTS + the [`crate::wire`] header.
-    fn run_acceptor(tcp_port: u16, proxy_sock: &std::path::Path, stop: &AtomicBool) {
-        let Ok(listener) = TcpListener::bind(("127.0.0.1", tcp_port)) else {
-            return;
-        };
+    fn run_acceptor(listener: TcpListener, proxy_sock: &std::path::Path, stop: &AtomicBool) {
         for client in listener.incoming() {
             if stop.load(Ordering::Relaxed) {
                 break;

@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// Errors from the sandbox runtime layer.
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +38,11 @@ pub enum SandboxError {
 }
 
 /// Parameters used to run one command inside a fresh sandbox.
-#[derive(Debug, Clone)]
+///
+/// Serializable so the host runtime can hand it to the `__netns-agent` helper
+/// process (the forked child `execve`s a clean single-threaded image before
+/// spawning `ip`/`nft`/`bwrap`, avoiding the multithreaded-fork allocator hazard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecSpec {
     /// The command and its arguments (argv[0] is the program).
     pub argv: Vec<String>,

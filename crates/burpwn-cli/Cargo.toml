@@ -24,3 +24,8 @@ burpwn-tls.workspace = true
 burpwn-proxy.workspace = true
 burpwn-sandbox.workspace = true
 burpwn-wrap.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rustls.workspace = true

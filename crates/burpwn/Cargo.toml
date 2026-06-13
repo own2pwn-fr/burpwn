@@ -21,3 +21,4 @@ tracing-subscriber.workspace = true
 rustls.workspace = true
 burpwn-cli.workspace = true
 burpwn-mcp.workspace = true
+burpwn-sandbox.workspace = true

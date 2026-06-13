@@ -31,6 +31,8 @@ pub mod runtime;
 pub mod wire;
 
 pub use nft::redirect_ruleset;
-pub use rootless::{doctor, Preflight, RootlessRuntime};
+pub use rootless::{
+    doctor, netns_agent_main, Preflight, RootlessRuntime, NETNS_AGENT_ARG, SPEC_ENV,
+};
 pub use runtime::{ExecOutcome, ExecSpec, MockRuntime, SandboxError, SandboxRuntime};
 pub use wire::{PassedConn, WireError, L4};
