@@ -434,6 +434,22 @@ mod privileged {
             }
         };
 
+        // Bind the in-netns DNS socket (the nftables `udp/53` redirect target)
+        // and hand it to the host proxy ONCE — the host serves DNS over it (it
+        // has real upstream connectivity; the netns has none). Keep our copy
+        // open for the command's lifetime so the kernel socket stays alive.
+        let dns_sock = std::net::UdpSocket::bind(("127.0.0.1", spec.proxy_dns_port)).ok();
+        if let Some(ref udp) = dns_sock {
+            let meta = PassedConn {
+                dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                dst_port: 53,
+                l4: L4::Udp,
+            };
+            if let Err(e) = send_fd(udp.as_raw_fd(), meta, &spec.proxy_sock) {
+                eprintln!("burpwn __netns-agent: DNS socket hand-off failed: {e}");
+            }
+        }
+
         // Fork the command under bwrap as a separate process — the acceptor must
         // live in a process that does NOT exec (exec replaces the whole image,
         // killing the listener the instant the command starts).
@@ -585,11 +601,20 @@ mod privileged {
             dst_port,
             l4: L4::Tcp,
         };
-        let header = meta.encode();
+        send_fd(client.as_raw_fd(), meta, proxy_sock)
+    }
 
+    /// Pass one fd (TCP client socket, or the in-netns UDP/53 socket) to the
+    /// host proxy over `proxy_sock` via SCM_RIGHTS + the [`crate::wire`] header.
+    fn send_fd(
+        fd: RawFd,
+        meta: PassedConn,
+        proxy_sock: &std::path::Path,
+    ) -> Result<(), SandboxError> {
+        let header = meta.encode();
         let proxy = UnixStream::connect(proxy_sock)
             .map_err(|e| SandboxError::Io(format!("connect proxy_sock: {e}")))?;
-        let fds: [RawFd; 1] = [client.as_raw_fd()];
+        let fds: [RawFd; 1] = [fd];
         let cmsg = [ControlMessage::ScmRights(&fds)];
         let iov = [std::io::IoSlice::new(&header)];
         // No destination address (the unix socket is already connected); the

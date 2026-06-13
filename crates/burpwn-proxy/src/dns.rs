@@ -66,12 +66,29 @@ fn host_upstream() -> SocketAddr {
 
 /// Bind a UDP DNS server on `addr` and serve until the socket errors.
 pub async fn serve(addr: SocketAddr, cfg: DnsConfig, writer: WriteHandle) -> std::io::Result<()> {
-    let sock = Arc::new(UdpSocket::bind(addr).await?);
+    let sock = UdpSocket::bind(addr).await?;
     tracing::info!(%addr, upstream = %cfg.upstream, "DNS front-end listening");
+    serve_socket(sock, cfg, writer).await
+}
+
+/// Serve DNS over an ALREADY-BOUND socket — used for the transparent sandbox
+/// path, where the in-netns agent binds `127.0.0.1:dns_port` (the nftables
+/// `udp/53` redirect target) and passes the fd to the host proxy via SCM_RIGHTS.
+/// Stops after [`IDLE_TIMEOUT`] with no query, which bounds the per-exec task
+/// leak once the sandbox netns is gone (the passed fd then never sees traffic).
+pub async fn serve_socket(
+    sock: UdpSocket,
+    cfg: DnsConfig,
+    writer: WriteHandle,
+) -> std::io::Result<()> {
+    let sock = Arc::new(sock);
     let cfg = Arc::new(cfg);
     let mut buf = vec![0u8; 4096];
     loop {
-        let (n, peer) = sock.recv_from(&mut buf).await?;
+        let (n, peer) = match tokio::time::timeout(IDLE_TIMEOUT, sock.recv_from(&mut buf)).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(()), // idle → stop serving this socket
+        };
         let query = buf[..n].to_vec();
         let sock = sock.clone();
         let cfg = cfg.clone();
@@ -83,6 +100,9 @@ pub async fn serve(addr: SocketAddr, cfg: DnsConfig, writer: WriteHandle) -> std
         });
     }
 }
+
+/// Stop serving a (passed) DNS socket after this long with no query.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 async fn handle_query(
     sock: &UdpSocket,

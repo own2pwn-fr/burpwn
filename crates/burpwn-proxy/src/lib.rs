@@ -330,14 +330,19 @@ impl Proxy {
 
     /// Turn a passed raw fd + metadata into a tokio stream and dispatch it.
     async fn dispatch_passed(self: Arc<Self>, fd: RawFd, conn: PassedConn) -> anyhow::Result<()> {
-        // UDP datagram sockets are handled by the DNS path; the SCM front-end is
-        // for TCP. A UDP fd here is unexpected — close it.
+        // A passed UDP socket is the in-netns DNS socket (bound on the udp/53
+        // redirect target inside the sandbox). Serve DNS over it from the host,
+        // which has real upstream connectivity.
         if conn.l4 == L4::Udp {
-            // SAFETY: fd was just received and is owned by us; closing reclaims it.
-            unsafe {
-                libc::close(fd);
-            }
-            return Ok(());
+            // SAFETY: `fd` is a freshly-received, owned UDP socket bound in the
+            // sandbox netns; operations on it act in that netns by construction.
+            let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            std_sock.set_nonblocking(true)?;
+            let sock = tokio::net::UdpSocket::from_std(std_sock)?;
+            let cfg = crate::dns::DnsConfig::from_host(self.workspace_id, self.exec_id.clone());
+            return crate::dns::serve_socket(sock, cfg, self.writer.clone())
+                .await
+                .map_err(Into::into);
         }
         // SAFETY: `fd` is a freshly-received, owned accepted TCP socket.
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
