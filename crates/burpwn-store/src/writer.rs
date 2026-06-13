@@ -26,6 +26,24 @@ use crate::model::{FlowStart, InterceptState, NewMatchReplaceRule, RequestData, 
 /// unbounded memory growth; senders `.await` when full (back-pressure).
 pub const DEFAULT_CHANNEL_CAP: usize = 8192;
 
+/// Per-body store cap (bytes). A stored request/response body — and the FTS text
+/// derived from it — is truncated to this length before persisting, so a hostile
+/// origin streaming large/incompressible bodies cannot grow `session.db`
+/// unbounded (FTS roughly doubles each stored body).
+///
+/// This is a defensive *backstop*: the proxy already truncates the stored copy to
+/// its own `http::BODY_CAP` (8 MiB) before it ever reaches the writer, so in the
+/// normal path bodies are already well under this cap. We set it a notch higher
+/// (16 MiB) so it only ever fires for callers that bypass the proxy's cap (e.g.
+/// raw-chunk streamers, future direct writers).
+pub const MAX_STORE_BODY: usize = 16 * 1024 * 1024;
+
+/// Truncate `b` to at most [`MAX_STORE_BODY`] bytes for storage. Returns a
+/// borrowed slice (no copy) so the common under-cap path is free.
+fn cap_body(b: &[u8]) -> &[u8] {
+    &b[..b.len().min(MAX_STORE_BODY)]
+}
+
 /// A reply channel for ops that produce a generated id.
 pub type IdReply = oneshot::Sender<Result<i64>>;
 
@@ -602,8 +620,12 @@ fn do_flow_start(conn: &Connection, f: &FlowStart) -> Result<i64> {
 }
 
 fn do_request(conn: &Connection, flow_id: i64, d: &RequestData) -> Result<()> {
+    // Cap the stored body (and the FTS text derived from it below) to
+    // MAX_STORE_BODY so a hostile origin cannot grow session.db unbounded. The
+    // proxy already caps to its own BODY_CAP; this is a defensive backstop.
+    let body = cap_body(&d.body);
     let headers_id = BlobStore::put_opt(conn, blob_opt(&d.headers))?;
-    let body_id = BlobStore::put_opt(conn, blob_opt(&d.body))?;
+    let body_id = BlobStore::put_opt(conn, blob_opt(body))?;
     conn.execute(
         "INSERT INTO requests(flow_id, method, authority, path, http_version, headers_blob_id, body_blob_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -621,16 +643,18 @@ fn do_request(conn: &Connection, flow_id: i64, d: &RequestData) -> Result<()> {
             body_id,
         ],
     )?;
-    // Feed FTS with url + host + decoded body text.
+    // Feed FTS with url + host + decoded (capped) body text.
     let mut text = format!("{} {}\n{}\n", d.method, d.path, d.authority);
-    text.push_str(&String::from_utf8_lossy(&d.body));
+    text.push_str(&String::from_utf8_lossy(body));
     index_fts(conn, flow_id, FtsKind::Request, &text)?;
     Ok(())
 }
 
 fn do_response(conn: &Connection, flow_id: i64, d: &ResponseData) -> Result<()> {
+    // Cap the stored body (and its FTS text) to MAX_STORE_BODY — see do_request.
+    let body = cap_body(&d.body);
     let headers_id = BlobStore::put_opt(conn, blob_opt(&d.headers))?;
-    let body_id = BlobStore::put_opt(conn, blob_opt(&d.body))?;
+    let body_id = BlobStore::put_opt(conn, blob_opt(body))?;
     conn.execute(
         "INSERT INTO responses(flow_id, status, http_version, headers_blob_id, body_blob_id, timing_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -652,7 +676,7 @@ fn do_response(conn: &Connection, flow_id: i64, d: &ResponseData) -> Result<()> 
     let mut text = format!("{}\n", d.status);
     text.push_str(&String::from_utf8_lossy(&d.headers));
     text.push('\n');
-    text.push_str(&String::from_utf8_lossy(&d.body));
+    text.push_str(&String::from_utf8_lossy(body));
     index_fts(conn, flow_id, FtsKind::Response, &text)?;
     Ok(())
 }
@@ -667,7 +691,10 @@ fn do_flow_end(conn: &Connection, flow_id: i64, ts_end: i64) -> Result<()> {
 
 fn do_raw_chunk(conn: &Connection, flow_id: i64, bytes: &[u8]) -> Result<()> {
     // Raw chunks live as blobs referenced from notes-like FTS only; we keep the
-    // bytes deduplicated and index their (best-effort) text.
+    // bytes deduplicated and index their (best-effort) text. Cap the stored
+    // chunk (and its FTS text) to MAX_STORE_BODY so a hostile peer streaming a
+    // huge raw chunk cannot grow session.db unbounded.
+    let bytes = cap_body(bytes);
     BlobStore::put(conn, bytes)?;
     index_fts(conn, flow_id, FtsKind::Raw, &String::from_utf8_lossy(bytes))?;
     Ok(())
@@ -816,5 +843,27 @@ fn blob_opt(b: &[u8]) -> Option<&[u8]> {
         None
     } else {
         Some(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_body_truncates_oversize_and_leaves_small_untouched() {
+        // Under the cap: returned verbatim (no copy, same slice contents).
+        let small = vec![0xAB_u8; 1024];
+        assert_eq!(cap_body(&small).len(), small.len());
+
+        // At the cap: kept whole.
+        let exact = vec![0xCD_u8; MAX_STORE_BODY];
+        assert_eq!(cap_body(&exact).len(), MAX_STORE_BODY);
+
+        // Over the cap: truncated to exactly MAX_STORE_BODY.
+        let huge = vec![0xEF_u8; MAX_STORE_BODY + 4096];
+        let capped = cap_body(&huge);
+        assert_eq!(capped.len(), MAX_STORE_BODY);
+        assert_eq!(capped, &huge[..MAX_STORE_BODY]);
     }
 }

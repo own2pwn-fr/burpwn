@@ -3,7 +3,58 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.1] - 2026-06-13
+
+A fourth, exhaustive security pass (5 parallel audits across every crate) plus the
+fixes it surfaced. Build, clippy and the full test suite are green; the live
+end-to-end path (`burpwn exec -- curl https://…`, MITM capture, match-replace,
+intercept, structured errors) was re-validated against a real rootless sandbox.
+
+### Security
+- **Sandbox control-plane isolation** (`burpwn-sandbox`): the per-session run dir
+  (`proxy.sock` + `control.sock`) is now masked with a `tmpfs` inside bubblewrap.
+  A unix-socket `connect()` is not IP traffic, so the nft egress rules never
+  covered it — a wrapped command could previously reach `proxy.sock` to forge
+  capture-attribution headers or `control.sock` to drive the daemon. Now neither
+  is reachable from inside the sandbox (the in-netns acceptor lives in the agent
+  process, outside bwrap, and still reaches `proxy.sock`).
+- **Host-secret confinement** (`burpwn-cli`): `burpwn exec` no longer forwards the
+  operator's full environment into the sandbox. It now ships only an allowlist
+  (`PATH`, `HOME`, `TERM`, `LANG`, `LC_*`, proxy vars, `BURPWN_*`, …); secrets
+  such as `AWS_*`, `*_TOKEN`, `*_API_KEY`, `SSH_AUTH_SOCK` are dropped so an
+  untrusted wrapped tool with proxy egress cannot exfiltrate them.
+- **Capture-bypass on bash** (`burpwn-wrap`): `BURPWN_AUTO=1` auto-capture is now
+  zsh-only. On bash the DEBUG-trap could not cancel the typed line, so the command
+  ran twice — once captured, once outside the sandbox; bash now stays tip-only.
+- **Hook-config clobber** (`burpwn-wrap`): burpwn's own hook is matched by an
+  anchored `<bin> wrap-hook --agent` signature instead of a bare `wrap-hook`
+  substring, so a user hook merely mentioning that string is no longer
+  overwritten/deleted on `init`/`uninstall`.
+- **Path-traversal hardening** (`burpwn-cli`/`burpwn-mcp`): `burpwn mcp --session`
+  and the `current`-pointer read path now validate the session name; control-plane
+  header edits reject CR/LF/NUL (no request-line injection upstream).
+- Sandbox: `--new-session` (TTY/TIOCSTI injection), size-capped `/tmp` tmpfs,
+  `O_CLOEXEC` handshake/capture pipes, `RLIMIT_CORE=0` on the wrapped command.
+- TLS: SNI length-capped before minting a leaf, IP-literal SNI now emits an
+  `iPAddress` SAN, CA data dir tightened to `0700` and the key mode re-checked on
+  load.
+
+### Fixed
+- **Proxy DoS bounds** (`burpwn-proxy`): forwarded request/response bodies are now
+  capped (`http_body_util::Limited`, 413/502 on overflow) instead of buffered
+  unbounded; added header-read / upstream connect+exchange timeouts; the upstream
+  driver task is aborted on cancellation; half-open WebSocket/raw-TCP splices are
+  torn down after a drain grace instead of leaking a task forever.
+- **Store robustness** (`burpwn-store`): zstd blob decompression is bounded
+  (decompression-bomb guard), per-body store size is capped, the read pool
+  re-asserts `PRAGMA query_only` on every checkout, and status/port reads use
+  checked conversions.
+- **Structured errors** (`burpwn-cli`): in `--json` mode a top-level error is now
+  emitted as the `{ok:false,data:null,error}` envelope on stdout (an agent always
+  parses a structured result) instead of a plain-text `burpwn: …` line.
+- DNS replies are dropped when their transaction id does not match the query.
+
+## [0.1.0] - 2026-06-13
 
 ### Added
 - **Rootless transparent sandbox** (`burpwn-sandbox`): each `burpwn exec` runs a command in its own

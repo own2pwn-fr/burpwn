@@ -81,6 +81,11 @@ impl CertAuthority {
 
     /// Parse an existing CA from its two files.
     fn load(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        // The key was written 0600 at generation; verify it is still owner-only
+        // and repair it if a later operation loosened the bits. Don't fail hard
+        // if the repair can't be applied (e.g. odd filesystem) — just warn.
+        ensure_key_mode_0600(key_path);
+
         let cert_pem = fs::read_to_string(cert_path).map_err(|e| TlsError::io(cert_path, e))?;
         let key_pem = fs::read_to_string(key_path).map_err(|e| TlsError::io(key_path, e))?;
 
@@ -111,6 +116,14 @@ impl CertAuthority {
     /// Generate a brand-new CA, persist it, and return it.
     fn generate_and_store(dir: &Path, cert_path: &Path, key_path: &Path) -> Result<Self> {
         fs::create_dir_all(dir).map_err(|e| TlsError::io(dir, e))?;
+        // Lock the data dir down to 0700 — it holds the CA private key. Best
+        // effort: a pre-existing dir created under a looser umask is tightened
+        // here. (`create_dir_all` honors umask, so we set the mode explicitly.)
+        let mut dir_perms = fs::metadata(dir)
+            .map_err(|e| TlsError::io(dir, e))?
+            .permissions();
+        dir_perms.set_mode(0o700);
+        fs::set_permissions(dir, dir_perms).map_err(|e| TlsError::io(dir, e))?;
 
         let key = KeyPair::generate()?; // ECDSA P-256 by default
         let params = ca_params()?;
@@ -185,6 +198,32 @@ fn ca_params() -> Result<CertificateParams> {
     params.not_after = validity.not_after;
 
     Ok(params)
+}
+
+/// Verify the CA key file is still `0600` on load, repairing (and warning) if
+/// the mode has been loosened. Best effort: a metadata or chmod failure is
+/// logged but never fatal — a readable key is still usable, just less safe.
+fn ensure_key_mode_0600(key_path: &Path) {
+    let meta = match fs::metadata(key_path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(path = %key_path.display(), error = %e,
+                "could not stat CA key to verify permissions");
+            return;
+        }
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode == 0o600 {
+        return;
+    }
+    tracing::warn!(path = %key_path.display(), found = format_args!("{mode:o}"),
+        "CA key permissions loosened from 0600; tightening");
+    let mut perms = meta.permissions();
+    perms.set_mode(0o600);
+    if let Err(e) = fs::set_permissions(key_path, perms) {
+        tracing::warn!(path = %key_path.display(), error = %e,
+            "failed to re-tighten CA key permissions to 0600");
+    }
 }
 
 /// Extract the first CERTIFICATE block of a PEM string as owned DER.
@@ -270,6 +309,30 @@ mod tests {
             not_after > now,
             "CA not_after {not_after} must be in the future"
         );
+    }
+
+    #[test]
+    fn data_dir_is_0700_after_generate() {
+        let dir = TempDir::new().unwrap();
+        let _ = CertAuthority::load_or_generate(dir.path()).unwrap();
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "CA data dir must be owner-only");
+    }
+
+    #[test]
+    fn loosened_key_is_repaired_on_load() {
+        let dir = TempDir::new().unwrap();
+        let _ = CertAuthority::load_or_generate(dir.path()).unwrap();
+        let key_path = dir.path().join(CA_KEY_FILE);
+
+        // Loosen the key to world-readable, then load: it must be re-tightened.
+        let mut perms = fs::metadata(&key_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&key_path, perms).unwrap();
+
+        let _ = CertAuthority::load_or_generate(dir.path()).unwrap();
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "loosened key must be repaired to 0600");
     }
 
     #[test]

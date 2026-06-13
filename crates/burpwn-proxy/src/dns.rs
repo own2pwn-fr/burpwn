@@ -180,7 +180,27 @@ async fn forward_upstream(query: &[u8], cfg: &DnsConfig) -> std::io::Result<Vec<
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "dns upstream timeout"))??;
     buf.truncate(n);
+
+    // Bind the reply to the query's transaction id. The socket is `connect`ed so
+    // only the configured upstream can reach it (low risk), but a mismatched id
+    // means the datagram is not the answer to THIS query — drop it rather than
+    // relay a stray/spoofed response to the client. Best-effort: if either side
+    // is undecodable we let the bytes through (decode is for logging only).
+    if let (Some(qid), Some(rid)) = (message_id(query), message_id(&buf)) {
+        if qid != rid {
+            tracing::debug!(qid, rid, "dns reply id mismatch; dropping");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "dns upstream reply id mismatch",
+            ));
+        }
+    }
     Ok(buf)
+}
+
+/// Decode just the 16-bit transaction id of a DNS message, best-effort.
+fn message_id(bytes: &[u8]) -> Option<u16> {
+    Message::from_vec(bytes).ok().map(|m| m.id())
 }
 
 /// Decode the (name, type) of the first question, best-effort.
@@ -267,9 +287,11 @@ mod tests {
         let upstream = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
 
+        // The answer MUST echo the query's transaction id (0x1234, from
+        // `sample_query`) or `forward_upstream` now drops it as a mismatch.
         let answer_bytes = {
             let mut msg = Message::new();
-            msg.set_id(0xBEEF).set_message_type(MessageType::Response);
+            msg.set_id(0x1234).set_message_type(MessageType::Response);
             msg.to_vec().unwrap()
         };
         let answer_for_task = answer_bytes.clone();
@@ -289,5 +311,36 @@ mod tests {
         let query = sample_query("forward.test.");
         let got = forward_upstream(&query, &cfg).await.unwrap();
         assert_eq!(got, answer_bytes);
+    }
+
+    // Regression: an upstream reply whose transaction id does not match the query
+    // must be dropped (returned as an error) rather than relayed to the client.
+    #[tokio::test]
+    async fn drops_reply_with_mismatched_id() {
+        let upstream = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        // Canned answer carries a DIFFERENT id than the query (0x1234).
+        let answer_bytes = {
+            let mut msg = Message::new();
+            msg.set_id(0xBEEF).set_message_type(MessageType::Response);
+            msg.to_vec().unwrap()
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            if let Ok((_, peer)) = upstream.recv_from(&mut buf).await {
+                let _ = upstream.send_to(&answer_bytes, peer).await;
+            }
+        });
+
+        let cfg = DnsConfig {
+            upstream: upstream_addr,
+            workspace_id: 1,
+            exec_id: None,
+            timeout: Duration::from_secs(2),
+        };
+        let query = sample_query("mismatch.test.");
+        let err = forward_upstream(&query, &cfg).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

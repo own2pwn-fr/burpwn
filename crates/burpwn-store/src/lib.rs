@@ -97,7 +97,13 @@ impl Store {
         let manager = SqliteConnectionManager::file(path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_init(|c| c.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;"));
-        let pool = Pool::builder().build(manager)?;
+        // `with_init` runs once per physical connection. Register a customizer
+        // that re-asserts `query_only = ON` on every checkout, so a pooled
+        // "reader" can never silently become a writer (e.g. if some code path
+        // ever flipped the pragma off on a connection handed back to the pool).
+        let pool = Pool::builder()
+            .connection_customizer(Box::new(ReadOnlyCustomizer))
+            .build(manager)?;
 
         // 3. Spawn the writer task, owning the write connection.
         let (tx, rx) = mpsc::channel::<WriteOp>(capacity);
@@ -135,6 +141,21 @@ fn configure_connection(conn: &Connection, writer: bool) -> Result<()> {
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
     }
     Ok(())
+}
+
+/// Re-asserts `PRAGMA query_only = ON` on every read-pool checkout.
+///
+/// `r2d2`'s `with_init` only runs once per physical connection, so on its own it
+/// cannot guarantee a recycled connection is still read-only. This customizer's
+/// `on_acquire` runs on every checkout, so a pooled reader can never silently
+/// become a writer — any write attempt through it errors at the SQLite layer.
+#[derive(Debug)]
+struct ReadOnlyCustomizer;
+
+impl r2d2::CustomizeConnection<Connection, rusqlite::Error> for ReadOnlyCustomizer {
+    fn on_acquire(&self, conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
+        conn.execute_batch("PRAGMA query_only = ON;")
+    }
 }
 
 #[cfg(test)]
@@ -634,6 +655,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), N);
+    }
+
+    #[tokio::test]
+    async fn read_pool_connection_is_read_only_on_checkout() {
+        // Finding #2 regression: a pooled read connection must refuse writes,
+        // and the customizer re-asserts this on every checkout (not just once).
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+
+        // Exercise several checkouts: each must come back read-only.
+        for _ in 0..3 {
+            let reader = store.reader();
+            let conn = reader.pool_conn_for_test();
+            let err = conn
+                .execute(
+                    "INSERT INTO workspaces(name, created_at) VALUES ('x', 0)",
+                    [],
+                )
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("read") || msg.contains("readonly") || msg.contains("query_only"),
+                "write through a read-pool connection must be refused, got: {msg}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -89,13 +89,24 @@ pub fn uninstall(agent: Agent, home: &std::path::Path) -> Result<(), WrapError> 
 // ---------------------------------------------------------------------------
 
 /// Read a JSON config file, returning an empty object if absent.
+///
+/// A file that parses to valid JSON which is NOT an object (e.g. a top-level
+/// array or scalar a user authored) is rejected with [`WrapError::NonObjectRoot`]
+/// rather than silently clobbered — agent configs are objects, and merging would
+/// otherwise have to discard the user's content.
 fn read_json(path: &std::path::Path) -> Result<Value, WrapError> {
-    match std::fs::read_to_string(path) {
-        Ok(s) if s.trim().is_empty() => Ok(Value::Object(Default::default())),
-        Ok(s) => Ok(serde_json::from_str(&s)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Default::default())),
-        Err(e) => Err(WrapError::Io(e)),
+    let value = match std::fs::read_to_string(path) {
+        Ok(s) if s.trim().is_empty() => return Ok(Value::Object(Default::default())),
+        Ok(s) => serde_json::from_str::<Value>(&s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Value::Object(Default::default()))
+        }
+        Err(e) => return Err(WrapError::Io(e)),
+    };
+    if !value.is_object() {
+        return Err(WrapError::NonObjectRoot(path.display().to_string()));
     }
+    Ok(value)
 }
 
 /// Pretty-print `value` to `path`, creating parent dirs.
@@ -122,6 +133,10 @@ fn ensure_array<'a>(root: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
 }
 
 /// Navigate/create `root.hooks` as an object.
+///
+/// Callers obtain `root` from [`read_json`], which guarantees an object root
+/// (non-object roots are rejected as [`WrapError::NonObjectRoot`]); the
+/// coercion below is a belt-and-suspenders guard and is not expected to fire.
 fn ensure_hooks_obj(root: &mut Value) -> &mut Value {
     if !root.is_object() {
         *root = Value::Object(Default::default());
@@ -136,9 +151,28 @@ fn ensure_hooks_obj(root: &mut Value) -> &mut Value {
     hooks
 }
 
-/// True if `entry`'s installed command refers to burpwn's `wrap-hook` helper.
+/// True if `cmd` is one of burpwn's OWN installed hook invocations.
+///
+/// Recognised by the exact structure [`hooks::wrap_hook_invocation`] generates:
+/// `<burpwn-bin> wrap-hook --agent <slug>`. We anchor on the *token sequence*
+/// `wrap-hook` (as the subcommand, i.e. the second token) immediately followed
+/// by `--agent` — NOT on a bare `contains("wrap-hook")` substring. The substring
+/// form misclassified unrelated user hooks whose command merely mentioned
+/// `wrap-hook` (e.g. `~/bin/my-wrap-hook.sh`), clobbering/deleting them on
+/// init/uninstall and violating the merge-not-clobber guarantee.
 fn is_burpwn_command(cmd: &str) -> bool {
-    cmd.contains("wrap-hook")
+    let mut toks = cmd.split_whitespace();
+    // First token is the burpwn binary path/name (we don't pin it: it is baked
+    // at install time and may be `burpwn`, an absolute path, etc.).
+    let Some(_bin) = toks.next() else {
+        return false;
+    };
+    // Subcommand token must be exactly `wrap-hook`...
+    if toks.next() != Some("wrap-hook") {
+        return false;
+    }
+    // ...immediately followed by the `--agent` flag burpwn always emits.
+    toks.next() == Some("--agent")
 }
 
 /// Does a Claude/Gemini-style matcher entry contain a burpwn hook command?
@@ -605,5 +639,113 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("--agent copilot"));
+    }
+
+    #[test]
+    fn is_burpwn_command_only_matches_anchored_invocation() {
+        // Finding #2: burpwn's OWN entries are recognised...
+        assert!(is_burpwn_command("burpwn wrap-hook --agent claude-code"));
+        assert!(is_burpwn_command("/opt/burpwn wrap-hook --agent gemini"));
+        // ...but unrelated user commands that merely CONTAIN the `wrap-hook`
+        // substring are NOT misclassified (would clobber/delete them).
+        assert!(!is_burpwn_command("~/bin/my-wrap-hook.sh"));
+        assert!(!is_burpwn_command("/usr/local/bin/wrap-hook-runner --foo"));
+        assert!(!is_burpwn_command("echo wrap-hook"));
+        // `wrap-hook` must be the SUBCOMMAND token followed by `--agent`.
+        assert!(!is_burpwn_command("burpwn other --wrap-hook"));
+        assert!(!is_burpwn_command("burpwn wrap-hook"));
+        assert!(!is_burpwn_command(""));
+    }
+
+    #[test]
+    fn user_hook_containing_wrap_hook_substring_is_not_clobbered() {
+        // Finding #2: a pre-existing user PreToolUse hook whose command merely
+        // contains the literal `wrap-hook` must survive init AND uninstall.
+        let home = tempfile::tempdir().unwrap();
+        let path = Agent::ClaudeCode.config_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let pre = json!({
+            "hooks": { "PreToolUse": [
+                { "matcher": "Bash",
+                  "hooks": [ { "type": "command", "command": "~/bin/my-wrap-hook.sh" } ] }
+            ] }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&pre).unwrap()).unwrap();
+
+        // init: user's hook preserved, burpwn appended (now 2 entries).
+        let rep = install(Agent::ClaudeCode, home.path(), &[]).unwrap();
+        assert_eq!(rep.action, InstallAction::Installed);
+        let v = read(&path);
+        let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "~/bin/my-wrap-hook.sh"));
+
+        // uninstall: only burpwn's entry removed, user's wrap-hook script kept.
+        uninstall(Agent::ClaudeCode, home.path()).unwrap();
+        let v = read(&path);
+        let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hooks"][0]["command"], "~/bin/my-wrap-hook.sh");
+    }
+
+    #[test]
+    fn cursor_user_wrap_hook_substring_is_not_clobbered() {
+        // Finding #2, Cursor flat-entry path: a user `beforeShellExecution` entry
+        // whose command contains `wrap-hook` must not be overwritten or deleted.
+        let home = tempfile::tempdir().unwrap();
+        let path = Agent::Cursor.config_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "hooks": { "beforeShellExecution": [ { "command": "~/bin/my-wrap-hook.sh" } ] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install(Agent::Cursor, home.path(), &[]).unwrap();
+        let v = read(&path);
+        assert_eq!(
+            v["hooks"]["beforeShellExecution"].as_array().unwrap().len(),
+            2
+        );
+
+        uninstall(Agent::Cursor, home.path()).unwrap();
+        let v = read(&path);
+        let arr = v["hooks"]["beforeShellExecution"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["command"], "~/bin/my-wrap-hook.sh");
+    }
+
+    #[test]
+    fn non_object_root_json_is_refused_not_clobbered() {
+        // Finding #5: an existing config that is valid JSON but NOT an object
+        // (e.g. a top-level array) must NOT be silently overwritten; we error.
+        let home = tempfile::tempdir().unwrap();
+        let path = Agent::ClaudeCode.config_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "[1, 2, 3]\n";
+        std::fs::write(&path, original).unwrap();
+
+        let err = install(Agent::ClaudeCode, home.path(), &[]).unwrap_err();
+        assert!(matches!(err, WrapError::NonObjectRoot(_)));
+        // the user's file is untouched
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn non_object_root_scalar_is_refused() {
+        // A top-level scalar/string is likewise refused (Gemini path).
+        let home = tempfile::tempdir().unwrap();
+        let path = Agent::Gemini.config_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "\"just a string\"\n").unwrap();
+        let err = install(Agent::Gemini, home.path(), &[]).unwrap_err();
+        assert!(matches!(err, WrapError::NonObjectRoot(_)));
     }
 }

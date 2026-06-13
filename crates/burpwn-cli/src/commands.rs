@@ -405,7 +405,10 @@ async fn ensure_daemon(paths: &Paths, session: &str) -> Result<()> {
     // (setsid) so it's reparented to init immediately and decoupled from the
     // exec's process group — Ctrl-C in the user's shell no longer kills the
     // daemon, and it can't become a zombie nobody reaps (Bug #3). stdio is
-    // redirected to /dev/null so it never holds the terminal or inherits fd 3.
+    // redirected to /dev/null so it never holds the terminal. The long-lived
+    // daemon must also NOT inherit fd 3 (the exec envelope pipe the MCP `run_exec`
+    // reads): if it did, the read end would never see EOF and the MCP tool call
+    // would hang. `spawn_detached_daemon` explicitly closes fd 3 in the child.
     let exe = std::env::current_exe().context("locating own executable")?;
     spawn_detached_daemon(&exe, session).context("spawning proxy daemon")?;
 
@@ -444,14 +447,19 @@ fn spawn_detached_daemon(exe: &std::path::Path, session: &str) -> std::io::Resul
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // SAFETY: `setsid` is async-signal-safe and the only thing we call between
-    // fork and exec. Detaching the child into its own session makes it a
-    // session leader reparented to init, decoupled from our signal group.
+    // SAFETY: `setsid` and `close` are async-signal-safe and the only things we
+    // call between fork and exec. Detaching the child into its own session makes
+    // it a session leader reparented to init, decoupled from our signal group.
+    // We also close fd 3 so the long-lived daemon never inherits (and pins open)
+    // the exec envelope pipe: otherwise the MCP `run_exec` reading the parent's
+    // fd-3 read end would block forever waiting for an EOF the daemon withholds.
+    // `close` returning EBADF (fd 3 already closed) is fine and ignored.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            libc::close(3);
             Ok(())
         });
     }
@@ -693,10 +701,15 @@ async fn req_replay(
         headers.push(replay::parse_header_spec(spec)?);
     }
     let body = match &args.set_body {
-        Some(spec) if spec.starts_with('@') => Some(
-            std::fs::read(&spec[1..])
-                .with_context(|| format!("reading body file {}", &spec[1..]))?,
-        ),
+        Some(spec) if spec.starts_with('@') => {
+            // `@file` reads the body from a file. On failure, do NOT echo the
+            // (possibly resolved/absolute) path back: an error message that
+            // varies by path existence/permission is a path-probing oracle for
+            // agent-driven automation. Report only the io error kind.
+            let data = std::fs::read(&spec[1..])
+                .map_err(|e| anyhow!("reading --set-body @file failed: {}", e.kind()))?;
+            Some(data)
+        }
         Some(spec) => Some(spec.clone().into_bytes()),
         None => None,
     };
@@ -1027,6 +1040,16 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
             let text = serde_json::to_string_pretty(&har)?;
             match output {
                 Some(path) => {
+                    // Refuse to follow an existing symlink at the target: writing
+                    // through it would let an attacker-seeded link redirect the
+                    // HAR onto a victim file (this is operator-facing but also
+                    // reachable from agent-driven automation). `symlink_metadata`
+                    // does not follow the final component, so a symlink is caught.
+                    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                        if meta.file_type().is_symlink() {
+                            bail!("refusing to write HAR through an existing symlink: {path}");
+                        }
+                    }
                     std::fs::write(&path, &text).with_context(|| format!("writing {path}"))?;
                     out.ok(
                         format!("wrote {entry_count} entries to {path}"),
@@ -1296,6 +1319,55 @@ mod tests {
         );
         // The daemon never ran, so no runtime dir leaked outside the base.
         assert!(!dir.path().join("escape").exists());
+    }
+
+    /// `export har -o <path>` must refuse to write *through* an existing symlink
+    /// at the target, so an attacker-seeded link can't redirect the HAR onto a
+    /// victim file. A regular (non-symlink) target still writes fine.
+    #[tokio::test]
+    async fn export_har_refuses_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        let session = "default";
+        paths.ensure_session_dir(session).unwrap();
+        populate(&paths, session).await;
+        let out = Output::new(false);
+
+        // Seed a symlink at the output path pointing at a "victim" file.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"do not clobber").unwrap();
+        let link = dir.path().join("out.har");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = cmd_export(
+            &out,
+            &paths,
+            ExportAction::Har {
+                workspace: None,
+                output: Some(link.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        // The victim file was not overwritten.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not clobber");
+
+        // A plain target writes normally.
+        let plain = dir.path().join("plain.har");
+        let code = cmd_export(
+            &out,
+            &paths,
+            ExportAction::Har {
+                workspace: None,
+                output: Some(plain.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(plain.exists());
     }
 
     #[tokio::test]

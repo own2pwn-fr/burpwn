@@ -38,6 +38,13 @@ impl Reader {
         Ok(self.pool.get()?)
     }
 
+    /// Check out a raw pooled connection (tests only) to assert the read-only
+    /// posture the pool's [`crate::ReadOnlyCustomizer`] enforces on each acquire.
+    #[cfg(test)]
+    pub(crate) fn pool_conn_for_test(&self) -> r2d2::PooledConnection<SqliteConnectionManager> {
+        self.pool.get().unwrap()
+    }
+
     /// List flows matching `filter`, newest first.
     pub fn list_flows(&self, filter: &FlowFilter) -> Result<Vec<FlowRow>> {
         let conn = self.conn()?;
@@ -193,7 +200,9 @@ impl Reader {
             return Ok(None);
         };
         Ok(Some(ResponseData {
-            status: status as u16,
+            // A tampered i64 status must not silently wrap into a wrong-but-valid
+            // u16; clamp an out-of-range value to 0 rather than truncating.
+            status: u16::try_from(status).unwrap_or(0),
             http_version,
             headers: load_blob_or_empty(conn, hid)?,
             body: load_blob_or_empty(conn, bid)?,
@@ -418,13 +427,15 @@ fn row_to_flow(row: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
         protocol: Protocol::from_db(&protocol),
         scheme: row.get(5)?,
         dst_ip: row.get(6)?,
-        dst_port: row.get::<_, i64>(7)? as u16,
+        // Tampered out-of-range i64 columns must not silently wrap into a
+        // wrong-but-valid u16; clamp to 0 rather than truncating.
+        dst_port: u16::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
         sni: row.get(8)?,
         intercepted: row.get::<_, i64>(9)? != 0,
         method: row.get(10)?,
         authority: row.get(11)?,
         path: row.get(12)?,
-        status: status.map(|s| s as u16),
+        status: status.map(|s| u16::try_from(s).unwrap_or(0)),
     })
 }
 

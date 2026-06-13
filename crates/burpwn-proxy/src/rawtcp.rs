@@ -6,6 +6,7 @@
 //! forwarding everything unchanged.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -17,6 +18,12 @@ use crate::util::now_millis;
 
 /// Per-direction cap on bytes teed to the store (forwarding is uncapped).
 const CAPTURE_CAP: usize = 256 * 1024;
+
+/// Grace a still-open direction is given to drain after its sibling finished,
+/// before being aborted. Bounds the half-open leak (a peer that closes one
+/// direction and holds the other open+silent) without truncating the normal
+/// close, where both directions EOF within the window.
+const SPLICE_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Handle a redirected raw-TCP connection: log a flow, splice, capture.
 #[allow(clippy::too_many_arguments)]
@@ -79,12 +86,40 @@ where
     let (ur, uw) = tokio::io::split(upstream);
 
     let w1 = writer.clone();
-    let c2s = tokio::spawn(async move { splice(cr, uw, w1, flow_id, "c2s").await });
+    let mut c2s = tokio::spawn(async move { splice(cr, uw, w1, flow_id, "c2s").await });
     let w2 = writer.clone();
-    let s2c = tokio::spawn(async move { splice(ur, cw, w2, flow_id, "s2c").await });
+    let mut s2c = tokio::spawn(async move { splice(ur, cw, w2, flow_id, "s2c").await });
 
-    let _ = c2s.await;
-    let _ = s2c.await;
+    // A peer may half-close one direction (read-0) while holding the other open
+    // and silent. If we `await` BOTH handles the sibling `splice` blocks on `read`
+    // forever → task + fd leak. Wait for the FIRST direction to finish, then give
+    // the sibling a bounded grace to drain its remaining bytes before aborting it.
+    // On a normal close both directions EOF within the grace, so no in-flight
+    // bytes are truncated; only a half-open silent peer is force-torn-down.
+    let c2s_abort = c2s.abort_handle();
+    let s2c_abort = s2c.abort_handle();
+    // Arms return a bool (no borrow escapes the select) so both `&mut` future
+    // borrows are released before we await the survivor.
+    let c2s_finished_first = tokio::select! {
+        _ = &mut c2s => true,
+        _ = &mut s2c => false,
+    };
+    let survivor = if c2s_finished_first {
+        &mut s2c
+    } else {
+        &mut c2s
+    };
+    if tokio::time::timeout(SPLICE_DRAIN_GRACE, &mut *survivor)
+        .await
+        .is_err()
+    {
+        // Aborting an already-finished handle is a no-op, so abort both rather
+        // than thread the survivor's identity through.
+        c2s_abort.abort();
+        s2c_abort.abort();
+        // Reap the aborted survivor so it is actually finished on return.
+        let _ = survivor.await;
+    }
 }
 
 async fn splice<R, W>(

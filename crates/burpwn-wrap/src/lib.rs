@@ -59,6 +59,11 @@ pub enum WrapError {
     /// TOML serialization error on `config.toml`.
     #[error("toml serialize error: {0}")]
     TomlSer(#[from] toml::ser::Error),
+    /// An existing agent config file parsed to valid JSON that is NOT an object,
+    /// so merging burpwn's hook would have to clobber the user's content. We
+    /// refuse rather than overwrite it.
+    #[error("agent config root is not a JSON object (refusing to overwrite): {0}")]
+    NonObjectRoot(String),
 }
 
 /// Rewrite a single command line into its `burpwn exec` form.

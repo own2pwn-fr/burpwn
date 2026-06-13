@@ -81,12 +81,35 @@ impl WrapConfig {
 /// "git status"              -> "git"
 /// "/usr/bin/curl -sSL …"    -> "curl"
 /// "FOO=1 BAR=2 npm install" -> "npm"
+/// "FOO=\"a b\" curl …"      -> "curl"
 /// ""                        -> ""
 /// ```
 fn program_of(cmd: &str) -> &str {
-    for tok in cmd.split_whitespace() {
+    let mut toks = cmd.split_whitespace().peekable();
+    while let Some(tok) = toks.peek().copied() {
         // Skip leading `VAR=value` environment assignments.
         if tok.contains('=') && tok.split('=').next().is_some_and(is_env_name) {
+            toks.next();
+            // A quoted assignment value may contain whitespace and thus span
+            // several whitespace-split tokens (`FOO="a b"`): consume tokens
+            // until the opening quote is balanced, so we don't mistake the tail
+            // of the value (e.g. `b"`) for the program. Without this the program
+            // detection would be wrong and `should_wrap` could compare the wrong
+            // program against `exclude_commands`, potentially skipping capture.
+            if let Some((_, rest)) = tok.split_once('=') {
+                if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                    // Closed within this same token? (>= 2 quote chars present.)
+                    let closed = rest.matches(quote).count() >= 2;
+                    if !closed {
+                        // Consume following tokens until one ends the quote.
+                        for next in toks.by_ref() {
+                            if next.contains(quote) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
         // Strip directory components: `/usr/bin/curl` -> `curl`.
@@ -129,6 +152,22 @@ mod tests {
         assert_eq!(program_of("   "), "");
         assert_eq!(program_of(""), "");
         assert_eq!(program_of("./run.sh"), "run.sh");
+    }
+
+    #[test]
+    fn program_of_handles_quoted_assignment_values() {
+        // Finding #4: a quoted assignment value containing whitespace spans
+        // multiple whitespace-split tokens; we must consume through the closing
+        // quote, not return the tail of the value as the program.
+        assert_eq!(program_of(r#"FOO="a b" curl https://x"#), "curl");
+        assert_eq!(program_of("A=1 ls"), "ls");
+        assert_eq!(program_of("X='y' prog"), "prog");
+        // single-quoted value with spaces
+        assert_eq!(program_of("X='a b c' wget url"), "wget");
+        // multiple assignments, one quoted with spaces
+        assert_eq!(program_of(r#"A=1 B="x y" nmap -sV t"#), "nmap");
+        // quoted value with a path-like program after it stays correctly stripped
+        assert_eq!(program_of(r#"FOO="a b" /usr/bin/curl"#), "curl");
     }
 
     #[test]

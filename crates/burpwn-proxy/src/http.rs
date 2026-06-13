@@ -20,10 +20,10 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONTENT_ENCODING, HOST};
 use hyper::service::service_fn;
@@ -46,6 +46,28 @@ use crate::util::now_millis;
 /// bounded, so large uploads/downloads are captured-but-truncated rather than
 /// corrupted on the wire.
 const BODY_CAP: usize = 8 * 1024 * 1024;
+
+/// Hard ceiling on a body buffered for FORWARDING. The match/replace and
+/// intercept primitives need the full body in memory, so we cannot stream it
+/// through — but we MUST bound the buffer or an adversarial client/origin can
+/// stream gigabytes (chunked or via a huge Content-Length) and OOM the proxy
+/// one connection at a time. 256 MiB is generous (well above the
+/// [`BODY_CAP`] store cap, which only governs the persisted copy) yet finite;
+/// bodies above it are refused (413 downstream / 502 upstream) rather than
+/// buffered without limit.
+const FORWARD_BODY_CAP: usize = 256 * 1024 * 1024;
+
+/// Max time to read the inbound request headers before the connection is torn
+/// down. Bounds slowloris-style header dribbling against the served side.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max time to establish the upstream TCP (and, for MITM, TLS) connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall budget for the upstream request/response exchange (send the request,
+/// receive the headers, and collect the full body). Bounds a slow/silent origin
+/// from pinning a downstream connection and its buffers indefinitely.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How the proxy reaches the origin for a given served connection.
 #[derive(Clone)]
@@ -105,6 +127,8 @@ where
         async move { Ok::<_, Infallible>(handle(req, ctx).await) }
     });
     hyper::server::conn::http1::Builder::new()
+        // Bound slowloris-style header dribbling on the served (downstream) side.
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(io, service)
         .with_upgrades()
         .await
@@ -171,7 +195,22 @@ async fn handle_inner(
         .unwrap_or_else(|| parts.uri.path().to_string());
     let host = request_host(&parts);
     let raw_req_headers = serialize_headers(&parts.headers);
-    let req_body = collect_body(body).await?;
+    let req_body = match collect_body(body).await? {
+        BufferedBody::Full(b) => b,
+        BufferedBody::TooLarge => {
+            tracing::warn!(
+                %host,
+                cap = FORWARD_BODY_CAP,
+                "request body exceeds forward cap; refusing"
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Full::new(Bytes::from_static(
+                    b"burpwn: request body too large",
+                )))
+                .unwrap());
+        }
+    };
 
     // --- request-side match/replace ---
     let mut msg = Message {
@@ -261,6 +300,8 @@ async fn handle_inner(
     }
 
     // --- forward + capture the response ---
+    // An over-cap upstream body (or connect/exchange timeout) surfaces here as an
+    // `Err`, which `handle` turns into a 502; flow_end runs below only on success.
     let (resp_parts, resp_body_bytes) = forward(&ctx.upstream, upstream_req).await?;
     let raw_resp_headers = serialize_headers(&resp_parts.headers);
 
@@ -360,33 +401,62 @@ async fn handle_inner(
 }
 
 /// Open the upstream connection, send the request, and collect the response.
+/// The connect (and TLS handshake) is bounded by [`CONNECT_TIMEOUT`] and the
+/// whole request/response exchange by [`UPSTREAM_TIMEOUT`], so a slow or silent
+/// origin cannot pin a downstream connection (and its buffers) forever.
 async fn forward(
     upstream: &Upstream,
     req: Request<Full<Bytes>>,
 ) -> anyhow::Result<(http::response::Parts, Bytes)> {
     match upstream {
         Upstream::Plain { addr } => {
-            let tcp = TcpStream::connect(*addr).await?;
+            let tcp = with_timeout(
+                CONNECT_TIMEOUT,
+                "upstream connect",
+                TcpStream::connect(*addr),
+            )
+            .await??;
             // No ALPN on a cleartext upstream: default to HTTP/1.1 (prior-knowledge
             // h2c is rare and not something we negotiated).
-            send_over(tcp, req, false, "http").await
+            let exchange = send_over(tcp, req, false, "http");
+            with_timeout(UPSTREAM_TIMEOUT, "upstream exchange", exchange).await?
         }
         Upstream::Tls {
             addr,
             server_name,
             connector,
         } => {
-            let tcp = TcpStream::connect(*addr).await?;
             let server_name = rustls::pki_types::ServerName::try_from(server_name.clone())
                 .map_err(|_| anyhow::anyhow!("invalid upstream server name"))?;
-            let tls = connector.connect(server_name, tcp).await?;
+            // TCP connect + TLS handshake share the connect budget.
+            let tls = with_timeout(CONNECT_TIMEOUT, "upstream connect", async {
+                let tcp = TcpStream::connect(*addr).await?;
+                connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await??;
             // The UPSTREAM leg's protocol is whatever ALPN negotiated — independent
             // of the downstream version (a client may speak h2 to us while the
             // origin only speaks h1, or vice versa).
             let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-            send_over(tls, req, is_h2, "https").await
+            let exchange = send_over(tls, req, is_h2, "https");
+            with_timeout(UPSTREAM_TIMEOUT, "upstream exchange", exchange).await?
         }
     }
+}
+
+/// Run `fut` under `dur`, mapping an elapsed timeout to a labelled error so the
+/// flow fails cleanly (502 + log) instead of hanging. The inner future's own
+/// result type is preserved.
+async fn with_timeout<F, T>(dur: Duration, what: &'static str, fut: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(dur, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} timed out after {dur:?}"))
 }
 
 /// Drive one request/response over an established (plain or TLS) byte stream
@@ -413,11 +483,14 @@ where
         *req.version_mut() = Version::HTTP_2;
         let (mut sender, conn) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
-        tokio::spawn(async move {
+        // Abort (not just detach) the conn driver when this future is dropped —
+        // e.g. an enclosing `UPSTREAM_TIMEOUT` fires — so the upstream task and
+        // its fd are not leaked.
+        let _conn = AbortOnDrop(tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::debug!(error = %e, "upstream h2 conn closed");
             }
-        });
+        }));
         let resp = sender.send_request(req).await?;
         collect_response(resp).await
     } else {
@@ -425,13 +498,24 @@ where
         // in case the downstream request arrived as h2.
         *req.version_mut() = Version::HTTP_11;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-        tokio::spawn(async move {
+        let _conn = AbortOnDrop(tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::debug!(error = %e, "upstream h1 conn closed");
             }
-        });
+        }));
         let resp = sender.send_request(req).await?;
         collect_response(resp).await
+    }
+}
+
+/// Aborts the wrapped task when dropped, so an upstream connection driver spawned
+/// for one request is not left running (leaking a task + fd) if the request
+/// future is cancelled — e.g. by [`UPSTREAM_TIMEOUT`].
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -463,16 +547,28 @@ fn promote_to_absolute_uri(req: &mut Request<Full<Bytes>>, scheme: &str) {
     }
 }
 
+/// Collect an upstream response, bounding the body at [`FORWARD_BODY_CAP`] so a
+/// malicious origin cannot OOM the proxy. An over-cap body fails the flow (the
+/// caller surfaces a 502) rather than buffering without limit.
 async fn collect_response(
     resp: Response<Incoming>,
 ) -> anyhow::Result<(http::response::Parts, Bytes)> {
     let (parts, body) = resp.into_parts();
-    let bytes = body
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("read upstream body: {e}"))?
-        .to_bytes();
-    Ok((parts, bytes))
+    let limited = Limited::new(body, FORWARD_BODY_CAP);
+    match limited.collect().await {
+        Ok(collected) => Ok((parts, collected.to_bytes())),
+        // `Limited` boxes a `LengthLimitError` on overflow; any other error is a
+        // real read failure on the wire.
+        Err(e)
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err(anyhow::anyhow!(
+                "upstream response body exceeds forward cap ({FORWARD_BODY_CAP} bytes)"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!("read upstream body: {e}")),
+    }
 }
 
 /// Build the request to send upstream from the original parts + the (possibly
@@ -523,15 +619,35 @@ fn build_upstream_request(
     Ok(builder.body(Full::new(Bytes::from(msg.body.clone())))?)
 }
 
-/// Collect a request body in FULL (so it can be forwarded upstream unchanged).
-/// Truncation applies only to the STORED copy, via [`cap_for_store`].
-async fn collect_body(body: Incoming) -> anyhow::Result<Vec<u8>> {
-    let collected = body
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("read body: {e}"))?
-        .to_bytes();
-    Ok(collected.to_vec())
+/// Outcome of buffering a forward-path body under the [`FORWARD_BODY_CAP`]
+/// ceiling: either the full bytes, or a signal that the cap was exceeded so the
+/// caller can refuse the flow instead of buffering without limit.
+enum BufferedBody {
+    /// The full body, under the cap.
+    Full(Vec<u8>),
+    /// The body exceeded [`FORWARD_BODY_CAP`]; refuse rather than OOM.
+    TooLarge,
+}
+
+/// Collect a request body in FULL (so it can be forwarded upstream unchanged),
+/// bounded by [`FORWARD_BODY_CAP`] so an adversarial client cannot OOM the proxy
+/// by streaming an unbounded body. Truncation of the STORED copy is separate and
+/// applies via [`cap_for_store`]. A genuine transport error still surfaces as an
+/// `Err`; only an over-cap body maps to [`BufferedBody::TooLarge`].
+async fn collect_body(body: Incoming) -> anyhow::Result<BufferedBody> {
+    let limited = Limited::new(body, FORWARD_BODY_CAP);
+    match limited.collect().await {
+        Ok(collected) => Ok(BufferedBody::Full(collected.to_bytes().to_vec())),
+        // `Limited` boxes a `LengthLimitError` on overflow; any other error is a
+        // real read failure on the wire.
+        Err(e)
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Ok(BufferedBody::TooLarge)
+        }
+        Err(e) => Err(anyhow::anyhow!("read body: {e}")),
+    }
 }
 
 /// A copy of a body bounded to [`BODY_CAP`] for STORAGE only (never for
@@ -762,8 +878,49 @@ where
         }
         let _ = dw.shutdown().await;
     });
-    let _ = c2s.await;
-    let _ = s2c.await;
+    join_half_open(c2s, s2c, SPLICE_DRAIN_GRACE).await;
+}
+
+/// Grace period a still-open splice direction is given to drain after its
+/// sibling has finished, before it is aborted. On a normal WebSocket/TCP close
+/// both directions EOF within this window so no in-flight bytes are truncated; a
+/// peer that half-closes one direction and holds the other open+silent is torn
+/// down after the grace, preventing the sibling from blocking on `read` forever
+/// (task + fd leak).
+const SPLICE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Join two splice-direction tasks without leaking on a half-open peer: wait for
+/// the FIRST to finish, then give the sibling `grace` to drain its remaining
+/// bytes; abort it only if it overruns that window. Returns once both are done
+/// (or the survivor was aborted).
+async fn join_half_open(
+    mut c2s: tokio::task::JoinHandle<()>,
+    mut s2c: tokio::task::JoinHandle<()>,
+    grace: Duration,
+) {
+    let c2s_abort = c2s.abort_handle();
+    let s2c_abort = s2c.abort_handle();
+    // Wait for the FIRST direction to finish. The arms return a bool (no borrow
+    // escapes the select), so both `&mut` future borrows are released before we
+    // await the survivor below.
+    let c2s_finished_first = tokio::select! {
+        _ = &mut c2s => true,
+        _ = &mut s2c => false,
+    };
+    let survivor = if c2s_finished_first {
+        &mut s2c
+    } else {
+        &mut c2s
+    };
+    if tokio::time::timeout(grace, &mut *survivor).await.is_err() {
+        // Whichever handle is still live: aborting the already-finished one is a
+        // no-op, so abort both rather than thread the identity through.
+        c2s_abort.abort();
+        s2c_abort.abort();
+        // Reap the aborted survivor so it is actually finished on return (abort
+        // only schedules cancellation; awaiting drives it to completion).
+        let _ = survivor.await;
+    }
 }
 
 /// Perform the upstream side of a WebSocket handshake over `stream`, returning
@@ -913,6 +1070,69 @@ mod tests {
         let h = out.headers();
         assert!(!h.contains_key(hyper::header::CONNECTION));
         assert!(!h.contains_key(hyper::header::UPGRADE));
+    }
+
+    // Bug (HIGH) regression: the forward-path body buffer is bounded by a
+    // `Limited`, and an over-cap body must be detectable as a `LengthLimitError`
+    // (so the request path can 413 / the response path can 502) rather than
+    // buffering without limit. Exercise the exact `Limited` + downcast logic the
+    // collectors rely on, with a tiny cap.
+    #[tokio::test]
+    async fn limited_body_overflow_is_detected() {
+        let body = Full::new(Bytes::from_static(b"0123456789")); // 10 bytes
+        let limited = Limited::new(body, 4); // cap below the body size
+        let err = limited.collect().await.expect_err("over-cap must error");
+        assert!(
+            err.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some(),
+            "overflow must surface as a LengthLimitError"
+        );
+    }
+
+    #[tokio::test]
+    async fn limited_body_under_cap_passes_through() {
+        let body = Full::new(Bytes::from_static(b"0123456789"));
+        let limited = Limited::new(body, FORWARD_BODY_CAP);
+        let bytes = limited.collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"0123456789");
+    }
+
+    // The forward cap must be finite and larger than the store cap (the store cap
+    // only bounds the persisted copy, not the buffered-for-forwarding body).
+    // Compile-time assertion so the invariant can never regress.
+    const _: () = assert!(FORWARD_BODY_CAP > BODY_CAP);
+
+    // Bug (MEDIUM) regression: when one splice direction finishes but the sibling
+    // is parked forever on `read` (half-open peer), `join_half_open` must NOT block
+    // indefinitely — it aborts the survivor after the grace and returns.
+    #[tokio::test]
+    async fn join_half_open_aborts_stuck_sibling() {
+        let done = tokio::spawn(async {}); // finishes immediately
+        let stuck = tokio::spawn(async {
+            // Simulate a direction blocked forever on a silent half-open peer.
+            std::future::pending::<()>().await;
+        });
+        let stuck_handle = stuck.abort_handle();
+        // A short grace keeps the test fast; the real const is 10s.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            join_half_open(done, stuck, Duration::from_millis(50)),
+        )
+        .await
+        .expect("join_half_open must return, not hang on the stuck sibling");
+        assert!(stuck_handle.is_finished(), "stuck sibling must be aborted");
+    }
+
+    // The normal path: both directions finish promptly, so the survivor drains
+    // within the grace and is NOT aborted (no truncation).
+    #[tokio::test]
+    async fn join_half_open_lets_normal_close_drain() {
+        let a = tokio::spawn(async {});
+        let b = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        join_half_open(a, b, Duration::from_secs(5)).await;
+        // Reaching here without hanging is the assertion; a clean close drained.
     }
 
     #[test]

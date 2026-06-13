@@ -102,6 +102,57 @@ pub struct ExecResult {
     pub outcome: ExecOutcome,
 }
 
+/// Environment variables forwarded verbatim into the sandbox.
+///
+/// # Threat model
+///
+/// The wrapped command is UNTRUSTED (it's an AI-driven tool or arbitrary binary)
+/// and it has proxy egress, so any operator secret reaching its environment can
+/// be exfiltrated over the wire. The host environment of the `burpwn` operator
+/// routinely carries cloud/API credentials (`ANTHROPIC_API_KEY`, `AWS_*`,
+/// `GITHUB_TOKEN`, `OPENAI_API_KEY`, …), `SSH_AUTH_SOCK`, etc. We therefore
+/// forward an explicit ALLOWLIST of benign, behaviour-shaping variables and drop
+/// everything else (deny-by-default). Variables matching [`ENV_ALLOWLIST_PREFIXES`]
+/// (locale `LC_*` and proxy passthrough) are also forwarded.
+///
+/// Note: the CA-trust env (`SSL_CERT_FILE`/`SSL_CERT_DIR`) is injected by the
+/// runtime itself, so it is deliberately NOT forwarded from the host here.
+const ENV_ALLOWLIST: &[&str] = &[
+    // Core shell/locale identity the wrapped tool expects to behave normally.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "TZ",
+    // Proxy configuration the tool may genuinely need (lower + upper forms).
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+];
+
+/// Prefixes whose variables are also forwarded (locale `LC_*`). `BURPWN_*` is
+/// intentionally NOT bulk-forwarded here: only `BURPWN_EXEC_ID`, added by
+/// [`run_exec`] after building the spec, is exposed to the child.
+const ENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_"];
+
+/// Filter a host environment down to the [`ENV_ALLOWLIST`] (+ prefixes),
+/// dropping operator secrets so the untrusted wrapped tool never sees them.
+/// Factored out as a pure helper so it can be unit-tested without touching the
+/// real process environment.
+fn filtered_env(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.filter(|(k, _)| {
+        ENV_ALLOWLIST.contains(&k.as_str())
+            || ENV_ALLOWLIST_PREFIXES.iter().any(|p| k.starts_with(p))
+    })
+    .collect()
+}
+
 /// Build the [`ExecSpec`] for one `exec` invocation.
 ///
 /// `argv` is the command; `workdir` the cwd; `extra_env` the user-provided env
@@ -113,10 +164,10 @@ pub fn build_spec(
     timeout: Option<Duration>,
     inherit_stdio: bool,
 ) -> ExecSpec {
-    let mut env: Vec<(String, String)> = std::env::vars().collect();
-    // De-noise: the sandbox manages CA-trust env itself; we still forward the
-    // rest of the inherited environment so the wrapped tool behaves normally.
-    env.retain(|(k, _)| k != "SSL_CERT_FILE" && k != "SSL_CERT_DIR");
+    // ALLOWLIST: forward only a safe set of host env vars into the sandbox; the
+    // untrusted wrapped tool (which has proxy egress) must never see operator
+    // secrets. See [`ENV_ALLOWLIST`] for the threat model.
+    let env = filtered_env(std::env::vars());
 
     ExecSpec {
         argv,
@@ -262,6 +313,42 @@ mod tests {
         assert!(spec.ca_path.ends_with("ca.pem"));
         assert!(spec.inherit_stdio);
         assert_eq!(spec.timeout, Some(Duration::from_secs(9)));
+    }
+
+    /// The env ALLOWLIST forwards benign vars (PATH, LC_*, proxy config) into
+    /// the sandbox but DROPS operator secrets (AWS/cloud/API credentials), which
+    /// the untrusted wrapped tool with proxy egress could otherwise exfiltrate.
+    #[test]
+    fn filtered_env_allowlists_safe_vars_and_drops_secrets() {
+        let host = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/op".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+            (
+                "https_proxy".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ),
+            // Secrets that must NOT cross into the sandbox.
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "shh".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string()),
+            ("GITHUB_TOKEN".to_string(), "ghp_secret".to_string()),
+            ("SSH_AUTH_SOCK".to_string(), "/run/agent".to_string()),
+            // CA-trust env is injected by the runtime, not forwarded from host.
+            ("SSL_CERT_FILE".to_string(), "/etc/ca.pem".to_string()),
+        ];
+        let out = filtered_env(host.into_iter());
+        let has = |k: &str| out.iter().any(|(n, _)| n == k);
+
+        assert!(has("PATH"));
+        assert!(has("HOME"));
+        assert!(has("LC_ALL"));
+        assert!(has("https_proxy"));
+
+        assert!(!has("AWS_SECRET_ACCESS_KEY"));
+        assert!(!has("ANTHROPIC_API_KEY"));
+        assert!(!has("GITHUB_TOKEN"));
+        assert!(!has("SSH_AUTH_SOCK"));
+        assert!(!has("SSL_CERT_FILE"));
     }
 
     #[tokio::test]

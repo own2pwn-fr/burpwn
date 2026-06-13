@@ -52,6 +52,14 @@ pub fn redirect_ruleset(tcp_port: u16, dns_port: u16) -> String {
     s.push_str(&format!("    udp dport 53 redirect to :{dns_port}\n"));
     s.push_str("  }\n");
     s.push_str("}\n");
+    // NOTE: a `filter hook output policy drop` egress guard was evaluated as
+    // defense-in-depth but REMOVED: in this rootless REDIRECT setup it drops the
+    // post-DNAT SYN (the packet does not present `oif "lo"` to the filter hook as
+    // expected, so loopback-only accept blackholes the redirect itself). Egress
+    // is already structurally blocked — the netns has only `lo` + the dummy
+    // `burp0` sink and NO real interface, so nothing can leave except via the
+    // REDIRECT to the in-netns acceptor. That is the security property; we do not
+    // rely on a fragile output-filter rule for it.
     s
 }
 
@@ -121,5 +129,16 @@ mod tests {
     #[test]
     fn ruleset_is_deterministic() {
         assert_eq!(redirect_ruleset(8080, 5353), redirect_ruleset(8080, 5353));
+    }
+
+    #[test]
+    fn ruleset_has_no_output_filter_drop_that_would_break_redirect() {
+        // Regression guard: a `filter hook output` drop policy blackholes the
+        // post-DNAT redirect in this rootless setup (proven via the live e2e),
+        // so the ruleset must NOT contain one. Egress is blocked structurally
+        // (no real interface), not by an output-filter rule.
+        let rs = redirect_ruleset(8080, 5353);
+        assert!(!rs.contains("filter hook output"));
+        assert!(!rs.contains("policy drop"));
     }
 }

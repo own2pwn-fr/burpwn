@@ -181,12 +181,27 @@ impl Paths {
     }
 
     /// Read the active session name from the `current` pointer, defaulting to
-    /// [`DEFAULT_SESSION`] when the pointer is absent or empty.
+    /// [`DEFAULT_SESSION`] when the pointer is absent, empty, or holds an invalid
+    /// (e.g. traversing) name.
+    ///
+    /// This is the single choke point trusted by every reader/daemon command
+    /// (`cmd_req`, `cmd_intercept`, `cmd_export`, …) that derives FS paths and
+    /// sockets from the active session. The `current` pointer is a plain file an
+    /// attacker (or a buggy writer) could seed with `../../evil`, so we validate
+    /// the contents here ([`validate_session_name`]) and fall back to the default
+    /// session rather than ever returning a traversing name.
     pub fn active_session(&self) -> String {
         match std::fs::read_to_string(self.current_pointer()) {
             Ok(s) => {
                 let t = s.trim();
                 if t.is_empty() {
+                    DEFAULT_SESSION.to_string()
+                } else if validate_session_name(t).is_err() {
+                    tracing::debug!(
+                        pointer = %self.current_pointer().display(),
+                        name = %t,
+                        "active-session pointer holds an invalid name; using default"
+                    );
                     DEFAULT_SESSION.to_string()
                 } else {
                     t.to_string()
@@ -292,6 +307,27 @@ mod tests {
         assert_eq!(p.active_session(), DEFAULT_SESSION);
         p.ensure_session_dir("work").unwrap();
         p.set_active_session("work").unwrap();
+        assert_eq!(p.active_session(), "work");
+    }
+
+    /// A `current` pointer seeded with a traversing name must NOT be returned as
+    /// the active session (it would let FS-path-building commands escape the
+    /// sessions dir); `active_session` falls back to the default instead.
+    #[test]
+    fn active_session_rejects_traversing_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::with_base(dir.path());
+        p.ensure_base().unwrap();
+        // Write a malicious pointer directly (bypassing set_active_session).
+        std::fs::write(p.current_pointer(), "../../evil\n").unwrap();
+        assert_eq!(p.active_session(), DEFAULT_SESSION);
+
+        // A pointer with a slash is likewise rejected.
+        std::fs::write(p.current_pointer(), "a/b\n").unwrap();
+        assert_eq!(p.active_session(), DEFAULT_SESSION);
+
+        // A valid name is still honoured.
+        std::fs::write(p.current_pointer(), "work\n").unwrap();
         assert_eq!(p.active_session(), "work");
     }
 

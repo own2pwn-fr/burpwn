@@ -44,9 +44,23 @@ pub fn parse_header_spec(spec: &str) -> Result<ReplayEdit> {
     if name.is_empty() {
         bail!("empty header name in {spec:?}");
     }
+    let value = value.trim();
+    // Reject CRLF / NUL injection: a `\r`/`\n` in name or value would smuggle
+    // extra header lines (or split the request) into the request we build/send
+    // (CRLF header injection). (`split_once(':')` already excludes `:` from the
+    // name, but the value and the `=`-form name can still carry control chars.)
+    if name.contains('\r')
+        || name.contains('\n')
+        || name.contains('\0')
+        || value.contains('\r')
+        || value.contains('\n')
+        || value.contains('\0')
+    {
+        bail!("header name/value must not contain CR, LF or NUL: {spec:?}");
+    }
     Ok(ReplayEdit {
         name: name.to_string(),
-        value: value.trim().to_string(),
+        value: value.to_string(),
     })
 }
 
@@ -214,6 +228,20 @@ mod tests {
         assert_eq!(parse_header_spec("X-A=b").unwrap().value, "b");
         assert!(parse_header_spec("nope").is_err());
         assert!(parse_header_spec(": v").is_err());
+    }
+
+    /// CRLF header injection: a `\r`/`\n`/NUL in the header value (or in the
+    /// `=`-form name) must be rejected, so `--set-header` can't smuggle extra
+    /// header lines into the rebuilt request.
+    #[test]
+    fn parse_header_spec_rejects_crlf_injection() {
+        assert!(parse_header_spec("X-A: b\r\nX-Injected: 1").is_err());
+        assert!(parse_header_spec("X-A: b\nc").is_err());
+        assert!(parse_header_spec("X-A=b\rc").is_err());
+        assert!(parse_header_spec("X-Bad\nName=v").is_err());
+        assert!(parse_header_spec("X-A: b\0c").is_err());
+        // A clean header still parses.
+        assert!(parse_header_spec("X-A: b").is_ok());
     }
 
     #[test]

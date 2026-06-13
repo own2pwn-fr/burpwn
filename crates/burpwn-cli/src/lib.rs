@@ -66,12 +66,32 @@ pub async fn run() -> Result<i32> {
     init_tracing();
     let cli = Cli::parse();
     let paths = Paths::resolve()?;
-    commands::dispatch(cli, &paths).await
+    let json = cli.json;
+    json_wrap(json, commands::dispatch(cli, &paths).await)
 }
 
 /// Like [`run`] but against an explicit [`Paths`] (for tests / embedding).
 pub async fn run_with(cli: Cli, paths: &Paths) -> Result<i32> {
-    commands::dispatch(cli, paths).await
+    let json = cli.json;
+    json_wrap(json, commands::dispatch(cli, paths).await)
+}
+
+/// In `--json` mode, convert a top-level dispatch error into the stable
+/// `{ok:false,data:null,error}` envelope on stdout (so an agent always parses a
+/// structured result instead of a plain-text `burpwn: …` line on stderr) and
+/// exit non-zero. In human mode the error propagates to `main` for a plain
+/// message. Success is passed through unchanged.
+fn json_wrap(json: bool, result: Result<i32>) -> Result<i32> {
+    match result {
+        Err(e) if json => {
+            println!(
+                "{}",
+                envelope::Envelope::err(format!("{e:#}")).to_json_line()
+            );
+            Ok(1)
+        }
+        other => other,
+    }
 }
 
 fn init_tracing() {
@@ -125,6 +145,19 @@ mod tests {
             }
             other => panic!("expected req list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn json_wrap_emits_error_envelope_in_json_mode() {
+        // In --json mode a dispatch error becomes a structured envelope + exit 1.
+        let code = json_wrap(true, Err(anyhow::anyhow!("invalid session name: \"../x\"")))
+            .expect("json mode never propagates the error");
+        assert_eq!(code, 1);
+        // In human mode the error propagates unchanged for `main` to print.
+        let err = json_wrap(false, Err(anyhow::anyhow!("boom"))).unwrap_err();
+        assert_eq!(format!("{err:#}"), "boom");
+        // Success is passed through in both modes.
+        assert_eq!(json_wrap(true, Ok(0)).unwrap(), 0);
     }
 
     #[test]

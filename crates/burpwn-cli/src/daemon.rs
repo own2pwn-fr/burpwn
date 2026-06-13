@@ -111,10 +111,28 @@ fn apply_edits(mut data: InterceptData, edits: &Edits) -> InterceptData {
         data.body = b.clone().into_bytes();
     }
     for h in &edits.set_headers {
+        // Reject CRLF / NUL injection: a `\r` or `\n` in the name or value would
+        // smuggle extra header lines (or split the request) into the upstream
+        // request/response we're about to forward (Bug #L?, CRLF header
+        // injection). Skip the offending edit and log rather than forward it.
+        if has_header_control_char(&h.name) || has_header_control_char(&h.value) {
+            tracing::warn!(
+                name = %h.name,
+                "dropping header edit containing CR/LF/NUL (header injection attempt)"
+            );
+            continue;
+        }
         data.headers
             .extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
     }
     data
+}
+
+/// Whether `s` contains a control character that could break out of a single
+/// header line (`\r`, `\n`) or terminate the C-string view of the header block
+/// (`\0`). Used to reject header-injection attempts before forwarding.
+fn has_header_control_char(s: &str) -> bool {
+    s.contains('\r') || s.contains('\n') || s.contains('\0')
 }
 
 /// Handle a single decoded control request against `state`.
@@ -231,9 +249,17 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
     }
 }
 
+/// Upper bound on a single `InterceptAwait` long-poll (seconds). A client could
+/// otherwise pass an arbitrary `u64` and wedge a connection (and its pulled
+/// intercept) for years — a local control-plane DoS (Bug #L?). 300s matches the
+/// proxy's auto-forward cap, so clamping here never changes legitimate behaviour.
+const MAX_AWAIT_SECS: u64 = 300;
+
 /// Serve the control protocol on `sock` until a `Shutdown` request arrives (or
-/// the listener errors). Returns when shutting down. Each connection is handled
-/// inline (the protocol is request/response and low-volume).
+/// the listener errors). Returns when shutting down. Each accepted connection is
+/// served on its own task so one slow/partial client can't block the others
+/// (the protocol is request/response and low-volume, but the long-poll
+/// `InterceptAwait` can legitimately hold a connection open for a while).
 pub async fn serve_control(state: ControlState, sock: impl AsRef<Path>) -> Result<()> {
     let sock = sock.as_ref();
     // Don't unconditionally unlink: a *live* daemon may already be bound here
@@ -268,22 +294,41 @@ pub async fn serve_control(state: ControlState, sock: impl AsRef<Path>) -> Resul
     }
     tracing::info!(?sock, "control server listening");
 
+    // A `Shutdown` request arrives on a spawned connection task; it signals the
+    // accept loop to stop via this channel (capacity 1 is enough — the first
+    // shutdown wins and we stop accepting).
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     loop {
-        let (stream, _) = listener.accept().await?;
-        // A per-connection error (e.g. the client disconnected mid-request, as
-        // happens when an MCP long-poll is cancelled) must NOT tear the whole
-        // control server down — log it and keep serving. Only a `Shutdown`
-        // request (Ok(true)) stops the loop.
-        match handle_connection(&state, stream).await {
-            Ok(true) => {
+        let stream = tokio::select! {
+            // Stop accepting as soon as any connection reported a `Shutdown`.
+            _ = shutdown_rx.recv() => {
                 tracing::info!("control server shutting down");
                 return Ok(());
             }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::debug!(error = %e, "control connection ended with error");
+            accepted = listener.accept() => accepted?.0,
+        };
+        // Serve each connection on its own task so one slow/partial client (or a
+        // long-poll `InterceptAwait`) can't block the others. `state` is cheaply
+        // Cloneable (shared controller + parked table behind Arc), so every task
+        // sees the same shared state.
+        let conn_state = state.clone();
+        let conn_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            // A per-connection error (e.g. the client disconnected mid-request,
+            // as happens when an MCP long-poll is cancelled) must NOT tear the
+            // whole control server down — log it. Only a `Shutdown` request
+            // (Ok(true)) stops the accept loop, via the shutdown channel.
+            match handle_connection(&conn_state, stream).await {
+                Ok(true) => {
+                    let _ = conn_shutdown.send(()).await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "control connection ended with error");
+                }
             }
-        }
+        });
     }
 }
 
@@ -331,6 +376,10 @@ async fn handle_connection(state: &ControlState, stream: UnixStream) -> Result<b
                 // resolve the just-pulled intercept with `Forward(None)` instead
                 // of orphaning it in the parked table with nobody to resolve it
                 // (Bug #6).
+                // Clamp the caller-supplied timeout: an unbounded `u64` would
+                // otherwise let one connection hold its pulled intercept for
+                // years (local control-plane DoS — see [`MAX_AWAIT_SECS`]).
+                let timeout_secs = timeout_secs.min(MAX_AWAIT_SECS);
                 let pulled = state
                     .intercept
                     .take_next(Duration::from_secs(timeout_secs))
@@ -473,7 +522,7 @@ pub fn read_dns_port(path: &Path) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::ControlClient;
+    use crate::control::{ControlClient, HeaderEdit};
 
     fn ctrl_state() -> ControlState {
         ControlState::new("default", 5353, InterceptController::new())
@@ -589,6 +638,53 @@ mod tests {
             InterceptDecision::Forward(Some(d)) => assert_eq!(d.body, b"edited"),
             other => panic!("expected forward-with-edit, got {other:?}"),
         }
+    }
+
+    /// CRLF header injection: a `set_header` whose name/value carries `\r`/`\n`
+    /// (or NUL) must NOT be appended to the forwarded header block — otherwise it
+    /// would smuggle extra header lines into the upstream request. The clean edit
+    /// in the same batch is still applied.
+    #[test]
+    fn apply_edits_drops_crlf_header_injection() {
+        let data = InterceptData {
+            host: "example.com".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            headers: b"Host: example.com\r\n".to_vec(),
+            body: Vec::new(),
+        };
+        let edits = Edits {
+            set_headers: vec![
+                // Malicious: value smuggles a whole extra header line.
+                HeaderEdit {
+                    name: "X-Evil".into(),
+                    value: "a\r\nX-Injected: 1".into(),
+                },
+                // Malicious: newline in the name.
+                HeaderEdit {
+                    name: "X-Bad\nName".into(),
+                    value: "v".into(),
+                },
+                // Benign: must be applied.
+                HeaderEdit {
+                    name: "X-Good".into(),
+                    value: "ok".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = apply_edits(data, &edits);
+        let headers = String::from_utf8_lossy(&out.headers);
+        assert!(headers.contains("X-Good: ok\r\n"), "clean edit applied");
+        assert!(
+            !headers.contains("X-Injected"),
+            "smuggled header must be dropped: {headers:?}"
+        );
+        assert!(
+            !headers.contains("X-Evil"),
+            "injecting edit must be dropped entirely: {headers:?}"
+        );
+        assert!(!headers.contains("X-Bad"), "newline-in-name edit dropped");
     }
 
     #[tokio::test]
@@ -771,6 +867,55 @@ mod tests {
         assert!(matches!(shut, ControlResponse::Ack));
         // The server returns Ok after a shutdown.
         server.await.unwrap().unwrap();
+    }
+
+    /// Connections are served on independent tasks (not inline): a connection
+    /// parked in a long-poll `InterceptAwait` must NOT block a second client's
+    /// `Status` round-trip. Before the spawn fix this Status would hang behind
+    /// the long-poll until it timed out.
+    #[tokio::test]
+    async fn long_poll_does_not_block_other_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let state = ctrl_state();
+
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move { serve_control(state, &server_sock).await });
+
+        // Client A enters a long-poll (nothing parked ⇒ it blocks in take_next).
+        let mut a = ControlClient::connect_retry(&sock, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let await_task = tokio::spawn(async move { a.intercept_await(30).await });
+        // Give A a beat to be accepted and enter the long-poll.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Client B's Status must return promptly despite A holding a connection.
+        let mut b = ControlClient::connect(&sock).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), b.status())
+            .await
+            .expect("Status must not block behind the long-poll")
+            .unwrap();
+        assert!(matches!(
+            status,
+            ControlResponse::Status { running: true, .. }
+        ));
+
+        // Clean up: shut down (also unblocks A's connection task).
+        let _ = b.shutdown().await;
+        let _ = await_task.await;
+        let _ = server.await;
+    }
+
+    /// The await timeout is clamped to [`MAX_AWAIT_SECS`] so a caller can't pass
+    /// a huge `u64` and wedge a connection for years (local control-plane DoS).
+    #[test]
+    fn await_timeout_is_clamped() {
+        // `black_box` keeps clippy from const-folding the clamp away (the point is
+        // to exercise the runtime `.min` the handler applies to a wire value).
+        let huge = std::hint::black_box(u64::MAX);
+        assert_eq!(huge.min(MAX_AWAIT_SECS), MAX_AWAIT_SECS);
+        assert_eq!(std::hint::black_box(10u64).min(MAX_AWAIT_SECS), 10);
     }
 
     #[test]

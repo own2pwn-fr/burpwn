@@ -38,6 +38,17 @@ pub enum StoreError {
         /// Highest version this build can apply.
         supported: i64,
     },
+
+    /// A compressed blob decoded to more bytes than its recorded `size` (or the
+    /// hard ceiling) allows — refused rather than risking an OOM from a tampered
+    /// or maliciously-fed high-ratio frame.
+    #[error("blob {id} decoded to an oversized payload (limit {limit} bytes)")]
+    BlobTooLarge {
+        /// The offending blob row id.
+        id: i64,
+        /// The byte limit that was exceeded.
+        limit: u64,
+    },
 }
 
 /// Convenience result alias for the store crate.

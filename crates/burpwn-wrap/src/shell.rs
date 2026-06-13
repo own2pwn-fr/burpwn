@@ -7,14 +7,26 @@
 //! ## Mechanism (and why)
 //!
 //! A `command_not_found_handler` is useless here (the command *is* found). The
-//! robust, shell-portable approach we generate is a **`preexec` rewrite**:
+//! robust, shell-portable approach we generate is a **`preexec`-style hook**:
 //!
 //! * In zsh: a `preexec` function fires with the about-to-run command line.
-//! * In bash: we emulate the same via a `DEBUG` trap guarded by
-//!   `$BASH_COMMAND`, gated on an interactive shell.
+//! * In bash: a `DEBUG` trap guarded by `$BASH_COMMAND`, gated on an interactive
+//!   shell, fires on each command.
 //!
-//! The snippet does NOT try to silently re-exec the typed command (that fights
-//! the shell and is fragile). Instead it follows rtk's pragmatic model:
+//! ## Auto-capture (`BURPWN_AUTO=1`) is zsh-only — bash stays tip-only
+//!
+//! The two hooks are NOT equivalent for *active rewrite*. A zsh `preexec` that
+//! returns 130 cancels the original line, so it can re-run the command through
+//! `burpwn exec` exactly once (captured). A bash `DEBUG` trap canNOT cancel the
+//! top-level interactive command — a non-zero return from the trap does not stop
+//! it — so re-running the command inside the trap would execute it TWICE: once
+//! captured (in the trap) and once OUTSIDE the sandbox (uncaptured), defeating
+//! capture and double-running side effects. Therefore active auto-capture is
+//! enabled ONLY under zsh; under bash the hook is strictly tip-only (it prints a
+//! reminder and lets the command run normally) even with `BURPWN_AUTO=1`.
+//!
+//! The snippet does NOT try to silently re-exec the typed command on bash (that
+//! fights the shell and is fragile). Instead it follows rtk's pragmatic model:
 //!
 //!   1. Define a `burpwn` passthrough so the snippet is self-contained.
 //!   2. On each command, if the program is not excluded and not already a
@@ -22,11 +34,12 @@
 //!      scripted agent reading the TTY) should run it via `burpwn exec --`.
 //!   3. Provide a `bw` helper function: `bw <cmd…>` ⇒ `burpwn exec -- <cmd…>`
 //!      (argv passed through verbatim — no shell re-parse), and a
-//!      `BURPWN_AUTO=1` opt-in that makes the preexec actively re-run the whole
-//!      command line through `burpwn exec -- sh -c "$cmd"` (off by default to
-//!      avoid surprising an interactive operator). The `sh -c` form ensures a
-//!      compound line (`&&`, `;`, `|`, `$(…)`) runs entirely inside one sandbox
-//!      rather than only its first top-level segment.
+//!      `BURPWN_AUTO=1` opt-in that, ON ZSH ONLY, makes the preexec actively
+//!      re-run the whole command line through `burpwn exec -- sh -c "$cmd"` (off
+//!      by default to avoid surprising an interactive operator; on bash it stays
+//!      a tip). The `sh -c` form ensures a compound line (`&&`, `;`, `|`, `$(…)`)
+//!      runs entirely inside one sandbox rather than only its first top-level
+//!      segment.
 //!
 //! The accompanying [`shell_wrapper_script`] is a tiny executable an operator
 //! can set as a custom agent's shell (`SHELL=/…/burpwn-shell`) for fully
@@ -91,12 +104,20 @@ __burpwn_exclude={excl}
 
 # True if $1 (a full command line) should be wrapped.
 __burpwn_should_wrap() {{
-  local line="$1" prog="" next="" tok seen_prog=0
+  local line="$1" prog="" next="" tok seen_prog=0 __burpwn_had_noglob=0
   # Extract the PROGRAM token: skip leading VAR=val assignments and a benign
   # wrapper prefix (sudo/env/command/nice/nohup), strip any path, and remember
   # the token right after it. Anchoring to the program (rather than scanning the
   # whole line) avoids a false "already wrapped" on a command that merely
   # mentions `burpwn exec` as an argument — which would silently skip capture.
+  #
+  # Disable globbing (noglob) around the unquoted `$line` scan: word-splitting
+  # is wanted here, but pathname expansion is NOT — a line containing a glob
+  # (`echo *`, `./*.sh`, `[abc]`) would otherwise make the loop iterate over
+  # matching FILENAMES instead of the literal command tokens, mis-detecting the
+  # program. Save/restore the caller's noglob state. POSIX/bash/zsh-portable.
+  case $- in *f*) __burpwn_had_noglob=1 ;; *) __burpwn_had_noglob=0 ;; esac
+  set -f
   for tok in $line; do
     if [ "$seen_prog" = "1" ]; then next="$tok"; break; fi
     case "$tok" in
@@ -105,6 +126,7 @@ __burpwn_should_wrap() {{
       *) prog="${{tok##*/}}"; seen_prog=1 ;;
     esac
   done
+  [ "$__burpwn_had_noglob" = "0" ] && set +f
   [ -z "$prog" ] && return 1
   # Already wrapped? (program is `burpwn` followed by `exec`, or the `bw` helper.)
   if {{ [ "$prog" = "burpwn" ] && [ "$next" = "exec" ]; }} || [ "$prog" = "bw" ]; then
@@ -120,17 +142,31 @@ __burpwn_should_wrap() {{
 # `bw <cmd...>` — explicit helper to run a command through burpwn.
 bw() {{ command burpwn exec -- "$@"; }}
 
-# preexec-style rewrite. With BURPWN_AUTO=1 it re-runs the typed command via
-# `burpwn exec`; otherwise it just prints a reminder (non-invasive default).
+# preexec-style handler. $1 is the command line; $2 is the MODE:
+#   rewrite  — active auto-capture is supported (zsh `preexec`): with
+#              BURPWN_AUTO=1 re-run the whole line through `burpwn exec` and
+#              return 130 so zsh cancels the original (already-handled) line.
+#   tip-only — active auto-capture is NOT supported on this shell (bash DEBUG
+#              trap): NEVER execute here. A bash DEBUG trap's non-zero return
+#              does NOT cancel the top-level interactive command, so re-running
+#              the command in this path would run it TWICE — once captured here
+#              and once OUTSIDE the sandbox (uncaptured), defeating capture and
+#              double-running side effects. So on bash we only ever print a tip.
+# Without BURPWN_AUTO=1 both modes just print a non-invasive reminder.
 __burpwn_preexec() {{
-  local cmd="$1"
+  local cmd="$1" mode="${{2:-tip-only}}"
   __burpwn_should_wrap "$cmd" || return 0
   if [ "${{BURPWN_AUTO:-0}}" = "1" ]; then
-    print -r -- "[burpwn] wrapping: $cmd" 2>/dev/null || echo "[burpwn] wrapping: $cmd"
-    # Run the WHOLE line inside one sandboxed shell so compound commands
-    # (&&, ;, |, $(…)) are captured in full, not just the first segment.
-    command burpwn exec -- sh -c "$cmd"
-    return 130   # signal the original line was already handled (zsh)
+    if [ "$mode" = "rewrite" ]; then
+      print -r -- "[burpwn] wrapping: $cmd" 2>/dev/null || echo "[burpwn] wrapping: $cmd"
+      # Run the WHOLE line inside one sandboxed shell so compound commands
+      # (&&, ;, |, $(…)) are captured in full, not just the first segment.
+      command burpwn exec -- sh -c "$cmd"
+      return 130   # signal the original line was already handled (zsh)
+    else
+      # bash: auto-capture can't be enforced from a DEBUG trap (see above).
+      echo "[burpwn] tip: BURPWN_AUTO auto-capture is zsh-only on this shell; use 'bw <cmd>' or set SHELL=burpwn-shell" >&2
+    fi
   else
     echo "[burpwn] tip: export BURPWN_AUTO=1 to auto-capture, or run: burpwn exec -- sh -c '$cmd'" >&2
   fi
@@ -139,7 +175,10 @@ __burpwn_preexec() {{
 if [ -n "$ZSH_VERSION" ]; then
   autoload -Uz add-zsh-hook 2>/dev/null
   if typeset -f add-zsh-hook >/dev/null 2>&1; then
-    add-zsh-hook preexec __burpwn_preexec
+    # zsh preexec CAN cancel the original line (return 130), so active rewrite
+    # is safe here.
+    __burpwn_zsh_preexec() {{ __burpwn_preexec "$1" rewrite; }}
+    add-zsh-hook preexec __burpwn_zsh_preexec
   fi
 elif [ -n "$BASH_VERSION" ]; then
   case $- in
@@ -147,7 +186,10 @@ elif [ -n "$BASH_VERSION" ]; then
       __burpwn_debug_trap() {{
         [ -n "$COMP_LINE" ] && return            # skip completion
         [ "$BASH_COMMAND" = "$PROMPT_COMMAND" ] && return
-        __burpwn_preexec "$BASH_COMMAND"
+        # tip-only: a bash DEBUG trap cannot cancel the interactive command, so
+        # we must NOT re-run it here (that would execute it twice, the 2nd run
+        # uncaptured). Auto-capture is zsh-only.
+        __burpwn_preexec "$BASH_COMMAND" tip-only
       }}
       trap '__burpwn_debug_trap' DEBUG
       ;;
@@ -272,6 +314,43 @@ mod tests {
     fn snippet_embeds_exclusions_quoted() {
         let s = global_shell_snippet(&["git".into(), "weird name".into()]);
         assert!(s.contains("__burpwn_exclude=('git' 'weird name')"));
+    }
+
+    #[test]
+    fn snippet_auto_capture_is_zsh_only() {
+        // Finding #1: under BURPWN_AUTO the active rewrite (`burpwn exec -- sh -c`)
+        // must run ONLY from the zsh preexec path, never from the bash DEBUG-trap
+        // path (where it would double-run the command, the 2nd run uncaptured).
+        let s = global_shell_snippet(&[]);
+
+        // zsh wires preexec in "rewrite" mode; bash DEBUG trap wires "tip-only".
+        assert!(s.contains(r#"__burpwn_preexec "$1" rewrite"#));
+        assert!(s.contains(r#"__burpwn_preexec "$BASH_COMMAND" tip-only"#));
+
+        // The active rewrite lives behind the `rewrite` mode guard.
+        let rewrite_pos = s
+            .find(r#"if [ "$mode" = "rewrite" ]; then"#)
+            .expect("rewrite-mode guard present");
+        let exec_pos = s
+            .find("command burpwn exec -- sh -c")
+            .expect("active rewrite present");
+        assert!(
+            exec_pos > rewrite_pos,
+            "active rewrite must be inside the rewrite-mode branch"
+        );
+
+        // The bash trap's tip mentions auto-capture is zsh-only.
+        assert!(s.contains("auto-capture is zsh-only on this shell"));
+    }
+
+    #[test]
+    fn snippet_disables_globbing_for_token_scan() {
+        // Finding #3: the program-token scan over unquoted `$line` must run with
+        // globbing disabled so a glob in the command line isn't pathname-expanded.
+        let s = global_shell_snippet(&[]);
+        assert!(s.contains("set -f"));
+        assert!(s.contains("set +f"));
+        assert!(s.contains("__burpwn_had_noglob"));
     }
 
     #[test]

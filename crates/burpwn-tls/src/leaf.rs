@@ -14,6 +14,7 @@
 
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lru::LruCache;
@@ -33,6 +34,13 @@ use crate::error::{Result, TlsError};
 /// inserting a new key evicts the least-recently-used one. Bounds attacker-driven
 /// memory + keygen cost from many distinct client-supplied SNIs.
 const CACHE_CAP: usize = 2048;
+
+/// Maximum SNI length we will mint a leaf for (and use as a cache key). A DNS
+/// name maxes out at 253 octets (RFC 1035 §2.3.4, presentation form), so an SNI
+/// longer than this is never a real hostname — it is an attacker padding the
+/// per-entry cache key / SAN. We fail closed on anything longer rather than
+/// minting and growing memory by the attacker's chosen amount.
+const MAX_SNI_LEN: usize = 253;
 
 /// Mints and caches leaf certificates signed by the install CA.
 #[derive(Debug)]
@@ -87,6 +95,12 @@ impl LeafGenerator {
         sni: Option<&str>,
         dst_ip: Option<IpAddr>,
     ) -> Result<Arc<CertifiedKey>> {
+        // Fail closed on an absurd / invalid attacker-chosen SNI before it ever
+        // becomes a cache key or a SAN: drop it to `None` so we fall back to the
+        // destination IP (passthrough-style) instead of minting a leaf and
+        // growing memory by the attacker's chosen length. Length is bounded to
+        // the DNS maximum and the value must be a valid server name.
+        let sni = sni.filter(|s| !s.is_empty() && is_acceptable_sni(s));
         let key = cache_key(sni, dst_ip)?;
 
         // Fast path: already cached (and marks the entry most-recently-used).
@@ -147,9 +161,16 @@ fn leaf_params(sni: Option<&str>, dst_ip: Option<IpAddr>) -> Result<CertificateP
     let mut sans = Vec::new();
     let mut cn = None;
     if let Some(s) = sni.filter(|s| !s.is_empty()) {
-        let dns = Ia5String::try_from(s.to_string())
-            .map_err(|e| TlsError::InvalidSan(s.to_string(), e.to_string()))?;
-        sans.push(SanType::DnsName(dns));
+        // If the SNI is itself an IP literal, emit an iPAddress SAN — a DnsName
+        // SAN carrying an IP makes strict clients reject the leaf. Otherwise it
+        // is a hostname and goes in as a DnsName SAN.
+        if let Ok(ip) = IpAddr::from_str(s) {
+            sans.push(SanType::IpAddress(ip));
+        } else {
+            let dns = Ia5String::try_from(s.to_string())
+                .map_err(|e| TlsError::InvalidSan(s.to_string(), e.to_string()))?;
+            sans.push(SanType::DnsName(dns));
+        }
         cn = Some(s.to_string());
     }
     if let Some(ip) = dst_ip {
@@ -189,6 +210,13 @@ fn leaf_params(sni: Option<&str>, dst_ip: Option<IpAddr>) -> Result<CertificateP
 /// proxy can call on a captured SNI before handing it here).
 pub fn is_valid_server_name(name: &str) -> bool {
     ServerName::try_from(name.to_string()).is_ok()
+}
+
+/// Whether `sni` is acceptable to mint a leaf for: length-bounded to the DNS
+/// maximum ([`MAX_SNI_LEN`]) and a valid TLS server name. Rejecting here keeps an
+/// attacker from using an oversized/garbage SNI as an unbounded cache key or SAN.
+fn is_acceptable_sni(sni: &str) -> bool {
+    sni.len() <= MAX_SNI_LEN && is_valid_server_name(sni)
 }
 
 #[cfg(test)]
@@ -310,6 +338,69 @@ mod tests {
             gen.cache_len()
         );
         assert_eq!(gen.cache_len(), cap, "cache should be saturated at the cap");
+    }
+
+    /// Finding #6: an IP-literal SNI must produce an iPAddress SAN, not a
+    /// DnsName SAN (strict clients reject a DnsName carrying an IP).
+    #[test]
+    fn ip_literal_sni_yields_ip_san_not_dns() {
+        let (_d, gen) = generator();
+        let ck = gen.get_or_make(Some("192.0.2.10"), None).unwrap();
+        assert!(
+            leaf_dns_sans(&ck).is_empty(),
+            "IP-literal SNI must NOT land in a DnsName SAN"
+        );
+        assert_eq!(
+            leaf_ip_sans(&ck),
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))],
+            "IP-literal SNI must land in an iPAddress SAN"
+        );
+    }
+
+    /// An IPv6-literal SNI is likewise emitted as an iPAddress SAN.
+    #[test]
+    fn ipv6_literal_sni_yields_ip_san() {
+        let (_d, gen) = generator();
+        let ck = gen.get_or_make(Some("::1"), None).unwrap();
+        assert!(leaf_dns_sans(&ck).is_empty());
+        assert_eq!(leaf_ip_sans(&ck), vec!["::1".parse::<IpAddr>().unwrap()]);
+    }
+
+    /// Finding #5: an over-long SNI is rejected before minting. With no IP to
+    /// fall back to, the whole call errors (fail closed) rather than minting a
+    /// leaf and caching an attacker-sized key.
+    #[test]
+    fn oversize_sni_is_rejected_without_minting() {
+        let (_d, gen) = generator();
+        let huge = "a".repeat(MAX_SNI_LEN + 1);
+        assert!(
+            gen.get_or_make(Some(&huge), None).is_err(),
+            "absurd SNI with no IP fallback must fail closed"
+        );
+        assert_eq!(gen.cache_len(), 0, "nothing minted, nothing cached");
+    }
+
+    /// An over-long SNI alongside a destination IP falls back to the IP (the SNI
+    /// is dropped), so we mint an IP-only leaf rather than honoring the garbage.
+    #[test]
+    fn oversize_sni_falls_back_to_dst_ip() {
+        let (_d, gen) = generator();
+        let huge = "a".repeat(MAX_SNI_LEN + 1);
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let ck = gen.get_or_make(Some(&huge), Some(ip)).unwrap();
+        assert!(
+            leaf_dns_sans(&ck).is_empty(),
+            "the absurd SNI must not appear as a SAN"
+        );
+        assert_eq!(leaf_ip_sans(&ck), vec![ip]);
+        assert_eq!(gen.cache_len(), 1, "keyed by the dst IP, bounded length");
+    }
+
+    /// `is_acceptable_sni` accepts a normal hostname but rejects an over-long one.
+    #[test]
+    fn acceptable_sni_length_gate() {
+        assert!(is_acceptable_sni("example.com"));
+        assert!(!is_acceptable_sni(&"a".repeat(MAX_SNI_LEN + 1)));
     }
 
     /// A freshly minted leaf's `not_before` must be at or before "now": never

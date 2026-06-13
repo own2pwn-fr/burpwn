@@ -42,7 +42,7 @@ pub mod server;
 
 use anyhow::Result;
 
-use burpwn_cli::paths::Paths;
+use burpwn_cli::paths::{validate_session_name, Paths};
 
 /// Default server-side `await_intercept` timeout (seconds), kept well under the
 /// typical MCP client request timeout so the long-poll returns `{pending:false}`
@@ -70,6 +70,12 @@ pub async fn run(args: McpArgs) -> Result<i32> {
 
     let paths = Paths::resolve()?;
     let session = args.session.unwrap_or_else(|| paths.active_session());
+    // Reject a traversing `--session` (e.g. `../../tmp/x`) BEFORE building any
+    // filesystem path from it, so a caller can never escape the sessions dir.
+    // `active_session()` is already self-validating (see paths.rs), so this only
+    // ever rejects an explicitly-passed bad name.
+    validate_session_name(&session)
+        .map_err(|e| anyhow::anyhow!("invalid --session {session:?}: {e}"))?;
     // Ensure the session dir exists so query tools can open an (empty) store.
     paths.ensure_session_dir(&session)?;
 
@@ -95,6 +101,18 @@ mod tests {
     fn mcp_args_default_has_no_session() {
         let a = McpArgs::default();
         assert!(a.session.is_none());
+    }
+
+    /// A traversing `--session` must be rejected before any FS path is built
+    /// from it, so `burpwn mcp --session ../../tmp/x` can't escape the sessions
+    /// dir. This mirrors the guard `run()` applies (the same
+    /// `validate_session_name` used by `cmd_exec`/`cmd_proxy`).
+    #[test]
+    fn traversing_session_is_rejected() {
+        assert!(validate_session_name("../../tmp/x").is_err());
+        assert!(validate_session_name("..").is_err());
+        assert!(validate_session_name("a/b").is_err());
+        assert!(validate_session_name("ok-1").is_ok());
     }
 
     #[tokio::test]

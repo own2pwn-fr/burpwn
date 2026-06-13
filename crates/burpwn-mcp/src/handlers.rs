@@ -421,17 +421,39 @@ pub async fn run_exec(session: &str, params: &crate::params::ExecParams) -> Resu
         drop(std::fs::File::from_raw_fd(write_fd));
     }
 
-    // Read the envelope from the pipe read end.
-    // SAFETY: read_fd is a valid owned fd; into a tokio File for async reads.
+    // Read the envelope from the pipe read end, concurrently with the child's
+    // exit. SAFETY: read_fd is a valid owned fd; into a tokio File for async
+    // reads.
     let std_read = unsafe { std::fs::File::from_raw_fd(read_fd) };
     let mut reader = tokio::fs::File::from_std(std_read);
     let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
-        .await
-        .context("reading exec envelope from fd 3")?;
 
-    let status = child.wait().await.context("waiting for burpwn exec")?;
+    // A grandchild that inherited fd 3 (and outlives the direct child) keeps the
+    // pipe's write end open, so `read_to_end` would block on an EOF that never
+    // comes — hanging the whole MCP tool call. Race the read against the child's
+    // exit + a hard timeout grace: once the child is gone we only briefly wait
+    // for any straggler envelope bytes, then stop reading regardless.
+    let status = {
+        // How long to keep draining fd 3 *after* the child exits before giving
+        // up on a grandchild that's pinning the pipe open.
+        const FD3_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut wait = std::pin::pin!(child.wait());
+        let mut read_all = std::pin::pin!(reader.read_to_end(&mut buf));
+        tokio::select! {
+            // Child exited first (the common case): briefly drain any remaining
+            // envelope bytes, then proceed even if the pipe stays open (a
+            // grandchild may still hold fd 3 — we must not block on it forever).
+            status = &mut wait => {
+                let _ = tokio::time::timeout(FD3_DRAIN_GRACE, &mut read_all).await;
+                status.context("waiting for burpwn exec")?
+            }
+            // The envelope arrived and the writer closed (EOF) before the child
+            // was reaped: now wait for the child normally.
+            _ = &mut read_all => {
+                wait.await.context("waiting for burpwn exec")?
+            }
+        }
+    };
 
     // Best-effort: parse the envelope. The CLI may have written nothing to fd 3
     // if it errored before producing one — fall back to the process status.

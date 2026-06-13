@@ -192,6 +192,12 @@ pub fn ca_env_vars(ca_path: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// Upper bound on the sandbox `/tmp` tmpfs, in bytes. A bind-free tmpfs defaults
+/// to half of host RAM; without a cap an adversarial command can fill RAM by
+/// writing to `/tmp` (the wall-clock timeout bounds *time*, not *bytes*). 1 GiB
+/// is generous for real tooling yet prevents host-memory exhaustion.
+const TMP_TMPFS_SIZE: u64 = 1024 * 1024 * 1024;
+
 /// Build the full `bwrap` argv for the user command. PURE (string-only) so it
 /// is unit-tested. NOTE: `--unshare-net` is intentionally ABSENT — bwrap must
 /// inherit the netns we created so the REDIRECT ruleset applies.
@@ -204,6 +210,16 @@ pub fn ca_env_vars(ca_path: &str) -> Vec<(String, String)> {
 /// explicitly filter [`SPEC_ENV`] (and the `BURPWN_NETNS_SPEC` literal) out of
 /// the re-injected `spec.env` so the serialized spec can never leak through,
 /// even though `spec.env` was populated from the full inherited host env.
+///
+/// SECURITY (control-plane isolation): `--ro-bind / /` would otherwise expose
+/// the session run directory — which holds `proxy.sock` (the SCM fd-passing
+/// socket) and `control.sock` (the intercept/daemon control channel). A unix
+/// socket `connect()` is NOT IP traffic, so the netns/nft egress isolation does
+/// not cover it: a wrapped command could reach `proxy.sock` to forge
+/// `PassedConn` attribution headers or `control.sock` to drive the daemon. We
+/// overlay an empty `--tmpfs` on that directory so neither socket is reachable
+/// from inside the sandbox. The in-netns acceptor lives OUTSIDE bwrap (it is the
+/// agent process, not the wrapped command), so it still reaches `proxy.sock`.
 pub fn build_bwrap_argv(spec: &ExecSpec) -> Vec<String> {
     let workdir = spec.workdir.to_string_lossy().to_string();
     let ca = spec.ca_path.to_string_lossy().to_string();
@@ -215,10 +231,31 @@ pub fn build_bwrap_argv(spec: &ExecSpec) -> Vec<String> {
     push(&mut args, &["bwrap"]);
     // Start from an EMPTY environment; the command gets only what we --setenv.
     push(&mut args, &["--clearenv"]);
+    // A new terminal session detaches the wrapped command from the caller's
+    // controlling TTY, preventing TIOCSTI input-injection back into the operator
+    // shell in inherit-stdio mode (a classic sandbox-escape-via-tty).
+    push(&mut args, &["--new-session"]);
     push(&mut args, &["--ro-bind", "/", "/"]);
     push(&mut args, &["--dev", "/dev"]);
     push(&mut args, &["--proc", "/proc"]);
-    push(&mut args, &["--tmpfs", "/tmp"]);
+    // Size-capped tmpfs (see TMP_TMPFS_SIZE) so a runaway command cannot exhaust
+    // host RAM via /tmp. `--size` applies to the NEXT --tmpfs (bwrap >= 0.5).
+    args.extend([
+        "--size".to_string(),
+        TMP_TMPFS_SIZE.to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+    ]);
+    // Mask the session run directory (proxy.sock + control.sock) so the wrapped
+    // command cannot reach the host control plane through `--ro-bind / /`. Must
+    // come AFTER `--ro-bind / /` to overlay it. The acceptor that legitimately
+    // uses proxy.sock runs in the agent process, outside this bwrap image.
+    if let Some(run_dir) = spec.proxy_sock.parent() {
+        let run_dir = run_dir.to_string_lossy().to_string();
+        if !run_dir.is_empty() && run_dir != "/" {
+            args.extend(["--tmpfs".to_string(), run_dir]);
+        }
+    }
     // The command's working directory is bind-mounted rw.
     args.extend([
         "--bind".to_string(),
@@ -381,10 +418,17 @@ mod privileged {
         // permits the unprivileged single-uid map write AFTER the child has
         // actually unshared CLONE_NEWUSER. Writing the map immediately after
         // fork (before the child's unshare lands) races and fails with EPERM.
-        let (ready_r, ready_w) =
-            nix::unistd::pipe().map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
-        let (go_r, go_w) =
-            nix::unistd::pipe().map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
+        // O_CLOEXEC on every pipe end: the handshake ends (`ready_w`/`go_r`) are
+        // used by the forked child only BEFORE its `execve`, so closing them on
+        // exec is exactly right — without CLOEXEC they would leak (as dead pipe
+        // fds) through the agent re-exec into the wrapped command's fd table. The
+        // capture write-ends are re-published onto fd 1/2 via `dup2` (which
+        // clears CLOEXEC on the copy), so they still survive into the command.
+        use nix::fcntl::OFlag;
+        let (ready_r, ready_w) = nix::unistd::pipe2(OFlag::O_CLOEXEC)
+            .map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
+        let (go_r, go_w) = nix::unistd::pipe2(OFlag::O_CLOEXEC)
+            .map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
 
         // In capture mode (the default), create stdout/stderr pipes BEFORE
         // forking. The child `dup2`s the write-ends onto fd 1/2 before
@@ -394,9 +438,9 @@ mod privileged {
         let (out_pipe, err_pipe) = if spec.inherit_stdio {
             (None, None)
         } else {
-            let out = nix::unistd::pipe()
+            let out = nix::unistd::pipe2(OFlag::O_CLOEXEC)
                 .map_err(|e| SandboxError::Runtime(format!("stdout pipe: {e}")))?;
-            let err = nix::unistd::pipe()
+            let err = nix::unistd::pipe2(OFlag::O_CLOEXEC)
                 .map_err(|e| SandboxError::Runtime(format!("stderr pipe: {e}")))?;
             (Some(out), Some(err))
         };
@@ -795,6 +839,20 @@ mod privileged {
         // exec replaces the image; if it returns, it errored.
         let err = {
             use std::os::unix::process::CommandExt;
+            // Disable core dumps for the wrapped (untrusted) command so a crash
+            // cannot spill sandbox memory to host disk. setrlimit is
+            // async-signal-safe, so it is sound in `pre_exec`.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let lim = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    // Best-effort: failure here must not abort the exec.
+                    libc::setrlimit(libc::RLIMIT_CORE, &lim);
+                    Ok(())
+                });
+            }
             cmd.exec()
         };
         tracing::error!(error = %err, "burpwn sandbox: bwrap exec failed");
@@ -947,6 +1005,52 @@ mod tests {
         assert!(joined.contains("--ro-bind /etc/burpwn/ca.pem /etc/burpwn/ca.pem"));
         assert!(joined.contains("--die-with-parent"));
         assert!(joined.contains("--unshare-pid"));
+        // TTY-injection defense + a size-capped /tmp tmpfs.
+        assert!(joined.contains("--new-session"));
+        assert!(joined.contains(&format!("--size {TMP_TMPFS_SIZE} --tmpfs /tmp")));
+    }
+
+    #[test]
+    fn bwrap_argv_masks_the_session_run_dir() {
+        // SECURITY: proxy.sock + control.sock live in the session run dir; the
+        // sandbox must overlay a tmpfs on it so the wrapped command cannot reach
+        // the host control plane (a unix connect bypasses the nft egress rules).
+        let argv = build_bwrap_argv(&spec()); // proxy_sock = /run/burpwn/proxy.sock
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("--tmpfs /run/burpwn"),
+            "the run dir holding proxy.sock/control.sock must be masked: {joined}"
+        );
+        // The mask must come AFTER `--ro-bind / /` to actually overlay it.
+        let robind = argv.iter().position(|a| a == "/").unwrap();
+        let mask = argv
+            .iter()
+            .position(|a| a == "/run/burpwn")
+            .expect("run-dir tmpfs present");
+        assert!(mask > robind, "run-dir tmpfs must overlay --ro-bind / /");
+    }
+
+    #[test]
+    fn bwrap_argv_isolation_invariant_ordering() {
+        // REGRESSION GUARD for the confidentiality invariant: `--proc /proc` must
+        // come AFTER `--ro-bind / /` (so the fresh procfs masks the host /proc
+        // that ro-bind would otherwise expose — incl. /proc/<daemon>/environ),
+        // and `--unshare-pid` must be present (so the daemon's PID is not even
+        // visible). Dropping/reordering either silently re-exposes host secrets.
+        let argv = build_bwrap_argv(&spec());
+        let robind = argv
+            .windows(3)
+            .position(|w| w == ["--ro-bind", "/", "/"])
+            .expect("--ro-bind / / present");
+        let proc = argv
+            .windows(2)
+            .position(|w| w == ["--proc", "/proc"])
+            .expect("--proc /proc present");
+        assert!(
+            proc > robind,
+            "--proc /proc must come after --ro-bind / / to mask host /proc"
+        );
+        assert!(argv.iter().any(|a| a == "--unshare-pid"));
     }
 
     #[test]
