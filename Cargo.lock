@@ -278,6 +278,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "brotli",
+ "burpwn-sandbox",
  "burpwn-store",
  "burpwn-tls",
  "bytes",
