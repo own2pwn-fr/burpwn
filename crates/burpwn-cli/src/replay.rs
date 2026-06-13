@@ -1,23 +1,20 @@
 //! `req replay` (Repeater): rebuild a stored request, apply edits, send it and
-//! record the result as a new flow.
+//! return the response.
 //!
-//! ## v1 transport (documented limitation)
+//! ## Transport
 //!
-//! Replay sends via a **direct tokio TCP client** speaking raw HTTP/1.1 to the
-//! flow's destination. This is fully implemented for **cleartext HTTP** flows
-//! (`scheme == "http"`, protocol `h1`). HTTPS and HTTP/2 replay are intentionally
-//! out of v1 scope (they need the TLS/h2 stack the proxy already owns); they
-//! return a clear "not yet implemented" error rather than sending plaintext to a
-//! TLS port. A later version should route replay through the proxy's own client
-//! path so TLS/h2 are handled by the existing machinery.
+//! Replay routes through [`burpwn_proxy::replay_once`], which owns the TLS/h1/h2
+//! client machinery the proxy already uses. This handles **every** scheme —
+//! cleartext HTTP, HTTPS and HTTP/2 — by dialing `dst_ip:dst_port`, using the
+//! flow's host as both SNI and `:authority`. The edit-application and
+//! request-shaping logic below is transport-agnostic and unit-tested in
+//! isolation.
 
-use std::time::Duration;
+use std::net::SocketAddr;
 
-use anyhow::{anyhow, bail, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use anyhow::{anyhow, bail, Context, Result};
 
-use burpwn_store::model::{FlowDetail, Protocol, RequestData};
+use burpwn_store::model::{FlowDetail, RequestData};
 
 /// One header edit applied to the rebuilt request.
 #[derive(Debug, Clone)]
@@ -100,86 +97,100 @@ fn set_header(raw: &mut Vec<u8>, name: &str, value: &str) {
     *raw = out.into_bytes();
 }
 
-/// Serialize a [`RequestData`] into raw HTTP/1.1 wire bytes for the origin: a
-/// request line, the (Content-Length-corrected) header block, a blank line, and
-/// the body. The `Host` header is ensured from the authority.
-pub fn serialize_request(req: &RequestData) -> Vec<u8> {
-    let mut headers = req.headers.clone();
-    // Ensure Host and a correct Content-Length.
-    if !has_header(&headers, "host") && !req.authority.is_empty() {
-        set_header(&mut headers, "Host", &req.authority);
-    }
-    set_header(&mut headers, "Content-Length", &req.body.len().to_string());
-    // Connection: close so the origin ends the response and we can read to EOF.
-    set_header(&mut headers, "Connection", "close");
-
+/// Parse a raw `Name: value\r\n` header block into ordered `(name, value)`
+/// pairs, dropping pseudo-headers and the hop-by-hop `Host`/`Content-Length`
+/// (the transport recomputes those). Lines without a colon are skipped.
+pub fn parse_request_headers(raw: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(raw);
     let mut out = Vec::new();
-    out.extend_from_slice(format!("{} {} HTTP/1.1\r\n", req.method, req.path).as_bytes());
-    out.extend_from_slice(&headers);
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&req.body);
+    for line in text.split("\r\n").flat_map(|l| l.split('\n')) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            // Skip pseudo-headers (`:method` etc.) and length/host the transport
+            // derives itself; keep everything else verbatim.
+            if name.is_empty()
+                || name.starts_with(':')
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("host")
+            {
+                continue;
+            }
+            out.push((name.to_string(), value.trim().to_string()));
+        }
+    }
     out
 }
 
-fn has_header(raw: &[u8], name: &str) -> bool {
-    let text = String::from_utf8_lossy(raw);
-    text.split("\r\n").any(|l| {
-        l.split_once(':')
-            .map(|(n, _)| n.trim().eq_ignore_ascii_case(name))
-            .unwrap_or(false)
-    })
+/// The destination socket address parsed from the flow's `dst_ip:dst_port`.
+fn dst_addr(detail: &FlowDetail) -> Result<SocketAddr> {
+    format!("{}:{}", detail.flow.dst_ip, detail.flow.dst_port)
+        .parse()
+        .with_context(|| {
+            format!(
+                "flow {} has an unparseable destination {}:{}",
+                detail.flow.id, detail.flow.dst_ip, detail.flow.dst_port
+            )
+        })
 }
 
-/// Replay the (already-edited) request from `detail` to its destination.
-///
-/// Only cleartext HTTP/1.x is supported in v1; other schemes/protocols error.
+/// The host used for SNI and `:authority`: the recorded SNI, else the request
+/// authority, else the destination ip.
+fn replay_host(detail: &FlowDetail, req: &RequestData) -> String {
+    detail
+        .flow
+        .sni
+        .clone()
+        .or_else(|| (!req.authority.is_empty()).then(|| req.authority.clone()))
+        .or_else(|| detail.flow.authority.clone())
+        .unwrap_or_else(|| detail.flow.dst_ip.clone())
+}
+
+/// Replay the (already-edited) request from `detail` to its destination through
+/// the proxy's transport ([`burpwn_proxy::replay_once`]), which speaks the right
+/// scheme (cleartext / TLS) and HTTP version for the flow. Works for every
+/// scheme; the response is reassembled into raw bytes for display.
 pub async fn replay(detail: &FlowDetail, req: &RequestData) -> Result<ReplayResult> {
-    if detail.flow.scheme.eq_ignore_ascii_case("https")
-        || detail.flow.protocol == Protocol::H2
-        || detail.flow.protocol == Protocol::TlsPassthru
-    {
-        bail!(
-            "replay over TLS/HTTP2 is not yet implemented (flow {} is {} / {:?}); \
-             v1 replays cleartext HTTP only",
-            detail.flow.id,
-            detail.flow.scheme,
-            detail.flow.protocol
-        );
+    let addr = dst_addr(detail)?;
+    let host = replay_host(detail, req);
+    if host.is_empty() {
+        bail!("flow {} has no host to replay to", detail.flow.id);
     }
-    let dst = format!("{}:{}", detail.flow.dst_ip, detail.flow.dst_port);
-    let wire = serialize_request(req);
+    let headers = parse_request_headers(&req.headers);
 
-    let mut stream = tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(&dst))
-        .await
-        .map_err(|_| anyhow!("connect to {dst} timed out"))?
-        .map_err(|e| anyhow!("connect to {dst} failed: {e}"))?;
-
-    stream.write_all(&wire).await?;
-    stream.flush().await?;
-
-    let mut raw_response = Vec::new();
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        stream.read_to_end(&mut raw_response),
+    let resp = burpwn_proxy::replay_once(
+        &detail.flow.scheme,
+        &host,
+        addr,
+        &req.method,
+        &host,
+        &req.path,
+        headers,
+        req.body.clone(),
     )
     .await
-    .map_err(|_| anyhow!("reading response from {dst} timed out"))??;
+    .map_err(|e| anyhow!("replay of flow {} failed: {e}", detail.flow.id))?;
 
-    let status = parse_status(&raw_response);
+    let raw_response = render_response(&resp);
     Ok(ReplayResult {
-        status,
+        status: resp.status,
         raw_response,
     })
 }
 
-/// Parse the status code from a raw HTTP/1.1 response (`HTTP/1.1 200 OK`).
-fn parse_status(raw: &[u8]) -> u16 {
-    let head = &raw[..raw.len().min(64)];
-    let line = String::from_utf8_lossy(head);
-    line.split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0)
+/// Reassemble a [`burpwn_proxy::ReplayResponse`] into raw HTTP-ish bytes (status
+/// line + headers + blank line + body) for human/`--raw` display.
+fn render_response(resp: &burpwn_proxy::ReplayResponse) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("{} {}\r\n", resp.http_version, resp.status).as_bytes());
+    for (name, value) in &resp.headers {
+        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&resp.body);
+    out
 }
 
 #[cfg(test)]
@@ -231,38 +242,29 @@ mod tests {
     }
 
     #[test]
-    fn serialize_adds_content_length_and_connection_close() {
-        let mut req = base_req();
-        req.body = b"abc".to_vec();
-        let wire = serialize_request(&req);
-        let s = String::from_utf8_lossy(&wire);
-        assert!(s.starts_with("GET / HTTP/1.1\r\n"));
-        assert!(s.contains("Content-Length: 3"));
-        assert!(s.contains("Connection: close"));
-        assert!(s.ends_with("\r\nabc"));
+    fn parse_request_headers_drops_host_length_and_pseudo() {
+        let raw = b":method: GET\r\nHost: example.com\r\nContent-Length: 3\r\n\
+                   User-Agent: orig\r\nAccept: */*\r\n";
+        let pairs = parse_request_headers(raw);
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["User-Agent", "Accept"]);
+        assert_eq!(pairs[0].1, "orig");
     }
 
-    #[test]
-    fn parse_status_reads_code() {
-        assert_eq!(parse_status(b"HTTP/1.1 404 Not Found\r\n"), 404);
-        assert_eq!(parse_status(b"garbage"), 0);
-    }
-
-    #[tokio::test]
-    async fn replay_rejects_https() {
-        let detail = FlowDetail {
+    fn detail_for(scheme: &str, port: u16) -> FlowDetail {
+        FlowDetail {
             flow: burpwn_store::model::FlowRow {
                 id: 1,
                 workspace_id: 1,
                 ts_start: 0,
                 ts_end: None,
-                protocol: Protocol::H1,
-                scheme: "https".into(),
-                dst_ip: "1.2.3.4".into(),
-                dst_port: 443,
-                sni: None,
+                protocol: burpwn_store::model::Protocol::H1,
+                scheme: scheme.into(),
+                dst_ip: "127.0.0.1".into(),
+                dst_port: port,
+                sni: Some("example.com".into()),
                 method: Some("GET".into()),
-                authority: Some("x".into()),
+                authority: Some("example.com".into()),
                 path: Some("/".into()),
                 status: None,
                 intercepted: false,
@@ -271,8 +273,46 @@ mod tests {
             client_addr: "127.0.0.1:1".into(),
             request: Some(base_req()),
             response: None,
+            tags: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn replay_host_prefers_sni_then_authority_then_ip() {
+        let mut d = detail_for("https", 443);
+        assert_eq!(replay_host(&d, &base_req()), "example.com");
+        d.flow.sni = None;
+        // falls back to the request authority.
+        assert_eq!(replay_host(&d, &base_req()), "example.com");
+        let mut req = base_req();
+        req.authority = String::new();
+        d.flow.authority = None;
+        assert_eq!(replay_host(&d, &req), "127.0.0.1");
+    }
+
+    #[test]
+    fn render_response_builds_raw_bytes() {
+        let resp = burpwn_proxy::ReplayResponse {
+            status: 200,
+            http_version: "HTTP/1.1".into(),
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+            body: b"hi".to_vec(),
         };
-        let err = replay(&detail, &base_req()).await.unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"));
+        let raw = render_response(&resp);
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.starts_with("HTTP/1.1 200\r\n"));
+        assert!(s.contains("Content-Type: text/plain\r\n"));
+        assert!(s.ends_with("\r\nhi"));
+    }
+
+    /// Live replay requires network/a listening origin; gate it off by default.
+    #[tokio::test]
+    #[ignore = "needs a live origin / network"]
+    async fn replay_round_trips_against_live_origin() {
+        let d = detail_for("http", 80);
+        let res = replay(&d, &base_req()).await;
+        // We only assert it returns; the actual status depends on the network.
+        let _ = res;
     }
 }

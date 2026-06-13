@@ -55,6 +55,7 @@ use tokio::sync::mpsc;
 
 pub use error::{Result, StoreError};
 pub use reader::Reader;
+pub use writer::{AckReply, IdReply, IdsReply};
 pub use writer::{WriteHandle, WriteOp, DEFAULT_CHANNEL_CAP};
 
 /// A per-session store: owns the writer task handle and the read pool.
@@ -394,6 +395,117 @@ mod tests {
             .unwrap();
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].resolved_at, Some(600));
+    }
+
+    #[tokio::test]
+    async fn attribute_flows_stamps_only_in_window_null_exec_flows() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+
+        // Helper that creates a flow with the given ts_start and exec_id.
+        let mk = |ts: i64, exec: Option<&str>| FlowStart {
+            workspace_id: schema::DEFAULT_WORKSPACE_ID,
+            ts_start: ts,
+            exec_id: exec.map(Into::into),
+            client_addr: "127.0.0.1:1".into(),
+            dst_ip: "10.0.0.1".into(),
+            dst_port: 80,
+            sni: None,
+            scheme: "http".into(),
+            protocol: Protocol::H1,
+            intercepted: false,
+        };
+
+        // Pre-window, NULL exec: must NOT be stamped (ts < since).
+        let pre = w.flow_start(mk(100, None)).await.unwrap();
+        // In-window, NULL exec: must be stamped.
+        let in1 = w.flow_start(mk(500, None)).await.unwrap();
+        let in2 = w.flow_start(mk(600, None)).await.unwrap();
+        // In-window but already attributed: must NOT be re-stamped.
+        let already = w.flow_start(mk(700, Some("other-exec"))).await.unwrap();
+
+        // The target workspace must exist (flows.workspace_id is a FK) — the CLI
+        // resolves/creates it before attributing; do the same here.
+        let ws = w.create_workspace("target", 0).await.unwrap();
+
+        let stamped = w.attribute_flows(500, "exec-X", ws).await.unwrap();
+        assert_eq!(stamped, vec![in1, in2], "only in-window NULL-exec flows");
+        assert!(stamped.windows(2).all(|p| p[0] < p[1]), "ascending order");
+
+        // Verify the DB state.
+        let reader = store.reader();
+        assert_eq!(reader.get_flow(pre).unwrap().unwrap().exec_id, None);
+        let d1 = reader.get_flow(in1).unwrap().unwrap();
+        assert_eq!(d1.exec_id.as_deref(), Some("exec-X"));
+        assert_eq!(d1.flow.workspace_id, ws);
+        assert_eq!(
+            reader
+                .get_flow(already)
+                .unwrap()
+                .unwrap()
+                .exec_id
+                .as_deref(),
+            Some("other-exec"),
+            "already-attributed flow is untouched"
+        );
+
+        // A second call stamps nothing (they're no longer NULL-exec).
+        let again = w.attribute_flows(500, "exec-Y", 9).await.unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn match_replace_enable_disable_delete_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let id = w
+            .add_match_replace(NewMatchReplaceRule {
+                enabled: true,
+                scope: "".into(),
+                match_kind: MatchKind::Body,
+                pattern: "a".into(),
+                replacement: "b".into(),
+                on_request: true,
+            })
+            .await
+            .unwrap();
+        assert!(reader.list_match_replace().unwrap()[0].enabled);
+
+        w.set_match_replace_enabled(id, false).await.unwrap();
+        assert!(!reader.list_match_replace().unwrap()[0].enabled);
+
+        w.set_match_replace_enabled(id, true).await.unwrap();
+        assert!(reader.list_match_replace().unwrap()[0].enabled);
+
+        w.delete_match_replace(id).await.unwrap();
+        assert!(reader.list_match_replace().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_flow_includes_tags_and_notes() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let flow_id = w.flow_start(sample_flow()).await.unwrap();
+        w.tag_flow(flow_id, "vuln", None).await.unwrap();
+        w.tag_flow(flow_id, "auth", None).await.unwrap();
+        w.add_note(flow_id, "looks like IDOR", 1).await.unwrap();
+        w.add_note(flow_id, "needs review", 2).await.unwrap();
+
+        let detail = reader.get_flow(flow_id).unwrap().unwrap();
+        // Tags are listed by name (flow_tags orders by t.name).
+        assert_eq!(detail.tags, vec!["auth".to_string(), "vuln".to_string()]);
+        // Notes are listed by ts (oldest first).
+        assert_eq!(
+            detail.notes,
+            vec!["looks like IDOR".to_string(), "needs review".to_string()]
+        );
     }
 
     #[tokio::test]

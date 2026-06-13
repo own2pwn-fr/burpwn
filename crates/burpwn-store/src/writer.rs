@@ -32,6 +32,9 @@ pub type IdReply = oneshot::Sender<Result<i64>>;
 /// A reply channel for ops whose only result is success/failure.
 pub type AckReply = oneshot::Sender<Result<()>>;
 
+/// A reply channel for ops that produce a list of generated/affected ids.
+pub type IdsReply = oneshot::Sender<Result<Vec<i64>>>;
+
 /// Messages consumed by the writer task. Every variant is processed in arrival
 /// order on the single write connection.
 pub enum WriteOp {
@@ -169,6 +172,18 @@ pub enum WriteOp {
         created_at: i64,
         /// Reply with the intercept id.
         reply: IdReply,
+    },
+    /// Attribute every not-yet-attributed flow created at/after `since_ts` to an
+    /// exec + workspace; replies with the ids it stamped (ascending).
+    AttributeFlows {
+        /// Lower-bound (inclusive) `ts_start` for the time window.
+        since_ts: i64,
+        /// Exec correlation id to stamp.
+        exec_id: String,
+        /// Workspace id to stamp.
+        workspace_id: i64,
+        /// Reply with the ids stamped.
+        reply: IdsReply,
     },
     /// Resolve an intercept (set its terminal state + resolved_at).
     ResolveIntercept {
@@ -344,6 +359,50 @@ impl WriteHandle {
         .await?;
         recv_ack(rx).await
     }
+
+    /// Attribute every not-yet-attributed flow created at/after `since_ts` to the
+    /// given exec + workspace. Returns the ids it stamped. Used by `burpwn exec`
+    /// to scope a run's captures (the long-lived daemon records flows with a NULL
+    /// exec_id / default workspace; this assigns them post-hoc by time window).
+    pub async fn attribute_flows(
+        &self,
+        since_ts: i64,
+        exec_id: &str,
+        workspace_id: i64,
+    ) -> Result<Vec<i64>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::AttributeFlows {
+            since_ts,
+            exec_id: exec_id.to_string(),
+            workspace_id,
+            reply,
+        })
+        .await?;
+        recv_ids(rx).await
+    }
+
+    /// Delete a match/replace rule, awaiting ack.
+    pub async fn delete_match_replace(&self, id: i64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::DeleteMatchReplace {
+            id,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
+    /// Enable/disable a match/replace rule, awaiting ack.
+    pub async fn set_match_replace_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::SetMatchReplaceEnabled {
+            id,
+            enabled,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
 }
 
 async fn recv_id(rx: oneshot::Receiver<Result<i64>>) -> Result<i64> {
@@ -357,6 +416,13 @@ async fn recv_ack(rx: oneshot::Receiver<Result<()>>) -> Result<()> {
     match rx.await {
         Ok(r) => r,
         Err(_) => Err(StoreError::NoReply("ack op".into())),
+    }
+}
+
+async fn recv_ids(rx: oneshot::Receiver<Result<Vec<i64>>>) -> Result<Vec<i64>> {
+    match rx.await {
+        Ok(r) => r,
+        Err(_) => Err(StoreError::NoReply("ids op".into())),
     }
 }
 
@@ -479,6 +545,14 @@ fn handle_op(conn: &Connection, op: WriteOp) {
             reply,
         } => {
             let _ = reply.send(do_enqueue_intercept(conn, flow_id, created_at));
+        }
+        WriteOp::AttributeFlows {
+            since_ts,
+            exec_id,
+            workspace_id,
+            reply,
+        } => {
+            let _ = reply.send(do_attribute_flows(conn, since_ts, &exec_id, workspace_id));
         }
         WriteOp::ResolveIntercept {
             id,
@@ -654,6 +728,31 @@ fn do_enqueue_intercept(conn: &Connection, flow_id: i64, created_at: i64) -> Res
         rusqlite::params![flow_id, created_at],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Stamp `exec_id` + `workspace_id` onto every flow whose `ts_start >= since_ts`
+/// that has not yet been attributed (NULL `exec_id`). Returns the affected flow
+/// ids in ascending order. Uses SQLite's `RETURNING` clause.
+fn do_attribute_flows(
+    conn: &Connection,
+    since_ts: i64,
+    exec_id: &str,
+    workspace_id: i64,
+) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "UPDATE flows SET exec_id = ?1, workspace_id = ?2
+         WHERE ts_start >= ?3 AND exec_id IS NULL
+         RETURNING id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![exec_id, workspace_id, since_ts], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    let mut ids = Vec::new();
+    for r in rows {
+        ids.push(r?);
+    }
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 /// Append a text fragment to the contentless FTS index for a flow.

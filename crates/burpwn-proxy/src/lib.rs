@@ -29,6 +29,7 @@ pub mod matchreplace;
 pub mod mitm;
 pub mod passthrough;
 pub mod rawtcp;
+pub mod replay;
 mod util;
 pub mod wire;
 
@@ -58,6 +59,7 @@ pub use crate::intercept::{
     PendingIntercept, PendingSummary,
 };
 pub use crate::mitm::TlsInfo;
+pub use crate::replay::{replay_once, ReplayResponse};
 pub use crate::wire::{PassedConn, L4};
 
 /// Configuration for constructing a [`Proxy`].

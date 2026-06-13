@@ -113,6 +113,22 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
         }
         ControlRequest::InterceptDisable => {
             state.intercept.set_enabled(false);
+            // Purge any already-parked intercepts so stale ids don't linger into
+            // the next enable cycle. Resolve every queued flow (forward
+            // unchanged) and drain the daemon-side parked table (those pulled by
+            // `InterceptAwait`), unblocking their handlers. After this,
+            // `intercept list` is empty and a later `forward <old-id>` honestly
+            // reports "not found".
+            for s in state.intercept.pending() {
+                state
+                    .intercept
+                    .resolve(s.id, InterceptDecision::Forward(None));
+            }
+            let drained: Vec<PendingIntercept> =
+                state.parked.lock().await.drain().map(|(_, p)| p).collect();
+            for p in drained {
+                let _ = p.reply.send(InterceptDecision::Forward(None));
+            }
             ControlResponse::Ack
         }
         ControlRequest::InterceptList => {
@@ -421,6 +437,56 @@ mod tests {
             InterceptDecision::Forward(Some(d)) => assert_eq!(d.body, b"edited"),
             other => panic!("expected forward-with-edit, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn disable_purges_parked_intercepts() {
+        let state = ctrl_state();
+        state.intercept.set_enabled(true);
+
+        // Park an intercept and pull it via Await so it sits in the parked table.
+        let ctrl = state.intercept.clone();
+        let handler = tokio::spawn(async move {
+            ctrl.intercept(
+                InterceptKind::Request,
+                InterceptData {
+                    host: "example.com".into(),
+                    method: "GET".into(),
+                    path: "/x".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+            .await
+        });
+        let resp = handle_request(&state, ControlRequest::InterceptAwait { timeout_secs: 5 }).await;
+        let id = match resp {
+            ControlResponse::Pending { item: Some(i) } => i.id,
+            other => panic!("expected pending, got {other:?}"),
+        };
+
+        // Disable: should drain the parked table and unblock the handler.
+        let ack = handle_request(&state, ControlRequest::InterceptDisable).await;
+        assert!(matches!(ack, ControlResponse::Ack));
+
+        // List is now empty.
+        let listed = handle_request(&state, ControlRequest::InterceptList).await;
+        assert!(matches!(listed, ControlResponse::Intercepts { items } if items.is_empty()));
+
+        // Forwarding the old id is honestly "not found" (queue was cleared).
+        let fwd = handle_request(
+            &state,
+            ControlRequest::InterceptForward {
+                id,
+                edits: Edits::default(),
+            },
+        )
+        .await;
+        assert!(matches!(fwd, ControlResponse::Resolved { found: false }));
+
+        // The parked handler was resolved (forward unchanged), so it completes.
+        let decision = handler.await.unwrap();
+        assert!(matches!(decision, InterceptDecision::Forward(None)));
     }
 
     #[tokio::test]

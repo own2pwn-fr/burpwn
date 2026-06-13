@@ -1,10 +1,25 @@
 //! Pure application of [`MatchReplaceRule`]s to an HTTP message.
 //!
-//! v1 semantics are deliberately regex-free: each rule does a literal substring
-//! replacement of `pattern` with `replacement` on the targeted part of the
-//! message (host / url / header block / body). This keeps the transform total,
-//! cheap, and trivially unit-testable; regex support can layer on later behind
-//! the same [`apply_request`] / [`apply_response`] entry points.
+//! # Regex semantics
+//!
+//! Each rule's `pattern` is a **regular expression** (regex crate syntax) and
+//! `replacement` supports capture references — `$1`, `$name`, `${name}` — exactly
+//! as [`regex::Regex::replace_all`] interprets them. (A plain literal like
+//! `User-Agent: burpwn` is itself a valid regex that matches verbatim, so
+//! literal-style rules keep working.)
+//!
+//! - [`MatchKind::Header`]: the regex runs over the **whole header block**
+//!   (`Name: Value\r\n…`, decoded lossily from bytes), so a pattern like
+//!   `User-Agent: .*` matches and rewrites the entire UA line. The rewritten
+//!   block is written back as bytes.
+//! - [`MatchKind::Host`] / [`MatchKind::Url`]: the regex runs over the string.
+//! - [`MatchKind::Body`]: the regex runs over the body decoded as lossy UTF-8,
+//!   then re-encoded to bytes. If the body is **not valid UTF-8** the rule is a
+//!   safe no-op (we won't risk mangling binary bodies through lossy decoding).
+//!
+//! An **invalid regex pattern** never panics and never aborts the request: the
+//! offending rule is simply skipped (logged at `debug`). Every entry point stays
+//! total and only reports whether anything changed.
 //!
 //! Scope: a rule's `scope` field is a simple substring filter against the
 //! request host. An empty scope (or `"*"`) matches every host.
@@ -13,7 +28,10 @@
 //! them on the hot path and the test-suite can exercise every [`MatchKind`] ×
 //! request/response combination without standing anything up.
 
+use std::borrow::Cow;
+
 use burpwn_store::model::{MatchKind, MatchReplaceRule};
+use regex::{Regex, RegexBuilder};
 
 /// The mutable parts of a message a rule set can rewrite. `headers` is the
 /// order-preserving raw header block (`Name: Value\r\n…`); `host`/`url` are the
@@ -74,54 +92,105 @@ fn scope_matches(scope: &str, host: &str) -> bool {
 }
 
 fn apply_one(rule: &MatchReplaceRule, msg: &mut Message) -> Changed {
+    // An empty pattern matches the empty string at every position; treat it as a
+    // no-op so a blank rule never rewrites a message.
+    if rule.pattern.is_empty() {
+        return false;
+    }
+    // Compile the pattern as a regex. Header rules match case-INSENSITIVELY:
+    // hyper normalizes header names to lowercase (HTTP/2 requires it on the
+    // wire), so the captured block is `user-agent: …` while users naturally
+    // write `User-Agent:` (as in Burp / our docs). An invalid pattern is a safe
+    // no-op: skip the rule rather than panicking or aborting the request.
+    let re = match RegexBuilder::new(&rule.pattern)
+        .case_insensitive(matches!(rule.match_kind, MatchKind::Header))
+        .build()
+    {
+        Ok(re) => re,
+        Err(e) => {
+            tracing::debug!(
+                rule = rule.id,
+                pattern = %rule.pattern,
+                error = %e,
+                "skipping match/replace rule with invalid regex"
+            );
+            return false;
+        }
+    };
     match rule.match_kind {
-        MatchKind::Host => replace_str(&mut msg.host, &rule.pattern, &rule.replacement),
-        MatchKind::Url => replace_str(&mut msg.url, &rule.pattern, &rule.replacement),
-        MatchKind::Header => replace_bytes(
-            &mut msg.headers,
-            rule.pattern.as_bytes(),
-            rule.replacement.as_bytes(),
-        ),
-        MatchKind::Body => replace_bytes(
-            &mut msg.body,
-            rule.pattern.as_bytes(),
-            rule.replacement.as_bytes(),
-        ),
+        MatchKind::Host => replace_str(&mut msg.host, &re, &rule.replacement),
+        MatchKind::Url => replace_str(&mut msg.url, &re, &rule.replacement),
+        // The header block is order-preserving raw bytes that are virtually
+        // always UTF-8 (header names/values are ASCII). Apply the regex
+        // PER LINE so a pattern like `User-Agent: .*` rewrites the value but
+        // never consumes the `\r\n` terminator (regex `.` matches `\r`, so a
+        // whole-block replace would eat it).
+        MatchKind::Header => replace_header_block(&mut msg.headers, &re, &rule.replacement),
+        MatchKind::Body => replace_body(&mut msg.body, &re, &rule.replacement),
     }
 }
 
-/// Literal substring replace on a `String`; no-op (and `false`) if the pattern
-/// is empty or absent.
-fn replace_str(haystack: &mut String, pattern: &str, replacement: &str) -> Changed {
-    if pattern.is_empty() || !haystack.contains(pattern) {
-        return false;
+/// Regex replace-all on a `String`; `false` (no-op) when the pattern doesn't
+/// match. `replacement` honors `$1`/`${name}` capture refs.
+fn replace_str(haystack: &mut String, re: &Regex, replacement: &str) -> Changed {
+    let rewritten = match re.replace_all(haystack, replacement) {
+        Cow::Borrowed(_) => None, // no match → unchanged
+        Cow::Owned(new) => Some(new),
+    };
+    match rewritten {
+        Some(new) => {
+            *haystack = new;
+            true
+        }
+        None => false,
     }
-    *haystack = haystack.replace(pattern, replacement);
-    true
 }
 
-/// Literal substring replace over raw bytes (headers/body may be non-UTF-8).
-fn replace_bytes(haystack: &mut Vec<u8>, pattern: &[u8], replacement: &[u8]) -> Changed {
-    if pattern.is_empty() {
-        return false;
-    }
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    let mut hit = false;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(pattern) {
-            out.extend_from_slice(replacement);
-            i += pattern.len();
-            hit = true;
-        } else {
-            out.push(haystack[i]);
-            i += 1;
+/// Regex replace-all over the raw header block, applied PER LINE (split on
+/// `\r\n`) so the `\r\n` terminators are preserved verbatim — `User-Agent: .*`
+/// rewrites the value, not the line break. The block is decoded lossily (header
+/// names/values are effectively ASCII) and written back as bytes.
+fn replace_header_block(haystack: &mut Vec<u8>, re: &Regex, replacement: &str) -> Changed {
+    let text = String::from_utf8_lossy(haystack);
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split("\r\n").enumerate() {
+        if i > 0 {
+            out.push_str("\r\n");
+        }
+        match re.replace_all(line, replacement) {
+            Cow::Borrowed(_) => out.push_str(line),
+            Cow::Owned(new) => {
+                changed = true;
+                out.push_str(&new);
+            }
         }
     }
-    if hit {
-        *haystack = out;
+    if changed {
+        *haystack = out.into_bytes();
     }
-    hit
+    changed
+}
+
+/// Regex replace-all over a body. The body may be binary, so we require valid
+/// UTF-8: if it isn't, the rule is a documented no-op (we won't risk mangling
+/// binary bodies by lossy-decoding non-UTF-8 bytes).
+fn replace_body(haystack: &mut Vec<u8>, re: &Regex, replacement: &str) -> Changed {
+    let text = match std::str::from_utf8(haystack) {
+        Ok(t) => t,
+        Err(_) => return false, // non-UTF-8 body: safe no-op
+    };
+    let rewritten = match re.replace_all(text, replacement) {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(new) => Some(new.into_bytes()),
+    };
+    match rewritten {
+        Some(bytes) => {
+            *haystack = bytes;
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +245,8 @@ mod tests {
     #[test]
     fn header_rule_preserves_other_headers() {
         let mut m = msg();
+        // A literal substring is a valid regex (no special chars), so a
+        // value-only literal still works as before.
         let changed = apply_request(
             &[rule(MatchKind::Header, "", "curl/8", "burpwn/1", true)],
             &mut m,
@@ -185,6 +256,88 @@ mod tests {
             m.headers,
             b"Host: api.example.com\r\nUser-Agent: burpwn/1\r\n"
         );
+    }
+
+    #[test]
+    fn header_block_user_agent_dotstar_rewrites_whole_line() {
+        // The documented example: `User-Agent: .*` over the header BLOCK rewrites
+        // the whole UA line (regex `.*` does not cross `\r\n`).
+        let mut m = msg();
+        let changed = apply_request(
+            &[rule(
+                MatchKind::Header,
+                "",
+                "User-Agent: .*",
+                "User-Agent: burpwn",
+                true,
+            )],
+            &mut m,
+        );
+        assert!(changed);
+        assert_eq!(
+            m.headers,
+            b"Host: api.example.com\r\nUser-Agent: burpwn\r\n"
+        );
+    }
+
+    #[test]
+    fn header_match_is_case_insensitive_for_lowercased_names() {
+        // hyper lowercases header names (HTTP/2 wire requirement), so the captured
+        // block is `user-agent: …`; the documented `User-Agent: .*` must still match.
+        let mut m = Message {
+            host: "api.example.com".into(),
+            url: "/".into(),
+            headers: b"host: api.example.com\r\nuser-agent: curl/8\r\n".to_vec(),
+            body: Vec::new(),
+        };
+        let changed = apply_request(
+            &[rule(
+                MatchKind::Header,
+                "",
+                "User-Agent: .*",
+                "user-agent: burpwn",
+                true,
+            )],
+            &mut m,
+        );
+        assert!(changed);
+        assert_eq!(
+            m.headers,
+            b"host: api.example.com\r\nuser-agent: burpwn\r\n"
+        );
+    }
+
+    #[test]
+    fn capture_group_replacement() {
+        // Rewrite `id=5` to `id=500` using a capture reference.
+        let mut m = msg();
+        let changed = apply_request(
+            &[rule(MatchKind::Url, "", r"id=(\d+)", "id=${1}00", true)],
+            &mut m,
+        );
+        assert!(changed);
+        assert_eq!(m.url, "/v1/users?id=500");
+    }
+
+    #[test]
+    fn invalid_regex_is_safe_noop() {
+        let mut m = msg();
+        // An unclosed group is an invalid regex: must be skipped, not panic.
+        let changed = apply_request(&[rule(MatchKind::Body, "", "(unclosed", "x", true)], &mut m);
+        assert!(!changed);
+        assert_eq!(m.body, b"{\"role\":\"user\"}");
+    }
+
+    #[test]
+    fn non_utf8_body_is_noop() {
+        let mut m = msg();
+        m.body = vec![0xff, 0xfe, 0x00, 0x80]; // invalid UTF-8
+        let before = m.body.clone();
+        // `.+` would match any UTF-8 text, but the body isn't valid UTF-8 so the
+        // body rule is a documented no-op.
+        let changed = apply_request(&[rule(MatchKind::Body, "", ".+", "X", true)], &mut m);
+        assert!(!changed);
+        assert_eq!(m.body, before);
     }
 
     #[test]
@@ -243,10 +396,13 @@ mod tests {
 
     #[test]
     fn empty_pattern_is_noop() {
+        // A blank pattern is treated as a no-op (it would otherwise match the
+        // empty string at every position).
         let mut m = msg();
         assert!(!apply_request(
             &[rule(MatchKind::Body, "", "", "x", true)],
             &mut m
         ));
+        assert_eq!(m.body, b"{\"role\":\"user\"}");
     }
 }

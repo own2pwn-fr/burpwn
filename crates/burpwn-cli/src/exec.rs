@@ -21,12 +21,53 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use burpwn_sandbox::{ExecOutcome, ExecSpec, SandboxRuntime};
-use burpwn_store::model::FlowFilter;
 use burpwn_store::Store;
 
 use crate::daemon::{NETNS_DNS_PORT, NETNS_TCP_PORT};
 use crate::envelope::Envelope;
 use crate::paths::Paths;
+
+/// The id of the implicit default workspace every session starts with.
+pub const DEFAULT_WORKSPACE_ID: i64 = 1;
+
+/// Wall-clock unix-millis helper. The daemon stamps flows in millis, so the
+/// attribution window must be in the same unit.
+pub fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Grace period before attributing flows, so the daemon's async writer has time
+/// to flush the last in-flight flow rows it recorded for this exec.
+const ATTRIBUTE_GRACE: Duration = Duration::from_millis(150);
+
+/// Resolve a workspace NAME to its id, creating it if it does not yet exist.
+/// `None` resolves to the default workspace ([`DEFAULT_WORKSPACE_ID`]).
+///
+/// Opening the store is cheap; we list existing workspaces and match by name
+/// (case-sensitive, mirroring `workspace use`).
+pub async fn resolve_workspace_id(paths: &Paths, session: &str, name: Option<&str>) -> Result<i64> {
+    let Some(name) = name else {
+        return Ok(DEFAULT_WORKSPACE_ID);
+    };
+    let store = Store::open(paths.session_db(session))
+        .with_context(|| format!("opening session store for workspace {name:?}"))?;
+    if let Some(ws) = store
+        .reader()
+        .list_workspaces()?
+        .into_iter()
+        .find(|w| w.name == name)
+    {
+        return Ok(ws.id);
+    }
+    store
+        .writer()
+        .create_workspace(name.to_string(), now_millis())
+        .await
+        .with_context(|| format!("creating workspace {name:?}"))
+}
 
 /// Counter feeding the exec-id, so two execs in the same process+millisecond
 /// still differ.
@@ -90,11 +131,16 @@ pub fn build_spec(
 /// Run one `exec` against the provided runtime. Pure orchestration: the caller
 /// is responsible for ensuring the daemon is up (so tests can skip it).
 ///
-/// After the command finishes, the session store is queried for flows stamped
-/// with `exec_id` to populate `captured_request_ids`.
+/// The captured flows are attributed *after* the command finishes: we record a
+/// `since_ts` watermark before launching the sandbox, run the command, then ask
+/// the store to stamp every not-yet-attributed flow recorded since `since_ts`
+/// with this `exec_id` + `workspace_id`. The long-lived daemon records flows
+/// with a fixed `workspace_id=1` / `exec_id=NULL` (it cannot see this process's
+/// env), so post-hoc attribution by time window is the reliable correlator.
 pub async fn run_exec(
     paths: &Paths,
     session: &str,
+    workspace_id: i64,
     runtime: Arc<dyn SandboxRuntime>,
     argv: Vec<String>,
     timeout: Option<Duration>,
@@ -102,18 +148,24 @@ pub async fn run_exec(
 ) -> Result<ExecResult> {
     let exec_id = new_exec_id();
     let mut spec = build_spec(paths, session, argv, timeout, inherit_stdio);
-    // Stamp the exec id into the child's environment so the proxy (which reads
-    // its exec_id from ProxyConfig per-daemon) is not the only correlator; the
-    // daemon already attributes flows for this session, but exposing the id lets
-    // tools and tests correlate too.
+    // Stamp the exec id into the child's environment too (harmless): tools inside
+    // the sandbox may read it to correlate, even though the daemon does not.
     spec.env.push(("BURPWN_EXEC_ID".into(), exec_id.clone()));
+
+    // Watermark BEFORE launching, so flows the command produces fall in-window.
+    let since_ts = now_millis();
 
     let outcome = runtime
         .run(spec)
         .await
         .context("running command in sandbox")?;
 
-    let captured_request_ids = collect_captured(paths, session, &exec_id).unwrap_or_default();
+    // Give the daemon's async writer a beat to flush the last flows it recorded.
+    tokio::time::sleep(ATTRIBUTE_GRACE).await;
+
+    let captured_request_ids = attribute_captured(paths, session, since_ts, &exec_id, workspace_id)
+        .await
+        .unwrap_or_default();
 
     Ok(ExecResult {
         exec_id,
@@ -123,28 +175,25 @@ pub async fn run_exec(
     })
 }
 
-/// Query the session store for flows stamped with `exec_id`. Opening the store
-/// read-only is cheap; we filter in-memory because `FlowFilter` has no exec
-/// dimension.
-fn collect_captured(paths: &Paths, session: &str, exec_id: &str) -> Result<Vec<i64>> {
+/// Stamp every not-yet-attributed flow recorded since `since_ts` with the given
+/// `exec_id` and `workspace_id`, returning the ids that were attributed. Opening
+/// the store is cheap; an absent db means nothing was captured.
+async fn attribute_captured(
+    paths: &Paths,
+    session: &str,
+    since_ts: i64,
+    exec_id: &str,
+    workspace_id: i64,
+) -> Result<Vec<i64>> {
     let db = paths.session_db(session);
     if !db.exists() {
         return Ok(Vec::new());
     }
     let store = Store::open(&db)?;
-    let reader = store.reader();
-    let rows = reader.list_flows(&FlowFilter {
-        limit: Some(10_000),
-        ..Default::default()
-    })?;
-    let mut ids = Vec::new();
-    for row in rows {
-        if let Some(detail) = reader.get_flow(row.id)? {
-            if detail.exec_id.as_deref() == Some(exec_id) {
-                ids.push(row.id);
-            }
-        }
-    }
+    let ids = store
+        .writer()
+        .attribute_flows(since_ts, exec_id, workspace_id)
+        .await?;
     Ok(ids)
 }
 
@@ -237,6 +286,7 @@ mod tests {
         let result = run_exec(
             &paths,
             "default",
+            DEFAULT_WORKSPACE_ID,
             dyn_rt,
             vec!["curl".into(), "https://example.com".into()],
             None,
@@ -260,24 +310,57 @@ mod tests {
         assert_eq!(env.data["captured_request_ids"], json!([]));
     }
 
+    /// `--workspace foo` resolves to a freshly-created workspace id, and a second
+    /// resolution of the same name returns that same id (no duplicate created).
     #[tokio::test]
-    async fn run_exec_collects_flows_stamped_with_exec_id() {
+    async fn resolve_workspace_creates_then_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        // Touch the store so the db file exists.
+        drop(Store::open(paths.session_db("default")).unwrap());
+
+        // Absent name resolves to the default id without creating anything.
+        let def = resolve_workspace_id(&paths, "default", None).await.unwrap();
+        assert_eq!(def, DEFAULT_WORKSPACE_ID);
+
+        let id = resolve_workspace_id(&paths, "default", Some("recon"))
+            .await
+            .unwrap();
+        assert!(id >= 1);
+        let again = resolve_workspace_id(&paths, "default", Some("recon"))
+            .await
+            .unwrap();
+        assert_eq!(id, again);
+
+        let store = Store::open(paths.session_db("default")).unwrap();
+        let names: Vec<String> = store
+            .reader()
+            .list_workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        assert_eq!(names.iter().filter(|n| *n == "recon").count(), 1);
+    }
+
+    /// A flow recorded in-window (un-attributed: workspace 1 / exec NULL, like the
+    /// daemon writes) gets stamped with the exec id + target workspace, and its id
+    /// is returned as captured.
+    #[tokio::test]
+    async fn attribute_captured_stamps_in_window_flows() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(dir.path());
         paths.ensure_session_dir("default").unwrap();
 
-        // Pre-populate the store: two flows, only one with a matching exec id.
-        // We can't know the exec id ahead of run_exec, so instead we assert the
-        // mechanism: run_exec generates an id, the daemon (absent here) would
-        // stamp it; with no matching flows we get an empty list. The positive
-        // path of `collect_captured` is exercised directly below.
         let store = Store::open(paths.session_db("default")).unwrap();
         let w = store.writer();
+        let since = now_millis();
         let fid = w
             .flow_start(FlowStart {
                 workspace_id: 1,
-                ts_start: 0,
-                exec_id: Some("known-exec".into()),
+                ts_start: now_millis(),
+                exec_id: None,
                 client_addr: "127.0.0.1:1".into(),
                 dst_ip: "1.2.3.4".into(),
                 dst_port: 443,
@@ -304,9 +387,18 @@ mod tests {
         drop(w);
         drop(store);
 
-        let ids = collect_captured(&paths, "default", "known-exec").unwrap();
+        let ws = resolve_workspace_id(&paths, "default", Some("attr-ws"))
+            .await
+            .unwrap();
+        let ids = attribute_captured(&paths, "default", since, "exec-xyz", ws)
+            .await
+            .unwrap();
         assert_eq!(ids, vec![fid]);
-        let none = collect_captured(&paths, "default", "absent").unwrap();
-        assert!(none.is_empty());
+
+        // The flow now carries the exec id and target workspace.
+        let store = Store::open(paths.session_db("default")).unwrap();
+        let detail = store.reader().get_flow(fid).unwrap().unwrap();
+        assert_eq!(detail.exec_id.as_deref(), Some("exec-xyz"));
+        assert_eq!(detail.flow.workspace_id, ws);
     }
 }

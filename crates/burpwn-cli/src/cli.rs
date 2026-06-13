@@ -157,9 +157,10 @@ pub enum SessionAction {
 /// `exec` arguments.
 #[derive(Debug, Args)]
 pub struct ExecArgs {
-    /// Workspace id to attribute captured flows to.
+    /// Workspace NAME to attribute captured flows to (created on first use). When
+    /// omitted, the default workspace (id 1) is used.
     #[arg(long)]
-    pub workspace: Option<i64>,
+    pub workspace: Option<String>,
 
     /// Wall-clock timeout for the command, in seconds.
     #[arg(long)]
@@ -214,9 +215,9 @@ pub struct ReqListArgs {
     /// Exact destination port.
     #[arg(long)]
     pub port: Option<u16>,
-    /// Restrict to a workspace id.
+    /// Restrict to a workspace by NAME.
     #[arg(long)]
-    pub workspace: Option<i64>,
+    pub workspace: Option<String>,
     /// Max rows.
     #[arg(long)]
     pub limit: Option<i64>,
@@ -341,6 +342,8 @@ pub enum TagAction {
         /// Tag name.
         name: String,
     },
+    /// List all defined tags.
+    List,
 }
 
 /// `note` subcommands.
@@ -352,6 +355,11 @@ pub enum NoteAction {
         flow_id: i64,
         /// Note text.
         text: String,
+    },
+    /// List the notes attached to a flow.
+    List {
+        /// Flow id.
+        flow_id: i64,
     },
 }
 

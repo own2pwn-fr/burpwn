@@ -124,6 +124,8 @@ impl Reader {
 
         let request = self.load_request(&conn, id)?;
         let response = self.load_response(&conn, id)?;
+        let tags = self.flow_tags(id)?.into_iter().map(|t| t.name).collect();
+        let notes = self.flow_notes(id)?.into_iter().map(|n| n.body).collect();
 
         Ok(Some(FlowDetail {
             flow,
@@ -131,6 +133,8 @@ impl Reader {
             client_addr,
             request,
             response,
+            tags,
+            notes,
         }))
     }
 

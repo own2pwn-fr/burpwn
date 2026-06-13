@@ -316,6 +316,11 @@ pub async fn cmd_exec(
     // Ensure the CA exists (the sandbox needs to bind it in).
     CertAuthority::load_or_generate(paths.ca_dir()).map_err(|e| anyhow!("CA: {e}"))?;
 
+    // Resolve the --workspace NAME to an id (creating it if absent); omitted ⇒
+    // the default workspace. Done before the run so attribution can target it.
+    let workspace_id =
+        exec::resolve_workspace_id(paths, &session, args.workspace.as_deref()).await?;
+
     let runtime: Arc<dyn SandboxRuntime> = match runtime_override {
         Some(rt) => rt,
         None => {
@@ -340,7 +345,16 @@ pub async fn cmd_exec(
 
     let timeout = args.timeout.map(Duration::from_secs);
     let inherit_stdio = !json;
-    let result = exec::run_exec(paths, &session, runtime, args.cmd, timeout, inherit_stdio).await?;
+    let result = exec::run_exec(
+        paths,
+        &session,
+        workspace_id,
+        runtime,
+        args.cmd,
+        timeout,
+        inherit_stdio,
+    )
+    .await?;
 
     if json {
         exec::write_json_envelope(&exec::exec_envelope(&result));
@@ -411,8 +425,22 @@ fn open_store(paths: &Paths, session: &str) -> Result<Store> {
 
 fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Result<i32> {
     let store = open_store(paths, session)?;
+    // Resolve the --workspace NAME (if any) to an id. An unknown name is an
+    // error (listing a workspace that does not exist is a user mistake, not an
+    // empty result), mirroring `workspace use`.
+    let workspace_id = match &args.workspace {
+        None => None,
+        Some(name) => {
+            let ws = store.reader().list_workspaces()?;
+            let found = ws.iter().find(|w| &w.name == name);
+            match found {
+                Some(w) => Some(w.id),
+                None => bail!("no such workspace: {name}"),
+            }
+        }
+    };
     let filter = FlowFilter {
-        workspace_id: args.workspace,
+        workspace_id,
         host_contains: args.host,
         status: args.status,
         method: args.method,
@@ -498,6 +526,12 @@ fn req_show(out: &Output, paths: &Paths, session: &str, id: i64, raw: bool) -> R
                 resp.body.len()
             );
         }
+        if !detail.tags.is_empty() {
+            println!("  tags: {}", detail.tags.join(", "));
+        }
+        for note in &detail.notes {
+            println!("  note: {note}");
+        }
     }
     Ok(0)
 }
@@ -536,6 +570,8 @@ fn flow_detail_json(detail: &burpwn_store::model::FlowDetail) -> Value {
         "client_addr": detail.client_addr,
         "request": req,
         "response": resp,
+        "tags": detail.tags,
+        "notes": detail.notes,
     })
 }
 
@@ -751,17 +787,22 @@ async fn cmd_match_replace(out: &Output, paths: &Paths, action: MatchReplaceActi
                 }
             }
         }
-        // The store exposes add + list; rm/enable/disable are surfaced as a
-        // re-add of the desired enabled state is not sufficient. We update via a
-        // direct SQL-free path is unavailable, so these are reported as a
-        // documented limitation (the writer has no update/delete for rules yet).
-        MatchReplaceAction::Rm { id }
-        | MatchReplaceAction::Enable { id }
-        | MatchReplaceAction::Disable { id } => {
-            let _ = id;
-            bail!(
-                "match-replace rm/enable/disable are not yet supported: the store \
-                 writer exposes only add + list for rules (no update/delete API)"
+        MatchReplaceAction::Rm { id } => {
+            store.writer().delete_match_replace(id).await?;
+            out.ok(format!("removed rule {id}"), json!({ "removed": id }));
+        }
+        MatchReplaceAction::Enable { id } => {
+            store.writer().set_match_replace_enabled(id, true).await?;
+            out.ok(
+                format!("enabled rule {id}"),
+                json!({ "id": id, "enabled": true }),
+            );
+        }
+        MatchReplaceAction::Disable { id } => {
+            store.writer().set_match_replace_enabled(id, false).await?;
+            out.ok(
+                format!("disabled rule {id}"),
+                json!({ "id": id, "enabled": false }),
             );
         }
     }
@@ -825,6 +866,24 @@ async fn cmd_tag(out: &Output, paths: &Paths, action: TagAction) -> Result<i32> 
                 json!({ "tag_id": id, "flow_id": flow_id, "name": name }),
             );
         }
+        TagAction::List => {
+            let tags = store.reader().list_tags()?;
+            if out.json {
+                println!(
+                    "{}",
+                    Envelope::ok(serde_json::to_value(&tags)?).to_json_line()
+                );
+            } else if tags.is_empty() {
+                println!("(no tags)");
+            } else {
+                for t in &tags {
+                    match &t.color {
+                        Some(c) => println!("{:>4} {} ({c})", t.id, t.name),
+                        None => println!("{:>4} {}", t.id, t.name),
+                    }
+                }
+            }
+        }
     }
     Ok(0)
 }
@@ -842,6 +901,21 @@ async fn cmd_note(out: &Output, paths: &Paths, action: NoteAction) -> Result<i32
                 format!("added note {id} to flow {flow_id}"),
                 json!({ "note_id": id, "flow_id": flow_id }),
             );
+        }
+        NoteAction::List { flow_id } => {
+            let notes = store.reader().flow_notes(flow_id)?;
+            if out.json {
+                println!(
+                    "{}",
+                    Envelope::ok(serde_json::to_value(&notes)?).to_json_line()
+                );
+            } else if notes.is_empty() {
+                println!("(no notes)");
+            } else {
+                for n in &notes {
+                    println!("{:>4} {}", n.id, n.body);
+                }
+            }
         }
     }
     Ok(0)
@@ -862,13 +936,20 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
             })?;
             let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
             let har = har::build_har(&reader, &ids)?;
+            // Report the number of HTTP entries actually written, not the total
+            // flow count (which includes DNS / raw-TCP / TLS-passthru flows the
+            // HAR omits).
+            let entry_count = har["log"]["entries"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
             let text = serde_json::to_string_pretty(&har)?;
             match output {
                 Some(path) => {
                     std::fs::write(&path, &text).with_context(|| format!("writing {path}"))?;
                     out.ok(
-                        format!("wrote {} entries to {path}", ids.len()),
-                        json!({ "path": path, "entries": ids.len() }),
+                        format!("wrote {entry_count} entries to {path}"),
+                        json!({ "path": path, "entries": entry_count }),
                     );
                 }
                 None => {

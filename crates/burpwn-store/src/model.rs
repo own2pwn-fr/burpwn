@@ -154,6 +154,10 @@ pub struct FlowDetail {
     pub request: Option<RequestData>,
     /// Decoded response, if recorded.
     pub response: Option<ResponseData>,
+    /// Names of the tags attached to this flow.
+    pub tags: Vec<String>,
+    /// Bodies of the notes attached to this flow.
+    pub notes: Vec<String>,
 }
 
 /// A note attached to a flow.

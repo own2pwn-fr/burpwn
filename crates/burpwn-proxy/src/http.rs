@@ -389,7 +389,7 @@ async fn forward(
 /// using hyper's client connection. `use_h2` is the UPSTREAM-negotiated protocol
 /// (from ALPN), NOT the downstream version. `scheme` is the upstream scheme,
 /// needed to build the absolute URI HTTP/2 requires.
-async fn send_over<S>(
+pub(crate) async fn send_over<S>(
     stream: S,
     mut req: Request<Full<Bytes>>,
     use_h2: bool,

@@ -27,6 +27,7 @@ nix.workspace = true
 libc.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+regex = "1.10"
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
