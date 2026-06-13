@@ -196,10 +196,16 @@ impl Reader {
     /// flow ids (deduplicated, newest first).
     pub fn search(&self, query: &str) -> Result<Vec<i64>> {
         let conn = self.conn()?;
+        // Treat the user query as a LITERAL FTS5 phrase: wrap it in double quotes
+        // (escaping any embedded ones) so characters that are FTS5 query syntax —
+        // `-`, `:`, `*`, `^`, parentheses — don't get misinterpreted (e.g. a bare
+        // `needle-token` otherwise parses `token` as a column filter). This keeps
+        // `search` a plain substring/phrase search, which is what callers expect.
+        let phrase = format!("\"{}\"", query.replace('"', "\"\""));
         let mut stmt = conn.prepare(
             "SELECT DISTINCT flow_id FROM flows_fts WHERE flows_fts MATCH ?1 ORDER BY flow_id DESC",
         )?;
-        let rows = stmt.query_map([query], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map([phrase], |r| r.get::<_, i64>(0))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
