@@ -638,10 +638,7 @@ where
     let c2s = tokio::spawn(async move {
         let mut cap = 0usize;
         let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let Ok(n) = dr.read(&mut buf).await else {
-                break;
-            };
+        while let Ok(n) = dr.read(&mut buf).await {
             if n == 0 {
                 break;
             }
@@ -668,10 +665,7 @@ where
     let s2c = tokio::spawn(async move {
         let mut cap = 0usize;
         let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let Ok(n) = ur.read(&mut buf).await else {
-                break;
-            };
+        while let Ok(n) = ur.read(&mut buf).await {
             if n == 0 {
                 break;
             }
