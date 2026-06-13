@@ -139,7 +139,10 @@ async fn handle_query(
             RequestData {
                 method: "QUERY".into(),
                 authority: qname.clone(),
-                path: format!("{qname}/{qtype}"),
+                // Path is the record type only — the authority already carries the
+                // qname, so `req list` renders `dns://example.com./A` (not a
+                // doubled `dns://example.com.example.com./A`).
+                path: format!("/{qtype}"),
                 http_version: "DNS".into(),
                 headers: Vec::new(),
                 body: query,

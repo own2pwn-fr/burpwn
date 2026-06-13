@@ -257,7 +257,7 @@ async fn handle_inner(
     }
 
     // --- forward + capture the response ---
-    let (resp_parts, resp_body_bytes) = forward(&ctx.upstream, upstream_req, version).await?;
+    let (resp_parts, resp_body_bytes) = forward(&ctx.upstream, upstream_req).await?;
     let raw_resp_headers = serialize_headers(&resp_parts.headers);
 
     // Decode a COPY for storage; never alter forwarded bytes.
@@ -345,6 +345,12 @@ async fn handle_inner(
         // Hyper sets the length from the Full body; drop a stale framing header.
         hdrs.remove(hyper::header::CONTENT_LENGTH);
         hdrs.remove(hyper::header::TRANSFER_ENCODING);
+        // Connection-specific headers are illegal when the downstream is HTTP/2
+        // (e.g. an h1 origin response relayed to an h2 client).
+        hdrs.remove(hyper::header::CONNECTION);
+        hdrs.remove(hyper::header::UPGRADE);
+        hdrs.remove("keep-alive");
+        hdrs.remove("proxy-connection");
     }
     Ok(builder.body(Full::new(forward_body))?)
 }
@@ -353,12 +359,13 @@ async fn handle_inner(
 async fn forward(
     upstream: &Upstream,
     req: Request<Full<Bytes>>,
-    downstream_version: Version,
 ) -> anyhow::Result<(http::response::Parts, Bytes)> {
     match upstream {
         Upstream::Plain { addr } => {
             let tcp = TcpStream::connect(*addr).await?;
-            send_over(tcp, req, false, downstream_version).await
+            // No ALPN on a cleartext upstream: default to HTTP/1.1 (prior-knowledge
+            // h2c is rare and not something we negotiated).
+            send_over(tcp, req, false, "http").await
         }
         Upstream::Tls {
             addr,
@@ -369,27 +376,37 @@ async fn forward(
             let server_name = rustls::pki_types::ServerName::try_from(server_name.clone())
                 .map_err(|_| anyhow::anyhow!("invalid upstream server name"))?;
             let tls = connector.connect(server_name, tcp).await?;
+            // The UPSTREAM leg's protocol is whatever ALPN negotiated — independent
+            // of the downstream version (a client may speak h2 to us while the
+            // origin only speaks h1, or vice versa).
             let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-            send_over(tls, req, is_h2, downstream_version).await
+            send_over(tls, req, is_h2, "https").await
         }
     }
 }
 
-/// Drive one request/response over an established (plain or TLS) byte stream,
-/// using hyper's client connection. `force_h2` follows the upstream's negotiated
-/// ALPN; otherwise we mirror the downstream HTTP version.
+/// Drive one request/response over an established (plain or TLS) byte stream
+/// using hyper's client connection. `use_h2` is the UPSTREAM-negotiated protocol
+/// (from ALPN), NOT the downstream version. `scheme` is the upstream scheme,
+/// needed to build the absolute URI HTTP/2 requires.
 async fn send_over<S>(
     stream: S,
-    req: Request<Full<Bytes>>,
-    force_h2: bool,
-    downstream_version: Version,
+    mut req: Request<Full<Bytes>>,
+    use_h2: bool,
+    scheme: &str,
 ) -> anyhow::Result<(http::response::Parts, Bytes)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
-    let use_h2 = force_h2 || downstream_version == Version::HTTP_2;
     if use_h2 {
+        // HTTP/2 derives :scheme/:authority/:path from the URI, so it MUST be
+        // absolute. The request comes in origin-form (path only) with the
+        // authority in the Host header — promote it to an absolute URI and drop
+        // Host (HTTP/2 forbids it; the authority travels as :authority).
+        promote_to_absolute_uri(&mut req, scheme);
+        req.headers_mut().remove(HOST);
+        *req.version_mut() = Version::HTTP_2;
         let (mut sender, conn) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
         tokio::spawn(async move {
@@ -400,6 +417,9 @@ where
         let resp = sender.send_request(req).await?;
         collect_response(resp).await
     } else {
+        // HTTP/1.1: origin-form path + Host header (already set). Pin the version
+        // in case the downstream request arrived as h2.
+        *req.version_mut() = Version::HTTP_11;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -408,6 +428,34 @@ where
         });
         let resp = sender.send_request(req).await?;
         collect_response(resp).await
+    }
+}
+
+/// Rewrite an origin-form request URI (`/path`) into the absolute form
+/// (`scheme://authority/path`) HTTP/2 needs, taking the authority from the
+/// existing URI if present, else the `Host` header. No-op if already absolute.
+fn promote_to_absolute_uri(req: &mut Request<Full<Bytes>>, scheme: &str) {
+    if req.uri().authority().is_some() && req.uri().scheme().is_some() {
+        return;
+    }
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            req.headers()
+                .get(HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+    let Some(authority) = authority else { return };
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    if let Ok(uri) = format!("{scheme}://{authority}{pq}").parse::<http::Uri>() {
+        *req.uri_mut() = uri;
     }
 }
 
@@ -433,15 +481,20 @@ fn build_upstream_request(
     version: Version,
 ) -> anyhow::Result<Request<Full<Bytes>>> {
     let mut headers = headers_from_bytes(&msg.headers, &orig.headers);
-    // Ensure Host matches the (possibly rewritten) authority for H1.
-    if version != Version::HTTP_2 {
-        if let Ok(hv) = HeaderValue::from_str(&msg.host) {
-            headers.insert(HOST, hv);
-        }
+    // Always carry the (possibly rewritten) authority in the Host header. The H1
+    // sender uses it directly; the H2 sender promotes it to the :authority of an
+    // absolute URI and then strips Host (HTTP/2 forbids it).
+    if let Ok(hv) = HeaderValue::from_str(&msg.host) {
+        headers.insert(HOST, hv);
     }
-    // Drop hop-by-hop framing we will recompute.
+    // Drop hop-by-hop framing we will recompute, plus connection-specific headers
+    // that are illegal on an HTTP/2 leg.
     headers.remove(hyper::header::CONTENT_LENGTH);
     headers.remove(hyper::header::TRANSFER_ENCODING);
+    headers.remove(hyper::header::CONNECTION);
+    headers.remove(hyper::header::UPGRADE);
+    headers.remove("keep-alive");
+    headers.remove("proxy-connection");
 
     let uri: http::Uri = msg.url.parse().unwrap_or_else(|_| orig.uri.clone());
     let mut builder = Request::builder()
@@ -740,6 +793,40 @@ mod tests {
         let back = headers_from_bytes(&bytes, &hyper::HeaderMap::new());
         assert_eq!(back.get(HOST).unwrap(), "a.test");
         assert_eq!(back.get(hyper::header::ACCEPT).unwrap(), "application/json");
+    }
+
+    // Regression: HTTP/2 upstream forwarding returned 502 because the request URI
+    // stayed origin-form (`/`), so hyper's h2 client had no `:authority`. The
+    // promotion must build an absolute URI from the Host header.
+    #[test]
+    fn promote_origin_form_to_absolute_for_h2() {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/path?q=1")
+            .header(HOST, "example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        promote_to_absolute_uri(&mut req, "https");
+        assert_eq!(req.uri().scheme_str(), Some("https"));
+        assert_eq!(
+            req.uri().authority().map(|a| a.as_str()),
+            Some("example.com")
+        );
+        assert_eq!(
+            req.uri().path_and_query().map(|p| p.as_str()),
+            Some("/path?q=1")
+        );
+    }
+
+    #[test]
+    fn promote_is_noop_when_already_absolute() {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("https://already.test/x")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        promote_to_absolute_uri(&mut req, "http");
+        assert_eq!(req.uri().to_string(), "https://already.test/x");
     }
 
     #[test]
