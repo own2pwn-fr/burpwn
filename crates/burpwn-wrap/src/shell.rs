@@ -91,19 +91,25 @@ __burpwn_exclude={excl}
 
 # True if $1 (a full command line) should be wrapped.
 __burpwn_should_wrap() {{
-  local line="$1" prog tok
-  # already wrapped?
-  case "$line" in
-    "burpwn exec --"*|*"/burpwn exec --"*) return 1 ;;
-  esac
-  # extract program: skip leading VAR=val, strip path.
+  local line="$1" prog="" next="" tok seen_prog=0
+  # Extract the PROGRAM token: skip leading VAR=val assignments and a benign
+  # wrapper prefix (sudo/env/command/nice/nohup), strip any path, and remember
+  # the token right after it. Anchoring to the program (rather than scanning the
+  # whole line) avoids a false "already wrapped" on a command that merely
+  # mentions `burpwn exec` as an argument — which would silently skip capture.
   for tok in $line; do
+    if [ "$seen_prog" = "1" ]; then next="$tok"; break; fi
     case "$tok" in
       [A-Za-z_]*=*) continue ;;
-      *) prog="${{tok##*/}}"; break ;;
+      sudo|env|command|nice|nohup) continue ;;
+      *) prog="${{tok##*/}}"; seen_prog=1 ;;
     esac
   done
   [ -z "$prog" ] && return 1
+  # Already wrapped? (program is `burpwn` followed by `exec`, or the `bw` helper.)
+  if {{ [ "$prog" = "burpwn" ] && [ "$next" = "exec" ]; }} || [ "$prog" = "bw" ]; then
+    return 1
+  fi
   local e
   for e in "${{__burpwn_exclude[@]}}"; do
     [ "$e" = "$prog" ] && return 1
@@ -126,7 +132,7 @@ __burpwn_preexec() {{
     command burpwn exec -- sh -c "$cmd"
     return 130   # signal the original line was already handled (zsh)
   else
-    echo "[burpwn] tip: run \`bw $cmd\` (or \`burpwn exec -- $cmd\`) to capture traffic" >&2
+    echo "[burpwn] tip: export BURPWN_AUTO=1 to auto-capture, or run: burpwn exec -- sh -c '$cmd'" >&2
   fi
 }}
 

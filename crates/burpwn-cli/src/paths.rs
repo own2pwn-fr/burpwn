@@ -163,6 +163,14 @@ impl Paths {
             .mode(0o700)
             .create(&dir)
             .with_context(|| format!("creating runtime dir {}", dir.display()))?;
+        // Refuse a SYMLINKED run dir: `set_permissions` follows symlinks, so an
+        // attacker who pre-seeds the path as a symlink could redirect our 0700
+        // chmod onto a victim directory. Require a real directory.
+        let meta = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("stat runtime dir {}", dir.display()))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            anyhow::bail!("runtime dir {} is not a regular directory", dir.display());
+        }
         // `recursive(true)` only sets the mode on directories it newly created;
         // if the dir already existed with looser perms (e.g. created before this
         // fix, or under a different umask), tighten it back to 0700.
