@@ -148,10 +148,27 @@ impl Paths {
     }
 
     /// Ensure a session's runtime directory exists; returns it.
+    ///
+    /// The runtime dir holds the control/proxy sockets, so it is created mode
+    /// `0700` (owner-only). On hosts where `$XDG_RUNTIME_DIR` is unset the
+    /// fallback `<data>/run/<session>/` would otherwise inherit the process
+    /// umask and could be world-traversable, letting other local users connect
+    /// to the sockets (Bug #L6). The mode is applied to every component we
+    /// create here.
     pub fn ensure_run_dir(&self, name: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let dir = self.run_dir(name);
-        std::fs::create_dir_all(&dir)
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
             .with_context(|| format!("creating runtime dir {}", dir.display()))?;
+        // `recursive(true)` only sets the mode on directories it newly created;
+        // if the dir already existed with looser perms (e.g. created before this
+        // fix, or under a different umask), tighten it back to 0700.
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&dir, perms)
+            .with_context(|| format!("tightening runtime dir perms {}", dir.display()))?;
         Ok(dir)
     }
 
@@ -287,5 +304,32 @@ mod tests {
         assert!(validate_session_name("").is_err());
         assert!(validate_session_name("..").is_err());
         assert!(validate_session_name("a/b").is_err());
+        // Backslash, NUL, absolute and dot are rejected too.
+        assert!(validate_session_name("a\\b").is_err());
+        assert!(validate_session_name("a\0b").is_err());
+        assert!(validate_session_name(".").is_err());
+    }
+
+    /// Bug #L6: the per-session runtime dir (which holds the control/proxy
+    /// sockets) must be owner-only (0700), even when it already existed with
+    /// looser permissions.
+    #[test]
+    fn run_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::with_base(dir.path());
+
+        let run = p.ensure_run_dir("s").unwrap();
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "fresh runtime dir must be 0700, got {mode:o}");
+
+        // Loosen it, then re-ensure: it must be tightened back to 0700.
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run2 = p.ensure_run_dir("s").unwrap();
+        let mode = std::fs::metadata(&run2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "re-ensured runtime dir must be 0700, got {mode:o}"
+        );
     }
 }

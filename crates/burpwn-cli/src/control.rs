@@ -172,7 +172,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
@@ -191,6 +191,12 @@ pub const AWAIT_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 /// bound but the accept loop wedged) should be treated as dead rather than
 /// blocking the connect indefinitely.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum length (bytes) of a single control-protocol response line. A wedged
+/// or hostile daemon that streams bytes without a newline must not be able to
+/// grow our read buffer without bound (local OOM — Bug #L5). Responses are tiny
+/// JSON objects; 1 MiB is a generous cap that still bounds memory hard.
+pub const MAX_RESPONSE_LINE: u64 = 1024 * 1024;
 
 /// Compute the client-side read timeout appropriate for a given request. The
 /// blocking `InterceptAwait` gets `timeout_secs + margin`; everything else uses
@@ -284,9 +290,19 @@ impl ControlClient {
         self.write.flush().await?;
 
         let mut buf = String::new();
-        let n = self.reader.read_line(&mut buf).await?;
+        // Bound the response line: read at most MAX_RESPONSE_LINE bytes looking
+        // for a newline so a peer that never sends one can't OOM us (Bug #L5).
+        let n = (&mut self.reader)
+            .take(MAX_RESPONSE_LINE)
+            .read_line(&mut buf)
+            .await?;
         if n == 0 {
             return Err(anyhow!("control connection closed before a response"));
+        }
+        if !buf.ends_with('\n') && n as u64 >= MAX_RESPONSE_LINE {
+            return Err(anyhow!(
+                "control response exceeds {MAX_RESPONSE_LINE} bytes (daemon misbehaving)"
+            ));
         }
         let resp: ControlResponse = serde_json::from_str(buf.trim_end())
             .with_context(|| format!("decoding control response: {buf:?}"))?;
@@ -422,6 +438,50 @@ mod tests {
         // Await uses its server-side timeout plus the margin.
         let t = request_timeout(&ControlRequest::InterceptAwait { timeout_secs: 30 });
         assert_eq!(t, Duration::from_secs(30) + AWAIT_TIMEOUT_MARGIN);
+    }
+
+    /// Bug #L5: a daemon that streams bytes without ever sending a newline must
+    /// not be able to grow the client's read buffer without bound. The bounded
+    /// read caps the line at `MAX_RESPONSE_LINE` and returns a clear error
+    /// instead of OOMing.
+    #[tokio::test]
+    async fn oversized_response_line_is_rejected() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+
+        // Server: accept, then spew bytes with no newline past the cap.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            // Write strictly more than MAX_RESPONSE_LINE bytes, never a '\n'.
+            let mut sent: u64 = 0;
+            while sent <= MAX_RESPONSE_LINE {
+                if stream.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                sent += chunk.len() as u64;
+            }
+            let _ = stream.flush().await;
+            // Keep the connection open so the client's read sees the cap, not EOF.
+            std::future::pending::<()>().await;
+        });
+
+        let mut client = ControlClient::connect(&sock).await.unwrap();
+        let res = client.status().await;
+        assert!(
+            res.is_err(),
+            "expected an oversized-line error, got {res:?}"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("exceeds") || msg.contains("timed out"),
+            "unexpected error: {msg}"
+        );
+        server.abort();
     }
 
     /// A daemon that accepts the connection but never replies must not hang the

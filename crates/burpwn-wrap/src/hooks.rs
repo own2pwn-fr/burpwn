@@ -162,14 +162,22 @@ pub fn cline_rules_block(burpwn_bin: &str, exclude: &[String]) -> String {
     s.push_str("# burpwn traffic capture\n\n");
     s.push_str(
         "Every shell/terminal command you run MUST be routed through burpwn so its \
-network traffic is captured. Prefix the command exactly like:\n\n",
+network traffic is captured. Wrap the WHOLE command line as a single argument of \
+an inner shell, exactly like:\n\n",
     );
-    s.push_str(&format!("    {burpwn_bin} exec -- <your command>\n\n"));
     s.push_str(&format!(
-        "Example: instead of `curl https://target`, run `{burpwn_bin} exec -- curl https://target`.\n",
+        "    {burpwn_bin} exec -- sh -c '<your whole command line>'\n\n"
     ));
     s.push_str(&format!(
-        "Do not wrap a command that already begins with `{burpwn_bin} exec --`.\n",
+        "Example: instead of `curl https://target`, run `{burpwn_bin} exec -- sh -c 'curl https://target'`.\n",
+    ));
+    s.push_str(
+        "This matters for compound lines: a command using `&&`, `;`, `|`, or `$(…)` must be \
+placed in full inside the single `sh -c '…'` so every part is captured — do NOT put only \
+the first segment under burpwn.\n",
+    );
+    s.push_str(&format!(
+        "Do not re-wrap a command that already invokes `{burpwn_bin} exec --`.\n",
     ));
     if !exclude.is_empty() {
         s.push_str("\nDo NOT wrap these commands (run them directly, unwrapped): ");
@@ -247,7 +255,8 @@ mod tests {
         let block = cline_rules_block(BIN, &[]);
         assert!(block.starts_with(CLINE_BEGIN));
         assert!(block.trim_end().ends_with(CLINE_END));
-        assert!(block.contains("burpwn exec -- <your command>"));
+        assert!(block.contains("burpwn exec -- sh -c '<your whole command line>'"));
+        assert!(block.contains("&&")); // compound-line guidance present
         assert!(!block.contains("Do NOT wrap"));
     }
 

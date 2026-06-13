@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
@@ -73,12 +73,25 @@ impl ControlState {
         }
     }
 
-    /// Insert an already-pulled intercept into the parked table, keyed by id.
+    /// Insert an already-pulled intercept into the parked table, keyed by id,
+    /// *iff* interception is still enabled — returning the intercept back to the
+    /// caller (un-parked) when it was disabled in the meantime.
+    ///
+    /// The enabled-check and the insert happen while holding the `parked` lock,
+    /// the same lock `InterceptDisable` takes to drain the table. That makes the
+    /// take→park window atomic against a concurrent disable (Bug #8): a disable
+    /// either drains this entry after we park it, or flips `is_enabled()` to
+    /// false before we observe it here — never leaving it parked past a disable.
     /// Used by the connection handler *after* the `Pending` response has been
     /// written, so a client disconnect mid-long-poll never orphans the entry
     /// (see [`handle_connection`]).
-    async fn park(&self, p: PendingIntercept) {
-        self.parked.lock().await.insert(p.id, p);
+    async fn park_if_enabled(&self, p: PendingIntercept) -> Result<(), PendingIntercept> {
+        let mut parked = self.parked.lock().await;
+        if !self.intercept.is_enabled() {
+            return Err(p);
+        }
+        parked.insert(p.id, p);
+        Ok(())
     }
 }
 
@@ -161,19 +174,16 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
             items.sort_by_key(|i| i.id);
             ControlResponse::Intercepts { items }
         }
-        ControlRequest::InterceptAwait { timeout_secs } => {
-            match state
-                .intercept
-                .take_next(Duration::from_secs(timeout_secs))
-                .await
-            {
-                Some(p) => {
-                    let item = ControlState::summary_item(p.id, p.kind, &p.data);
-                    // Park the pending (with its reply sender) for later resolve.
-                    state.parked.lock().await.insert(p.id, p);
-                    ControlResponse::Pending { item: Some(item) }
-                }
-                None => ControlResponse::Pending { item: None },
+        ControlRequest::InterceptAwait { .. } => {
+            // `InterceptAwait` is handled inline by `handle_connection` (it must
+            // WRITE the `Pending` response BEFORE parking the pulled intercept —
+            // Bug #6 — and re-check the enabled state before parking — Bug #8).
+            // Routing it through here would duplicate that take/park logic in a
+            // second place with the old ordering, so the parking lives in
+            // exactly ONE place. This arm is unreachable in production.
+            ControlResponse::Error {
+                message: "InterceptAwait is handled inline by handle_connection, not here"
+                    .to_string(),
             }
         }
         ControlRequest::InterceptForward { id, edits } => {
@@ -247,6 +257,15 @@ pub async fn serve_control(state: ControlState, sock: impl AsRef<Path>) -> Resul
     }
     let listener = UnixListener::bind(sock)
         .with_context(|| format!("binding control socket {}", sock.display()))?;
+    // Restrict the socket to the owner (Bug #L6): defence in depth on top of the
+    // 0700 runtime dir so another local user can never connect to the control
+    // channel even if the dir perms are ever loosened.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(sock, perms)
+            .with_context(|| format!("restricting control socket perms {}", sock.display()))?;
+    }
     tracing::info!(?sock, "control server listening");
 
     loop {
@@ -268,6 +287,12 @@ pub async fn serve_control(state: ControlState, sock: impl AsRef<Path>) -> Resul
     }
 }
 
+/// Maximum length (bytes) of a single control-protocol line. Control messages
+/// are tiny JSON objects; a peer that streams bytes without a newline must not
+/// be able to grow our read buffer without bound (local OOM — Bug #L5). 1 MiB
+/// is far larger than any legitimate request yet bounds memory hard.
+const MAX_CONTROL_LINE: u64 = 1024 * 1024;
+
 /// Handle one control connection: read newline-delimited requests until EOF,
 /// replying to each. Returns `true` if a `Shutdown` was seen (after replying).
 async fn handle_connection(state: &ControlState, stream: UnixStream) -> Result<bool> {
@@ -276,8 +301,22 @@ async fn handle_connection(state: &ControlState, stream: UnixStream) -> Result<b
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        // Bound the line length: read at most MAX_CONTROL_LINE bytes looking for
+        // a newline. A peer that sends >MAX without a `\n` is rejected rather
+        // than allowed to grow `line` unbounded (Bug #L5).
+        let n = (&mut reader)
+            .take(MAX_CONTROL_LINE)
+            .read_line(&mut line)
+            .await?;
         if n == 0 {
+            return Ok(false);
+        }
+        // No terminating newline within the cap ⇒ oversized/garbage line.
+        if !line.ends_with('\n') && n as u64 >= MAX_CONTROL_LINE {
+            let resp = ControlResponse::Error {
+                message: format!("control line exceeds {MAX_CONTROL_LINE} bytes"),
+            };
+            write_response(&mut write, &resp).await?;
             return Ok(false);
         }
         let trimmed = line.trim_end();
@@ -302,9 +341,22 @@ async fn handle_connection(state: &ControlState, stream: UnixStream) -> Result<b
                         let resp = ControlResponse::Pending { item: Some(item) };
                         match write_response(&mut write, &resp).await {
                             Ok(()) => {
-                                // Response delivered: now it is safe to park the
-                                // intercept for a later Forward/Drop.
-                                state.park(p).await;
+                                // Response delivered: park the intercept for a
+                                // later Forward/Drop — but only if interception
+                                // is still enabled. A concurrent
+                                // `InterceptDisable` (Bug #8) could have flipped
+                                // it off after `take_next` pulled `p` from the
+                                // controller queue but before we park it; `p` is
+                                // then in neither queue nor parked table, so the
+                                // disable's drain misses it. `park_if_enabled`
+                                // re-checks under the parked lock (the same lock
+                                // disable drains under) and hands `p` back when
+                                // disabled, so we resolve it Forward(None) and
+                                // let the request proceed instead of stalling it
+                                // until the 5-min auto-forward.
+                                if let Err(p) = state.park_if_enabled(p).await {
+                                    let _ = p.reply.send(InterceptDecision::Forward(None));
+                                }
                             }
                             Err(e) => {
                                 // Client vanished mid-long-poll: fail open so the
@@ -427,6 +479,29 @@ mod tests {
         ControlState::new("default", 5353, InterceptController::new())
     }
 
+    /// Drive a single `InterceptAwait` through the inline `handle_connection`
+    /// path (the only place that parks intercepts) over a real unix socket,
+    /// against a clone of `state` (which shares the controller + parked table).
+    /// Returns the response and a guard that shuts the temp server down on drop.
+    async fn await_via_socket(state: &ControlState, timeout_secs: u64) -> ControlResponse {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server_state = state.clone();
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move { serve_control(server_state, &server_sock).await });
+
+        let mut client = ControlClient::connect_retry(&sock, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let resp = client
+            .intercept_await(timeout_secs)
+            .await
+            .expect("await round-trip");
+        let _ = client.shutdown().await;
+        let _ = server.await;
+        resp
+    }
+
     #[tokio::test]
     async fn status_reports_liveness_and_intercept_state() {
         let state = ctrl_state();
@@ -480,8 +555,8 @@ mod tests {
             .await
         });
 
-        // Await pulls it.
-        let resp = handle_request(&state, ControlRequest::InterceptAwait { timeout_secs: 5 }).await;
+        // Await pulls it (through the inline path — the only place that parks).
+        let resp = await_via_socket(&state, 5).await;
         let id = match resp {
             ControlResponse::Pending { item: Some(i) } => {
                 assert_eq!(i.host, "example.com");
@@ -536,7 +611,7 @@ mod tests {
             )
             .await
         });
-        let resp = handle_request(&state, ControlRequest::InterceptAwait { timeout_secs: 5 }).await;
+        let resp = await_via_socket(&state, 5).await;
         let id = match resp {
             ControlResponse::Pending { item: Some(i) } => i.id,
             other => panic!("expected pending, got {other:?}"),
@@ -566,11 +641,92 @@ mod tests {
         assert!(matches!(decision, InterceptDecision::Forward(None)));
     }
 
+    /// Bug #8: if interception is toggled off between an `InterceptAwait`'s
+    /// `take_next` and the park, the pulled intercept must be resolved
+    /// `Forward(None)` (so the in-flight request proceeds) and must NOT be left
+    /// parked (which would stall until the 5-min auto-forward). We exercise the
+    /// atomic check-and-park primitive directly: disable, then attempt to park.
+    #[tokio::test]
+    async fn park_after_disable_resolves_forward_and_does_not_leak() {
+        let state = ctrl_state();
+        state.intercept.set_enabled(true);
+
+        // A "proxy handler" parks an intercept; Await pulls it out of the queue.
+        let ctrl = state.intercept.clone();
+        let handler = tokio::spawn(async move {
+            ctrl.intercept(
+                InterceptKind::Request,
+                InterceptData {
+                    host: "example.com".into(),
+                    method: "GET".into(),
+                    path: "/race".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+            .await
+        });
+
+        let pulled = state
+            .intercept
+            .take_next(Duration::from_secs(5))
+            .await
+            .expect("an intercept must be available to pull");
+
+        // Interception is disabled in the window between take and park.
+        state.intercept.set_enabled(false);
+
+        // park_if_enabled must hand the intercept back (not park it).
+        let returned = state
+            .park_if_enabled(pulled)
+            .await
+            .expect_err("park must be refused while disabled");
+        let _ = returned.reply.send(InterceptDecision::Forward(None));
+
+        // The handler proceeds with Forward(None) — no 5-min stall.
+        let decision = tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .expect("handler must not hang after a disabled-park")
+            .unwrap();
+        assert!(matches!(decision, InterceptDecision::Forward(None)));
+
+        // Nothing parked: Status reports zero pending.
+        let resp = handle_request(&state, ControlRequest::Status).await;
+        match resp {
+            ControlResponse::Status { pending, .. } => assert_eq!(pending, 0),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn await_times_out_to_none() {
         let state = ctrl_state();
-        let resp = handle_request(&state, ControlRequest::InterceptAwait { timeout_secs: 0 }).await;
+        // Through the inline path (the production route), an empty queue yields
+        // a timed-out `Pending(None)`.
+        let resp = await_via_socket(&state, 0).await;
         assert!(matches!(resp, ControlResponse::Pending { item: None }));
+    }
+
+    /// Bug #L7: `InterceptAwait` must NOT be served by `handle_request` — the
+    /// parking logic lives solely in `handle_connection`'s inline arm. Routing
+    /// it here returns a clear error instead of silently duplicating the
+    /// take/park with the wrong ordering.
+    #[tokio::test]
+    async fn handle_request_rejects_intercept_await() {
+        let state = ctrl_state();
+        let resp = handle_request(&state, ControlRequest::InterceptAwait { timeout_secs: 5 }).await;
+        match resp {
+            ControlResponse::Error { message } => {
+                assert!(
+                    message.contains("handled inline by handle_connection"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected an Error, got {other:?}"),
+        }
+        // The queue was not touched: nothing parked.
+        let resp = handle_request(&state, ControlRequest::Status).await;
+        assert!(matches!(resp, ControlResponse::Status { pending: 0, .. }));
     }
 
     #[tokio::test]

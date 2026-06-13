@@ -148,8 +148,15 @@ impl PassedConn {
     /// Encode to the little-endian header (variable length: [`MIN_HEADER_LEN`] +
     /// `exec_id.len()`). `exec_id` is truncated to [`MAX_EXEC_ID`] bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let exec = self.exec_id.as_bytes();
-        let exec = &exec[..exec.len().min(MAX_EXEC_ID)];
+        // Truncate on a UTF-8 char boundary: slicing the raw bytes at exactly
+        // MAX_EXEC_ID could split a multibyte char, producing invalid UTF-8 that
+        // the receiver's `decode` would reject (`BadExecIdUtf8`), dropping the
+        // whole hand-off. Find the largest valid boundary <= MAX_EXEC_ID.
+        let mut end = self.exec_id.len().min(MAX_EXEC_ID);
+        while end > 0 && !self.exec_id.is_char_boundary(end) {
+            end -= 1;
+        }
+        let exec = &self.exec_id.as_bytes()[..end];
         let mut buf = vec![0u8; MIN_HEADER_LEN + exec.len()];
         buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         buf[4] = VERSION;
@@ -322,6 +329,46 @@ mod tests {
         buf = good;
         buf[6] = 0x07;
         assert_eq!(PassedConn::decode(&buf), Err(WireError::BadFamily(0x07)));
+    }
+
+    #[test]
+    fn encode_truncates_multibyte_exec_id_on_char_boundary() {
+        // An exec_id of multibyte chars longer than MAX_EXEC_ID: a raw byte
+        // truncation at MAX_EXEC_ID would split a 'é' (2 bytes) and yield invalid
+        // UTF-8 that decode() would reject. The encoder must back up to the
+        // nearest char boundary so the hand-off round-trips cleanly.
+        let exec: String = std::iter::repeat_n('é', MAX_EXEC_ID) // 2 * MAX_EXEC_ID bytes — well over the cap
+            .collect();
+        let c = pc(IpAddr::V4(Ipv4Addr::LOCALHOST), 80, L4::Tcp, 1, &exec);
+        let buf = c.encode();
+
+        // The encoded exec_id must fit the cap and be a valid char boundary
+        // prefix of the original (so no split multibyte char).
+        let exec_len = u16::from_le_bytes([buf[34], buf[35]]) as usize;
+        assert!(exec_len <= MAX_EXEC_ID);
+        // 'é' is 2 bytes, so the largest boundary <= 256 is 256.
+        assert_eq!(exec_len, MAX_EXEC_ID);
+
+        let decoded = PassedConn::decode(&buf).unwrap();
+        assert!(exec.starts_with(&decoded.exec_id));
+        assert_eq!(decoded.exec_id.len(), exec_len);
+        // The decode must not fail with BadExecIdUtf8.
+        assert!(decoded.exec_id.chars().all(|ch| ch == 'é'));
+    }
+
+    #[test]
+    fn encode_truncates_three_byte_char_below_cap() {
+        // Force the boundary back-up to land BELOW the cap: '☃' is 3 bytes, so
+        // 256 / 3 = 85 chars = 255 bytes; byte 256 would split the 86th char,
+        // and the encoder must back up to 255.
+        let exec: String = std::iter::repeat_n('☃', MAX_EXEC_ID).collect();
+        let c = pc(IpAddr::V4(Ipv4Addr::LOCALHOST), 80, L4::Tcp, 1, &exec);
+        let buf = c.encode();
+        let exec_len = u16::from_le_bytes([buf[34], buf[35]]) as usize;
+        assert_eq!(exec_len, 255); // 85 * 3, the largest boundary <= 256
+        let decoded = PassedConn::decode(&buf).unwrap();
+        assert_eq!(decoded.exec_id.chars().count(), 85);
+        assert!(exec.starts_with(&decoded.exec_id));
     }
 
     #[test]

@@ -287,6 +287,7 @@ impl Proxy {
             }
             mitm::MitmOutcome::Passthrough { stream, sni } => {
                 let (prefix, inner) = stream.into_parts();
+                let (ws, exec) = self.flow_attr(&conn);
                 passthrough::run(
                     inner,
                     prefix,
@@ -295,8 +296,8 @@ impl Proxy {
                     sni,
                     client_addr,
                     &self.writer,
-                    self.workspace_id,
-                    self.exec_id.clone(),
+                    ws,
+                    exec,
                 )
                 .await
                 .map_err(Into::into)

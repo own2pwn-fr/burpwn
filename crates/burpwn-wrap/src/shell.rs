@@ -20,10 +20,13 @@
 //!   2. On each command, if the program is not excluded and not already a
 //!      `burpwn exec` invocation, PRINT a one-line hint that the operator (or a
 //!      scripted agent reading the TTY) should run it via `burpwn exec --`.
-//!   3. Provide a `bw` helper function: `bw <cmd…>` ⇒ `burpwn exec -- <cmd…>`,
-//!      and a `BURPWN_AUTO=1` opt-in that makes the preexec actively re-run the
-//!      command through `burpwn exec` (off by default to avoid surprising an
-//!      interactive operator).
+//!   3. Provide a `bw` helper function: `bw <cmd…>` ⇒ `burpwn exec -- <cmd…>`
+//!      (argv passed through verbatim — no shell re-parse), and a
+//!      `BURPWN_AUTO=1` opt-in that makes the preexec actively re-run the whole
+//!      command line through `burpwn exec -- sh -c "$cmd"` (off by default to
+//!      avoid surprising an interactive operator). The `sh -c` form ensures a
+//!      compound line (`&&`, `;`, `|`, `$(…)`) runs entirely inside one sandbox
+//!      rather than only its first top-level segment.
 //!
 //! The accompanying [`shell_wrapper_script`] is a tiny executable an operator
 //! can set as a custom agent's shell (`SHELL=/…/burpwn-shell`) for fully
@@ -56,7 +59,7 @@ fn exclude_array(exclude: &[String]) -> String {
 
 /// Single-quote a string for POSIX-ish shells: wrap in `'…'`, turning any
 /// embedded `'` into the `'\''` idiom.
-fn single_quote(s: &str) -> String {
+pub(crate) fn single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -118,7 +121,9 @@ __burpwn_preexec() {{
   __burpwn_should_wrap "$cmd" || return 0
   if [ "${{BURPWN_AUTO:-0}}" = "1" ]; then
     print -r -- "[burpwn] wrapping: $cmd" 2>/dev/null || echo "[burpwn] wrapping: $cmd"
-    command burpwn exec -- ${{(z)cmd}} 2>/dev/null || eval "command burpwn exec -- $cmd"
+    # Run the WHOLE line inside one sandboxed shell so compound commands
+    # (&&, ;, |, $(…)) are captured in full, not just the first segment.
+    command burpwn exec -- sh -c "$cmd"
     return 130   # signal the original line was already handled (zsh)
   else
     echo "[burpwn] tip: run \`bw $cmd\` (or \`burpwn exec -- $cmd\`) to capture traffic" >&2

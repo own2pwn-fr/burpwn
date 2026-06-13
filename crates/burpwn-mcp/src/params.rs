@@ -143,8 +143,9 @@ pub struct InterceptDropParams {
 pub struct ExecParams {
     /// The command + arguments, e.g. `["curl", "https://example.com"]`.
     pub argv: Vec<String>,
-    /// Workspace name to attribute captured flows to (currently advisory; the
-    /// daemon attributes flows to the active session).
+    /// Workspace NAME to attribute this exec's captured flows to. Forwarded to
+    /// the CLI's `exec --workspace <name>`, which resolves the named workspace,
+    /// creating it if it does not yet exist. Omit to use the session default.
     #[serde(default)]
     pub workspace: Option<String>,
     /// Wall-clock timeout in seconds for the child command.

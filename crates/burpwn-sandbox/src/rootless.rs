@@ -195,6 +195,15 @@ pub fn ca_env_vars(ca_path: &str) -> Vec<(String, String)> {
 /// Build the full `bwrap` argv for the user command. PURE (string-only) so it
 /// is unit-tested. NOTE: `--unshare-net` is intentionally ABSENT — bwrap must
 /// inherit the netns we created so the REDIRECT ruleset applies.
+///
+/// SECURITY: the argv starts with `--clearenv` so the wrapped command does NOT
+/// inherit the agent/daemon process environment (which carries the serialized
+/// [`ExecSpec`] in [`SPEC_ENV`] plus any host secrets). bwrap applies
+/// `--clearenv` FIRST, then every `--setenv`, so the command sees ONLY the
+/// CA-trust vars + the caller-supplied `spec.env` we re-inject below. We
+/// explicitly filter [`SPEC_ENV`] (and the `BURPWN_NETNS_SPEC` literal) out of
+/// the re-injected `spec.env` so the serialized spec can never leak through,
+/// even though `spec.env` was populated from the full inherited host env.
 pub fn build_bwrap_argv(spec: &ExecSpec) -> Vec<String> {
     let workdir = spec.workdir.to_string_lossy().to_string();
     let ca = spec.ca_path.to_string_lossy().to_string();
@@ -204,6 +213,8 @@ pub fn build_bwrap_argv(spec: &ExecSpec) -> Vec<String> {
     };
 
     push(&mut args, &["bwrap"]);
+    // Start from an EMPTY environment; the command gets only what we --setenv.
+    push(&mut args, &["--clearenv"]);
     push(&mut args, &["--ro-bind", "/", "/"]);
     push(&mut args, &["--dev", "/dev"]);
     push(&mut args, &["--proc", "/proc"]);
@@ -221,8 +232,14 @@ pub fn build_bwrap_argv(spec: &ExecSpec) -> Vec<String> {
     for (k, v) in ca_env_vars(&ca) {
         args.extend(["--setenv".to_string(), k, v]);
     }
-    // Caller-supplied extra env.
+    // Caller-supplied extra env. `spec.env` was copied from the full inherited
+    // host env, so it can contain the serialized-spec var — never re-inject it
+    // (it would hand the wrapped, attacker-influenced command the proxy_sock
+    // path, exec_id, workspace_id and the whole copied caller env).
     for (k, v) in &spec.env {
+        if k == SPEC_ENV {
+            continue;
+        }
         args.extend(["--setenv".to_string(), k.clone(), v.clone()]);
     }
     push(&mut args, &["--die-with-parent", "--unshare-pid"]);
@@ -460,6 +477,13 @@ mod privileged {
                 return 125;
             }
         };
+        // Defense in depth: scrub the serialized spec from THIS process's env
+        // right after deserializing it, so it cannot leak to the bwrap'd command
+        // even on a code path that forgets `--clearenv` (bwrap inherits the
+        // agent's env for any var not overridden by a `--setenv`). This is a
+        // fresh, single-threaded `execve`d image, so the environ mutation races
+        // no other thread.
+        std::env::remove_var(super::SPEC_ENV);
 
         if let Err(e) = setup_netns(&spec) {
             eprintln!("burpwn __netns-agent: netns setup failed: {e}");
@@ -831,16 +855,14 @@ mod privileged {
         let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
         let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
 
-        // A timed-out command is reported with the conventional `timeout(1)`
-        // exit code 124 (with whatever partial output we captured).
-        if timed_out {
-            return Ok(ExecOutcome {
-                exit_code: 124,
-                stdout,
-                stderr,
-            });
-        }
-
+        // A command that reaps as a clean `Exited(code)` actually finished on its
+        // own — even when the deadline elapsed. There is an inherent race: the
+        // child can exit in the window between the final WNOHANG poll and the
+        // deadline check, so our SIGKILL no-ops and the reaped status is the real
+        // exit. In that case we must report the REAL code, not 124, otherwise a
+        // command that finishes right at the deadline is misreported as a
+        // timeout. We only force the conventional `timeout(1)` code 124 when the
+        // child was actually killed by a signal (our SIGKILL landed).
         match status {
             Ok(WaitStatus::Exited(_, code)) => Ok(ExecOutcome {
                 exit_code: code,
@@ -848,7 +870,10 @@ mod privileged {
                 stderr,
             }),
             Ok(WaitStatus::Signaled(_, sig, _)) => Ok(ExecOutcome {
-                exit_code: 128 + sig as i32,
+                // The child was killed by a signal. If we are the ones that
+                // killed it on the deadline, surface the timeout code 124;
+                // otherwise report the conventional 128 + signal.
+                exit_code: if timed_out { 124 } else { 128 + sig as i32 },
                 stdout,
                 stderr,
             }),
@@ -906,6 +931,9 @@ mod tests {
         let argv = build_bwrap_argv(&spec());
         let joined = argv.join(" ");
         assert_eq!(argv[0], "bwrap");
+        // SECURITY: --clearenv must be present so the command starts from an
+        // empty env (no inherited host/daemon secrets nor the serialized spec).
+        assert!(argv.iter().any(|a| a == "--clearenv"));
         assert!(joined.contains("--ro-bind / /"));
         assert!(joined.contains("--dev /dev"));
         assert!(joined.contains("--proc /proc"));
@@ -933,6 +961,26 @@ mod tests {
         // The user command comes after the `--` separator, last.
         let sep = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[sep + 1..], &["curl", "-s", "https://example.com"]);
+    }
+
+    #[test]
+    fn bwrap_argv_clears_env_and_never_reinjects_the_spec_var() {
+        // Even if the spec env (copied from the full host env) carries the
+        // serialized-spec var, build_bwrap_argv must --clearenv and must NOT
+        // re-inject SPEC_ENV via --setenv (which would leak proxy_sock/exec_id/
+        // workspace_id and the whole copied caller env to the wrapped command).
+        let mut s = spec();
+        s.env
+            .push((SPEC_ENV.to_string(), "{\"leaked\":true}".to_string()));
+        let argv = build_bwrap_argv(&s);
+        assert!(argv.iter().any(|a| a == "--clearenv"));
+        // The spec var must not appear as a --setenv key anywhere.
+        assert!(
+            !argv.iter().any(|a| a == SPEC_ENV),
+            "BURPWN_NETNS_SPEC must never be re-injected into the sandbox"
+        );
+        // A benign caller var is still re-injected normally.
+        assert!(argv.join(" ").contains("--setenv FOO bar"));
     }
 
     #[test]

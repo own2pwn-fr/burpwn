@@ -8,6 +8,14 @@
 
 use std::io::Read;
 
+/// Upper bound on the size of a DECODED body copy. Compressed bodies are
+/// attacker-controlled and a few-KB "zip/brotli bomb" can inflate to gigabytes,
+/// so each decompressor is wrapped in `.take(DECODE_CAP)` before `read_to_end`.
+/// The decoded copy is truncated at this bound (only the stored/searchable copy
+/// is decoded — the bytes forwarded on the wire are the original compressed body
+/// and are never touched by this module). Mirrors `http::BODY_CAP` (8 MiB).
+pub const DECODE_CAP: u64 = 8 * 1024 * 1024;
+
 /// Decode a body according to its `Content-Encoding` header value (case
 /// insensitive, comma-separated chains applied right-to-left). Unknown or absent
 /// encodings return the input unchanged. Decoding failures fall back to the
@@ -42,29 +50,31 @@ fn decode_one(coding: &str, body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn gunzip(body: &[u8]) -> Option<Vec<u8>> {
+/// Drain a decompressor into a buffer bounded by [`DECODE_CAP`]. The reader is
+/// wrapped in `.take(DECODE_CAP)` so a decompression bomb cannot exhaust memory:
+/// the decoded copy is truncated at the cap rather than allowed to grow without
+/// limit.
+fn read_capped<R: Read>(reader: R) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut dec = flate2::read::GzDecoder::new(body);
-    dec.read_to_end(&mut out).ok().map(|_| out)
+    reader.take(DECODE_CAP).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn gunzip(body: &[u8]) -> Option<Vec<u8>> {
+    read_capped(flate2::read::GzDecoder::new(body)).ok()
 }
 
 /// `deflate` per HTTP can be either zlib-wrapped or raw; try zlib first, then
 /// raw, matching what real servers emit.
 fn inflate(body: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut dec = flate2::read::ZlibDecoder::new(body);
-    if dec.read_to_end(&mut out).is_ok() {
+    if let Ok(out) = read_capped(flate2::read::ZlibDecoder::new(body)) {
         return Some(out);
     }
-    out.clear();
-    let mut raw = flate2::read::DeflateDecoder::new(body);
-    raw.read_to_end(&mut out).ok().map(|_| out)
+    read_capped(flate2::read::DeflateDecoder::new(body)).ok()
 }
 
 fn brotli_decode(body: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut dec = brotli::Decompressor::new(body, 4096);
-    dec.read_to_end(&mut out).ok().map(|_| out)
+    read_capped(brotli::Decompressor::new(body, 4096)).ok()
 }
 
 #[cfg(test)]
@@ -126,5 +136,29 @@ mod tests {
     fn corrupt_body_falls_back_to_raw() {
         // Not valid gzip — we keep the bytes rather than dropping them.
         assert_eq!(decode_body(Some("gzip"), b"not-gzip"), b"not-gzip");
+    }
+
+    #[test]
+    fn gzip_bomb_is_capped() {
+        // A highly-compressible input that decodes to far more than DECODE_CAP.
+        // The compressed form is a few KB; the decompressed form would be 32 MiB
+        // unbounded. The cap must clamp the decoded copy to DECODE_CAP.
+        let raw = vec![0u8; (DECODE_CAP as usize) * 4];
+        let bomb = gz(&raw);
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "compressed bomb should be small, got {}",
+            bomb.len()
+        );
+        let decoded = decode_body(Some("gzip"), &bomb);
+        assert_eq!(decoded.len() as u64, DECODE_CAP);
+    }
+
+    #[test]
+    fn brotli_bomb_is_capped() {
+        let raw = vec![0u8; (DECODE_CAP as usize) * 4];
+        let bomb = br(&raw);
+        let decoded = decode_body(Some("br"), &bomb);
+        assert_eq!(decoded.len() as u64, DECODE_CAP);
     }
 }

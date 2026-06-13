@@ -200,6 +200,10 @@ fn cmd_wrap_hook(_paths: &Paths, agent: Option<String>) -> Result<i32> {
 
 async fn cmd_proxy(paths: &Paths, args: ProxyArgs) -> Result<i32> {
     let session = args.session.unwrap_or_else(|| paths.active_session());
+    // Reject traversal / absolute session names before any path is built from
+    // them (Bug #6): otherwise `--session ../../foo` would open dirs+DB outside
+    // `…/sessions/`.
+    validate_session_name(&session)?;
     crate::daemon::run_daemon(paths, &session).await?;
     Ok(0)
 }
@@ -310,6 +314,10 @@ pub async fn cmd_exec(
     runtime_override: Option<Arc<dyn SandboxRuntime>>,
 ) -> Result<i32> {
     let session = args.session.unwrap_or_else(|| paths.active_session());
+    // Reject traversal / absolute session names before any path is built from
+    // them (Bug #6): otherwise `--session ../../foo` would create/open dirs+DB
+    // (and runtime dirs) outside `…/sessions/`.
+    validate_session_name(&session)?;
     paths.ensure_base()?;
     paths.ensure_session_dir(&session)?;
 
@@ -1218,6 +1226,76 @@ mod tests {
             rt.last_spec().unwrap().argv,
             vec!["curl", "http://example.com"]
         );
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_traversal_session_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_base().unwrap();
+
+        // A traversal session name must be rejected before any path is built,
+        // and crucially before a session dir/DB is created outside sessions/.
+        let rt = MockRuntime::new();
+        let dyn_rt: Arc<dyn SandboxRuntime> = rt.clone();
+        let err = cmd_exec(
+            true,
+            &paths,
+            ExecArgs {
+                workspace: None,
+                timeout: Some(5),
+                session: Some("../../foo".into()),
+                cmd: vec!["true".into()],
+            },
+            Some(dyn_rt),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid session name"),
+            "unexpected error: {err}"
+        );
+        // No escape: nothing was created above the sessions dir.
+        assert!(!dir.path().join("foo").exists());
+        // An absolute path is rejected too.
+        let rt2 = MockRuntime::new();
+        let dyn_rt2: Arc<dyn SandboxRuntime> = rt2.clone();
+        let err = cmd_exec(
+            true,
+            &paths,
+            ExecArgs {
+                workspace: None,
+                timeout: Some(5),
+                session: Some("/tmp/abs".into()),
+                cmd: vec!["true".into()],
+            },
+            Some(dyn_rt2),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid session name"));
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_traversal_session_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_base().unwrap();
+
+        let err = cmd_proxy(
+            &paths,
+            ProxyArgs {
+                session: Some("../../escape".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid session name"),
+            "unexpected error: {err}"
+        );
+        // The daemon never ran, so no runtime dir leaked outside the base.
+        assert!(!dir.path().join("escape").exists());
     }
 
     #[tokio::test]

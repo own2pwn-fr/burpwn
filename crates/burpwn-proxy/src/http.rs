@@ -250,7 +250,10 @@ async fn handle_inner(
         .await;
 
     // --- build the upstream request from the (possibly edited) message ---
-    let upstream_req = build_upstream_request(&parts, &method, &msg, version)?;
+    // For a WebSocket upgrade we must NOT strip Connection/Upgrade/Sec-WebSocket-*:
+    // RFC6455 requires the origin to see `Connection: Upgrade` + `Upgrade:
+    // websocket` (and the Sec-WebSocket-Key/Version) or it never returns 101.
+    let upstream_req = build_upstream_request(&parts, &method, &msg, version, is_ws)?;
 
     // WebSocket: hand off to the splice path after the handshake.
     if is_ws {
@@ -480,6 +483,7 @@ fn build_upstream_request(
     method: &str,
     msg: &Message,
     version: Version,
+    is_ws: bool,
 ) -> anyhow::Result<Request<Full<Bytes>>> {
     let mut headers = headers_from_bytes(&msg.headers, &orig.headers);
     // Always carry the (possibly rewritten) authority in the Host header. The H1
@@ -488,20 +492,30 @@ fn build_upstream_request(
     if let Ok(hv) = HeaderValue::from_str(&msg.host) {
         headers.insert(HOST, hv);
     }
-    // Drop hop-by-hop framing we will recompute, plus connection-specific headers
-    // that are illegal on an HTTP/2 leg.
+    // Drop hop-by-hop framing we will recompute.
     headers.remove(hyper::header::CONTENT_LENGTH);
     headers.remove(hyper::header::TRANSFER_ENCODING);
-    headers.remove(hyper::header::CONNECTION);
-    headers.remove(hyper::header::UPGRADE);
-    headers.remove("keep-alive");
-    headers.remove("proxy-connection");
+    // Strip connection-specific headers that are illegal on an HTTP/2 leg — but
+    // NOT for a WebSocket upgrade, which goes out over HTTP/1.1 and MUST carry
+    // `Connection: Upgrade` + `Upgrade: websocket` (and the Sec-WebSocket-* set,
+    // which `headers_from_bytes` already preserved) verbatim, or the origin will
+    // never answer 101 (RFC6455).
+    if !is_ws {
+        headers.remove(hyper::header::CONNECTION);
+        headers.remove(hyper::header::UPGRADE);
+        headers.remove("keep-alive");
+        headers.remove("proxy-connection");
+    }
 
     let uri: http::Uri = msg.url.parse().unwrap_or_else(|_| orig.uri.clone());
+    // A WebSocket upgrade is always replayed upstream over HTTP/1.1 (see
+    // `ws_handshake_upstream`), so pin the version even if the downstream request
+    // arrived as h2 — an `Upgrade` over h2 is meaningless.
+    let out_version = if is_ws { Version::HTTP_11 } else { version };
     let mut builder = Request::builder()
         .method(method.as_bytes())
         .uri(uri)
-        .version(version);
+        .version(out_version);
     {
         let h = builder.headers_mut().unwrap();
         *h = headers;
@@ -842,6 +856,63 @@ mod tests {
         fallback.append(HOST, HeaderValue::from_static("fallback.test"));
         let back = headers_from_bytes(b"this is not headers", &fallback);
         assert_eq!(back.get(HOST).unwrap(), "fallback.test");
+    }
+
+    // Build a `Message` whose raw header block carries a WebSocket upgrade, plus
+    // the matching original `Parts`, to exercise `build_upstream_request`.
+    fn ws_message_and_parts() -> (Message, http::request::Parts) {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/chat")
+            .header(HOST, "example.com")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        let raw = serialize_headers(&parts.headers);
+        let msg = Message {
+            host: "example.com".into(),
+            url: "/chat".into(),
+            headers: raw,
+            body: Vec::new(),
+        };
+        (msg, parts)
+    }
+
+    // Bug 1 regression: a WebSocket upgrade request must carry Connection/Upgrade
+    // (and the Sec-WebSocket-* set) verbatim to the origin, else it never 101s.
+    #[test]
+    fn build_upstream_keeps_upgrade_headers_for_ws() {
+        let (msg, parts) = ws_message_and_parts();
+        let out = build_upstream_request(&parts, "GET", &msg, Version::HTTP_11, true).unwrap();
+        let h = out.headers();
+        assert_eq!(
+            h.get(hyper::header::CONNECTION)
+                .map(|v| v.to_str().unwrap()),
+            Some("Upgrade")
+        );
+        assert_eq!(
+            h.get(hyper::header::UPGRADE).map(|v| v.to_str().unwrap()),
+            Some("websocket")
+        );
+        assert!(h.contains_key("sec-websocket-key"));
+        assert!(h.contains_key("sec-websocket-version"));
+        // WS is replayed over HTTP/1.1 regardless of the downstream version.
+        assert_eq!(out.version(), Version::HTTP_11);
+    }
+
+    // The non-WS path must still strip connection-specific headers (HTTP/2 leg
+    // correctness).
+    #[test]
+    fn build_upstream_strips_upgrade_headers_for_non_ws() {
+        let (msg, parts) = ws_message_and_parts();
+        let out = build_upstream_request(&parts, "GET", &msg, Version::HTTP_2, false).unwrap();
+        let h = out.headers();
+        assert!(!h.contains_key(hyper::header::CONNECTION));
+        assert!(!h.contains_key(hyper::header::UPGRADE));
     }
 
     #[test]

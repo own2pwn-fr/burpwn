@@ -362,8 +362,10 @@ pub async fn intercept_drop(
 /// This deliberately reuses the whole CLI orchestration (daemon-ensure, sandbox
 /// runtime, flow attribution) instead of reimplementing the sandbox here.
 ///
-/// `params.workspace` is parsed as an i64 (the CLI's `--workspace` is a workspace
-/// id); a non-numeric value is ignored with a warning rather than failing.
+/// `params.workspace`, when present, is forwarded verbatim as the `--workspace`
+/// value: the CLI's `--workspace` is a workspace NAME, which it resolves or
+/// creates. (It used to be parsed as an i64 id, which silently dropped real
+/// names and mis-attributed numeric-looking ones.)
 pub async fn run_exec(session: &str, params: &crate::params::ExecParams) -> Result<Value> {
     use std::os::fd::FromRawFd;
     use tokio::io::AsyncReadExt;
@@ -386,12 +388,10 @@ pub async fn run_exec(session: &str, params: &crate::params::ExecParams) -> Resu
         cmd.arg("--timeout").arg(t.to_string());
     }
     if let Some(ws) = &params.workspace {
-        match ws.parse::<i64>() {
-            Ok(id) => {
-                cmd.arg("--workspace").arg(id.to_string());
-            }
-            Err(_) => tracing::warn!(workspace = %ws, "ignoring non-numeric exec workspace"),
-        }
+        // `--workspace` is a NAME (the CLI resolves/creates it). Pass it through
+        // verbatim — do NOT parse it as an id, which silently dropped real names
+        // and mis-attributed numeric-looking ones.
+        cmd.arg("--workspace").arg(ws);
     }
     cmd.arg("--");
     for a in &params.argv {

@@ -1,7 +1,7 @@
 //! `burpwn wrap-hook`: the stdin filter the installed agent hooks pipe their
 //! tool-input JSON through. It reads a tool-input object on stdin, and if it is
 //! a shell/Bash tool call whose command [`should_wrap`], rewrites the command to
-//! `burpwn exec -- <cmd>` and emits the hook-response JSON on stdout.
+//! `burpwn exec -- sh -c '<cmd>'` and emits the hook-response JSON on stdout.
 //!
 //! It is **robust to unknown shapes**: anything it can't parse, or any tool it
 //! doesn't recognise, is passed through unchanged (echoed) so it never breaks an
@@ -23,7 +23,7 @@ use burpwn_wrap::{rewrite_command, should_wrap, WrapConfig};
 /// - `.params.command` / `.command` (generic / shell)
 ///
 /// When found and `should_wrap` is true, the command string is replaced in place
-/// with `burpwn exec -- <cmd>`. Everything else is echoed unchanged.
+/// with `burpwn exec -- sh -c '<cmd>'`. Everything else is echoed unchanged.
 pub fn process(input: &str, cfg: &WrapConfig) -> String {
     process_for(None, input, cfg)
 }
@@ -65,10 +65,26 @@ fn rewrite_in_place(v: &mut Value, cfg: &WrapConfig) -> bool {
 }
 
 /// True if `cmd` already invokes `burpwn exec` (so wrapping it again would give
-/// `burpwn exec -- burpwn exec -- …`).
+/// `burpwn exec -- … burpwn exec -- …`).
+///
+/// A bare prefix check misses real-world spellings like `sudo burpwn exec -- …`
+/// or `env FOO=1 /usr/local/bin/burpwn exec -- …`. We instead tokenize on
+/// whitespace and treat the line as already-wrapped if any token is `burpwn`
+/// (or a path ending in `/burpwn`) immediately followed by `exec`. A leading
+/// `bw ` (the global-hook helper) is also recognised.
 fn already_wrapped(cmd: &str) -> bool {
     let c = cmd.trim_start();
-    c.starts_with("burpwn exec") || c.contains("/burpwn exec") || c.starts_with("bw ")
+    if c == "bw" || c.starts_with("bw ") {
+        return true;
+    }
+    let toks: Vec<&str> = c.split_whitespace().collect();
+    toks.windows(2)
+        .any(|w| is_burpwn_token(w[0]) && w[1] == "exec")
+}
+
+/// Is `tok` the `burpwn` program — either bare or as a path ending `/burpwn`?
+fn is_burpwn_token(tok: &str) -> bool {
+    tok == "burpwn" || tok.rsplit('/').next() == Some("burpwn")
 }
 
 #[cfg(test)]
@@ -87,7 +103,7 @@ mod tests {
         let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
         assert_eq!(
             out["tool_input"]["command"],
-            "burpwn exec -- curl https://example.com"
+            "burpwn exec -- sh -c 'curl https://example.com'"
         );
     }
 
@@ -96,15 +112,62 @@ mod tests {
         let cfg = WrapConfig::default();
         let input = json!({ "command": "nmap -sV target" }).to_string();
         let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
-        assert_eq!(out["command"], "burpwn exec -- nmap -sV target");
+        assert_eq!(out["command"], "burpwn exec -- sh -c 'nmap -sV target'");
+    }
+
+    #[test]
+    fn rewrites_whole_compound_line() {
+        // Both segments of the compound must end up inside one sandboxed `sh -c`.
+        let cfg = WrapConfig::default();
+        let input = json!({ "command": "curl https://a && curl https://evil" }).to_string();
+        let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
+        assert_eq!(
+            out["command"],
+            "burpwn exec -- sh -c 'curl https://a && curl https://evil'"
+        );
     }
 
     #[test]
     fn already_wrapped_command_is_not_double_wrapped() {
         let cfg = WrapConfig::default();
-        let input = json!({ "command": "burpwn exec -- curl https://x" }).to_string();
+        // The hook already emits the `sh -c` form; firing on it must be a no-op.
+        let input = json!({ "command": "burpwn exec -- sh -c 'curl https://x'" }).to_string();
         let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
-        assert_eq!(out["command"], "burpwn exec -- curl https://x");
+        assert_eq!(out["command"], "burpwn exec -- sh -c 'curl https://x'");
+    }
+
+    #[test]
+    fn sudo_burpwn_exec_is_recognised_as_wrapped() {
+        // `sudo burpwn exec -- …` (and a path-qualified burpwn) must not be
+        // re-wrapped: the burpwn token is not the first token of the line.
+        let cfg = WrapConfig::default();
+        let input = json!({ "command": "sudo burpwn exec -- sh -c 'id'" }).to_string();
+        let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
+        assert_eq!(out["command"], "sudo burpwn exec -- sh -c 'id'");
+
+        let input =
+            json!({ "command": "env FOO=1 /usr/local/bin/burpwn exec -- sh -c 'id'" }).to_string();
+        let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
+        assert_eq!(
+            out["command"],
+            "env FOO=1 /usr/local/bin/burpwn exec -- sh -c 'id'"
+        );
+    }
+
+    #[test]
+    fn already_wrapped_unit() {
+        assert!(already_wrapped("burpwn exec -- sh -c 'id'"));
+        assert!(already_wrapped("  burpwn exec -- x"));
+        assert!(already_wrapped("sudo burpwn exec -- x"));
+        assert!(already_wrapped("/usr/local/bin/burpwn exec -- x"));
+        assert!(already_wrapped("env A=1 /opt/burpwn exec -- x"));
+        assert!(already_wrapped("bw curl https://x"));
+        assert!(already_wrapped("bw"));
+        // Not wrapped:
+        assert!(!already_wrapped("curl https://x"));
+        assert!(!already_wrapped("burpwn req list")); // burpwn but not `exec`
+        assert!(!already_wrapped("burpwnexec foo")); // not the burpwn token
+        assert!(!already_wrapped("bwrap --bind /"));
     }
 
     #[test]
@@ -113,7 +176,10 @@ mod tests {
         let input = json!({ "tool_input": { "command": "nmap t" } }).to_string();
         let out: Value =
             serde_json::from_str(&process_for(Some("claude-code"), &input, &cfg)).unwrap();
-        assert_eq!(out["tool_input"]["command"], "burpwn exec -- nmap t");
+        assert_eq!(
+            out["tool_input"]["command"],
+            "burpwn exec -- sh -c 'nmap t'"
+        );
     }
 
     #[test]

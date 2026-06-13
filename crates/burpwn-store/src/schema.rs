@@ -42,6 +42,13 @@ pub fn init(conn: &Connection) -> Result<()> {
                     step(conn)?;
                 }
             }
+            // Stamp the schema version INSIDE the transaction (PRAGMA
+            // user_version is transactional in SQLite). Doing it after COMMIT
+            // as a separate autocommit write leaves a crash window where the
+            // schema is migrated but user_version is stale, so the next open
+            // re-runs every migration. Inside the txn, the version bump commits
+            // atomically with the migration (or rolls back with it).
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             Ok(())
         };
         if let Err(e) = apply() {
@@ -49,7 +56,6 @@ pub fn init(conn: &Connection) -> Result<()> {
             return Err(e);
         }
         conn.execute_batch("COMMIT")?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
 
     seed_default_workspace(conn)?;
@@ -341,6 +347,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn user_version_is_stamped_atomically_with_migrations() {
+        // The version stamp must commit together with the schema, never as a
+        // separate post-COMMIT write. We assert the end state is consistent:
+        // schema present AND user_version current, with a single init() call.
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "flows"));
+
+        // A failing migration must leave BOTH the schema and the version
+        // untouched (the version bump rolls back with the migration), so the
+        // next open re-applies cleanly rather than seeing a half-stamped file.
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch("BEGIN").unwrap();
+        let migrated = (|| -> Result<()> {
+            migrate_v1(&fresh)?;
+            // simulate a crash/failure before the version stamp by erroring out
+            Err(StoreError::IncompatibleSchema {
+                found: 0,
+                supported: SCHEMA_VERSION,
+            })
+        })();
+        assert!(migrated.is_err());
+        fresh.execute_batch("ROLLBACK").unwrap();
+        let v2: i64 = fresh
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        // Rolled back: still at the initial version, schema gone too.
+        assert_eq!(v2, 0);
+        assert!(!table_exists(&fresh, "flows"));
+        // A subsequent real init() then succeeds end-to-end.
+        init(&fresh).unwrap();
+        let v3: i64 = fresh
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v3, SCHEMA_VERSION);
+        assert!(table_exists(&fresh, "flows"));
     }
 
     #[test]
