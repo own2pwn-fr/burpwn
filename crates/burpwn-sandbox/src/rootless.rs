@@ -438,7 +438,7 @@ mod privileged {
                     let _ = nix::sys::wait::waitpid(child, None);
                     return Err(e);
                 }
-                reap_child(child, out_r, err_r)
+                reap_child(child, out_r, err_r, spec.timeout)
             }
         }
     }
@@ -786,8 +786,9 @@ mod privileged {
         child: nix::unistd::Pid,
         out_r: Option<std::os::fd::OwnedFd>,
         err_r: Option<std::os::fd::OwnedFd>,
+        timeout: Option<std::time::Duration>,
     ) -> Result<ExecOutcome, SandboxError> {
-        use nix::sys::wait::{waitpid, WaitStatus};
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
         let spawn_reader = |fd: Option<std::os::fd::OwnedFd>| {
             fd.map(|fd| {
@@ -802,10 +803,43 @@ mod privileged {
         let out_reader = spawn_reader(out_r);
         let err_reader = spawn_reader(err_r);
 
-        let status = waitpid(child, None);
+        // Enforce the wall-clock timeout: poll for exit and, once the deadline
+        // passes, SIGKILL the child. bwrap runs with `--die-with-parent`, so
+        // killing the (agent) child cascades SIGKILL to the command and its
+        // descendants. Without a timeout we just block until exit.
+        let mut timed_out = false;
+        let status = if let Some(limit) = timeout {
+            let start = std::time::Instant::now();
+            loop {
+                match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) => {
+                        if start.elapsed() >= limit {
+                            let _ =
+                                nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                            timed_out = true;
+                            break waitpid(child, None);
+                        }
+                        thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    other => break other,
+                }
+            }
+        } else {
+            waitpid(child, None)
+        };
 
         let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
         let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+
+        // A timed-out command is reported with the conventional `timeout(1)`
+        // exit code 124 (with whatever partial output we captured).
+        if timed_out {
+            return Ok(ExecOutcome {
+                exit_code: 124,
+                stdout,
+                stderr,
+            });
+        }
 
         match status {
             Ok(WaitStatus::Exited(_, code)) => Ok(ExecOutcome {

@@ -132,6 +132,6 @@ mod tests {
         let cli = Cli::parse_from(["burpwn", "proxy", "--session", "s"]);
         assert!(matches!(cli.command, cli::Command::Proxy(_)));
         let cli = Cli::parse_from(["burpwn", "wrap-hook"]);
-        assert!(matches!(cli.command, cli::Command::WrapHook));
+        assert!(matches!(cli.command, cli::Command::WrapHook { .. }));
     }
 }

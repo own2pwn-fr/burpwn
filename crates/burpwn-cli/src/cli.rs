@@ -29,7 +29,13 @@ pub enum Command {
 
     /// (hidden) The stdin filter the installed hooks pipe tool-input through.
     #[command(hide = true)]
-    WrapHook,
+    WrapHook {
+        /// The agent whose hook dialect produced the stdin (e.g. `claude-code`,
+        /// `cursor`, `gemini`). The installed hooks pass this; it selects the
+        /// stdin/stdout JSON shape. Accepted for all agents (unknown → generic).
+        #[arg(long)]
+        agent: Option<String>,
+    },
 
     /// (hidden) Run the proxy daemon for a session (spawned by `exec`).
     #[command(hide = true)]

@@ -55,7 +55,7 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
     match cli.command {
         Command::Doctor => cmd_doctor(&out, paths),
         Command::Init(args) => cmd_init(&out, args),
-        Command::WrapHook => cmd_wrap_hook(paths),
+        Command::WrapHook { agent } => cmd_wrap_hook(paths, agent),
         Command::Proxy(args) => cmd_proxy(paths, args).await,
         Command::Ca { action } => cmd_ca(&out, paths, action),
         Command::Session { action } => cmd_session(&out, paths, action),
@@ -180,7 +180,7 @@ fn install_global_hook(
 
 /// The hidden stdin filter. Reads tool-input JSON on stdin, rewrites, emits the
 /// (possibly-rewritten) JSON on stdout. Always exits 0 (never breaks the agent).
-fn cmd_wrap_hook(_paths: &Paths) -> Result<i32> {
+fn cmd_wrap_hook(_paths: &Paths, agent: Option<String>) -> Result<i32> {
     let cfg = WrapConfig::default_path()
         .and_then(|p| WrapConfig::load(&p).ok())
         .unwrap_or_default();
@@ -189,7 +189,7 @@ fn cmd_wrap_hook(_paths: &Paths) -> Result<i32> {
         // Can't read stdin: emit nothing, succeed (pass-through semantics).
         return Ok(0);
     }
-    let output = wrap_hook::process(&input, &cfg);
+    let output = wrap_hook::process_for(agent.as_deref(), &input, &cfg);
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(output.as_bytes());
     let _ = stdout.flush();

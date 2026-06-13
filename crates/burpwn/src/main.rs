@@ -32,6 +32,19 @@ fn main() {
     // The `mcp` subcommand is routed directly here (not through burpwn-cli's
     // clap tree) so burpwn-mcp can depend on burpwn-cli without a cycle.
     let result = if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("mcp")) {
+        // Print help instead of starting the server when asked.
+        if std::env::args().skip(2).any(|a| a == "--help" || a == "-h") {
+            println!(
+                "Run the burpwn MCP server over stdio (for AI agents).\n\n\
+                 Usage: burpwn mcp [--session <name>]\n\n\
+                 Options:\n  \
+                 --session <name>  Session to operate on (default: the active session)\n  \
+                 -h, --help        Print help\n\n\
+                 The server speaks the Model Context Protocol on stdin/stdout; run it from\n\
+                 your agent's MCP client configuration, not interactively."
+            );
+            std::process::exit(0);
+        }
         rt.block_on(burpwn_mcp::run(parse_mcp_args()))
     } else {
         // The CLI owns argv parsing, tracing setup, and dispatch.
