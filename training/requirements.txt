@@ -1,0 +1,22 @@
+# Packaging + (re)generation + upload of the burpwn fine-tuning dataset.
+#
+# The generator itself (generate.py) is stdlib-only and needs NOTHING here.
+# These deps are only for Hugging Face packaging/upload and (optionally) a quick
+# local load check. Pinned loosely so they keep working as the ecosystem moves.
+
+# --- Hugging Face packaging / upload (upload_to_hf.py) ---
+huggingface_hub>=0.24,<1.0
+# Optional: lets you `datasets.load_dataset("json", data_files=...)` to smoke-test
+# that the JSONL parses and the splits load before pushing.
+datasets>=2.19,<4.0
+
+# --- Fine-tuning (see finetune/) ---
+# The trainer (LLaMA-Factory) brings its own pinned stack; install it separately
+# per finetune/README.md. These are listed for convenience if you train in this
+# same environment. Uncomment as needed.
+# transformers>=4.45
+# peft>=0.12
+# trl>=0.9
+# bitsandbytes>=0.43        # required for 4-bit QLoRA (70B config)
+# accelerate>=0.34
+# deepspeed>=0.14           # for multi-GPU ZeRO-3 (70B)

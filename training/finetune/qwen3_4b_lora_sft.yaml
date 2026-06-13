@@ -1,0 +1,65 @@
+# LLaMA-Factory — burpwn SFT, 4B class, LoRA (single 24GB GPU).
+#
+# Trains a small instruct model to drive burpwn (CLI + MCP tool-use) on the
+# burpwn-usage dataset. LoRA + bf16 fits comfortably on one 24GB card (e.g.
+# RTX 4090 / A5000). Swap `model_name_or_path` for any ~3–4B instruct model
+# (Llama-3.2-3B-Instruct, Phi-4-mini, etc.); keep `template` matching the base.
+#
+# Run:
+#   pip install -e ".[torch,metrics,bitsandbytes]"   # in the LLaMA-Factory repo
+#   llamafactory-cli train training/finetune/qwen3_4b_lora_sft.yaml
+#
+# `dataset_dir` points at this folder so LLaMA-Factory reads the dataset_info.json
+# here (which references ../dataset.{train,validation}.jsonl). Use an ABSOLUTE
+# path when launching from elsewhere.
+
+### model
+model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: all                 # all linear layers
+# train_on_responses_only: mask the prompt, learn only the assistant turns
+mask_history: false
+
+### dataset
+dataset_dir: .                   # this directory's dataset_info.json
+dataset: burpwn_train
+eval_dataset: burpwn_validation
+template: qwen                    # MUST match the base model's chat template
+cutoff_len: 4096
+max_samples: 100000
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+output_dir: saves/burpwn-qwen3-4b/lora/sft
+logging_steps: 10
+save_steps: 200
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8    # effective batch ~16
+learning_rate: 1.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 180000000
+
+### eval
+val_size: 0.0                     # we pass an explicit eval_dataset instead
+per_device_eval_batch_size: 2
+eval_strategy: steps
+eval_steps: 200

@@ -1,0 +1,73 @@
+# LLaMA-Factory — burpwn SFT, 70B class, QLoRA (4-bit), multi-GPU.
+#
+# Trains a large instruct model to drive burpwn (CLI + MCP tool-use) on the
+# burpwn-usage dataset using 4-bit QLoRA. Same data as the 4B config, longer
+# context. Plan for multi-GPU: a 70B base in 4-bit is ~38–40GB of weights, so it
+# fits the optimizer + activations on 2x80GB (A100/H100) or 4x48GB (A6000/L40S)
+# with ZeRO-3 offload. A single 80GB card can do short context with aggressive
+# checkpointing but expect it to be tight.
+#
+# Run (4 GPUs example):
+#   pip install -e ".[torch,metrics,bitsandbytes,deepspeed]"
+#   FORCE_TORCHRUN=1 NPROC_PER_NODE=4 \
+#     llamafactory-cli train training/finetune/llama3_70b_qlora_sft.yaml
+#
+# Swap `model_name_or_path` for any ~70B instruct model (Qwen2.5-72B-Instruct,
+# etc.) and set `template` to match it.
+
+### model
+model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+trust_remote_code: true
+
+### quantization (QLoRA, 4-bit NF4)
+quantization_bit: 4
+quantization_method: bnb         # bitsandbytes
+double_quantization: true
+quantization_type: nf4
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: all
+mask_history: false
+
+### dataset
+dataset_dir: .
+dataset: burpwn_train
+eval_dataset: burpwn_validation
+template: llama3                  # MUST match the base model's chat template
+cutoff_len: 8192                  # longer context — afforded by 4-bit + ZeRO-3
+max_samples: 100000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 8
+
+### output
+output_dir: saves/burpwn-llama3-70b/qlora/sft
+logging_steps: 10
+save_steps: 200
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16   # effective batch ~16 * num_gpus
+learning_rate: 1.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 180000000
+deepspeed: examples/deepspeed/ds_z3_offload_config.json  # ships with LLaMA-Factory
+
+### eval
+val_size: 0.0
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 200

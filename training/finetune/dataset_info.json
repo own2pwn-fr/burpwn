@@ -1,0 +1,35 @@
+{
+  "_comment": "LLaMA-Factory dataset registration for the burpwn-usage dataset. Copy/merge this into LLaMA-Factory's data/dataset_info.json, OR keep it here and pass `dataset_dir: <abs path to training/finetune>` in the training YAML. The OpenAI `messages` shape (role/content + tool_calls/tool) is read via formatting=sharegpt with the OpenAI tags mapping; tool calls and tool results are handled natively.",
+  "burpwn_train": {
+    "file_name": "../dataset.train.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system",
+      "observation_tag": "tool",
+      "function_tag": "assistant"
+    }
+  },
+  "burpwn_validation": {
+    "file_name": "../dataset.validation.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system",
+      "observation_tag": "tool",
+      "function_tag": "assistant"
+    }
+  }
+}
