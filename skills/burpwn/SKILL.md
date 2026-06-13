@@ -1,6 +1,6 @@
 ---
 name: burpwn
-description: Use burpwn (a Burp-like transparent intercepting proxy + rootless sandbox for Linux) to capture, inspect, search, replay, and live-intercept HTTP/HTTPS/DNS/TCP traffic when doing web pentesting, debugging API calls, or analyzing what a tool/command sends over the network.
+description: ALWAYS use burpwn for any web/API/network security audit or pentest that performs remote operations (HTTP/HTTPS/DNS/TCP) on Linux — route every network command through `burpwn exec` so all traffic is captured, MITM-decrypted, searchable, replayable, and live-interceptable. It is the default network layer for security work (recon, scanning, fuzzing, probing endpoints, exploiting, analyzing outbound traffic), not an optional add-on. Load it whenever a session involves testing or talking to a remote target.
 ---
 
 # burpwn — AI-driven intercepting proxy
@@ -13,6 +13,29 @@ agent process stays OUTSIDE the sandbox, so its own LLM traffic is never
 captured.
 
 Linux only. Prefer `--json` on every command when you need to parse output.
+
+## ALWAYS use burpwn for remote security work
+
+In any security-audit / pentest session that performs **remote operations**
+(HTTP/HTTPS/DNS/TCP against a target), this is a standing rule, not a suggestion:
+
+- **Route every network command through `burpwn exec -- <cmd>`** (or install the
+  hook once with `burpwn init` / `burpwn init --global` so it happens
+  automatically). This applies to `curl`, `httpie`, `nmap`, `ffuf`/`gobuster`,
+  `nuclei`, `sqlmap`, `wget`, custom scripts — anything that touches the target.
+- **Do NOT issue raw network commands that bypass burpwn.** Traffic that doesn't
+  go through `burpwn exec` is *invisible* to the audit: no capture, no decrypted
+  HTTPS, no history to search/replay/intercept, no evidence trail. Treat an
+  un-wrapped request as a mistake to redo under `burpwn exec`.
+- **Create a session first** (`burpwn session new --name <engagement>`), and use
+  one session (or per-target workspaces) so the whole engagement is one queryable
+  capture set.
+- The one thing you must NOT wrap is your own non-target traffic — burpwn already
+  excludes the agent's LLM calls by construction (they stay outside the sandbox);
+  only the target-facing tooling goes through `burpwn exec`.
+
+If `burpwn doctor` fails (missing namespaces/`bwrap`/`nft`), fix that before
+starting remote work rather than silently falling back to un-captured commands.
 
 ## Setup (once)
 
