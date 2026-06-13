@@ -229,15 +229,20 @@ pub fn build_bwrap_argv(spec: &ExecSpec) -> Vec<String> {
     ]);
     // The CA is bound read-only and trusted via the standard env vars.
     args.extend(["--ro-bind".to_string(), ca.clone(), ca.clone()]);
-    for (k, v) in ca_env_vars(&ca) {
-        args.extend(["--setenv".to_string(), k, v]);
+    let ca_pairs = ca_env_vars(&ca);
+    for (k, v) in &ca_pairs {
+        args.extend(["--setenv".to_string(), k.clone(), v.clone()]);
     }
     // Caller-supplied extra env. `spec.env` was copied from the full inherited
-    // host env, so it can contain the serialized-spec var — never re-inject it
-    // (it would hand the wrapped, attacker-influenced command the proxy_sock
-    // path, exec_id, workspace_id and the whole copied caller env).
+    // host env, so:
+    //  - never re-inject the serialized-spec var (it would hand the wrapped,
+    //    attacker-influenced command the proxy_sock path / exec_id / workspace),
+    //  - never let a host-exported CA-bundle var (CURL_CA_BUNDLE, REQUESTS_CA_
+    //    BUNDLE, …) override burpwn's MITM CA — bwrap applies --setenv last-wins,
+    //    so a surviving host CA var would silently break interception. We drop
+    //    every key burpwn manages above so OUR CA is the only one set.
     for (k, v) in &spec.env {
-        if k == SPEC_ENV {
+        if k == SPEC_ENV || ca_pairs.iter().any(|(ck, _)| ck == k) {
             continue;
         }
         args.extend(["--setenv".to_string(), k.clone(), v.clone()]);

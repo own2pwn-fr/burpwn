@@ -49,8 +49,11 @@ const ATTRIBUTE_GRACE: Duration = Duration::from_millis(150);
 /// Opening the store is cheap; we list existing workspaces and match by name
 /// (case-sensitive, mirroring `workspace use`).
 pub async fn resolve_workspace_id(paths: &Paths, session: &str, name: Option<&str>) -> Result<i64> {
-    let Some(name) = name else {
-        return Ok(DEFAULT_WORKSPACE_ID);
+    // Treat a missing or blank/whitespace-only name as "the default workspace"
+    // (so e.g. an empty `--workspace ""` doesn't create a workspace named "").
+    let name = match name {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => return Ok(DEFAULT_WORKSPACE_ID),
     };
     let store = Store::open(paths.session_db(session))
         .with_context(|| format!("opening session store for workspace {name:?}"))?;
