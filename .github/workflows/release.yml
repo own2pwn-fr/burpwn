@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross-linker for aarch64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --bin burpwn --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          d="burpwn-${{ matrix.target }}"
+          mkdir "$d"
+          cp target/${{ matrix.target }}/release/burpwn "$d/"
+          cp README.md LICENSE CHANGELOG.md "$d/"
+          tar -czf "$d.tar.gz" "$d"
+          sha256sum "$d.tar.gz" > "$d.tar.gz.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            burpwn-${{ matrix.target }}.tar.gz
+            burpwn-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
