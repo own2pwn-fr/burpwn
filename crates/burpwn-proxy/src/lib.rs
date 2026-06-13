@@ -134,6 +134,20 @@ impl Proxy {
         Arc::new(self.reader.list_match_replace().unwrap_or_default())
     }
 
+    /// Per-connection flow attribution. Each `burpwn exec` stamps its own
+    /// `exec_id` + `workspace_id` into the SCM wire header (so concurrent execs
+    /// don't cross-attribute). The explicit-proxy test front-end synthesizes a
+    /// `PassedConn` with an empty `exec_id`, in which case we fall back to the
+    /// daemon defaults from `ProxyConfig`.
+    fn flow_attr(&self, conn: &PassedConn) -> (i64, Option<String>) {
+        let exec = if conn.exec_id.is_empty() {
+            self.exec_id.clone()
+        } else {
+            Some(conn.exec_id.clone())
+        };
+        (conn.workspace_id, exec)
+    }
+
     /// Core entry: handle one redirected TCP connection with a known original
     /// destination. Classifies the first bytes and dispatches to MITM / cleartext
     /// HTTP / raw-TCP. Both front-ends call this.
@@ -153,29 +167,33 @@ impl Proxy {
                 self.serve_cleartext(stream, prefix, conn, client_addr)
                     .await
             }
-            Class::RawTcp => rawtcp::run(
-                stream,
-                prefix,
-                conn.dst_ip,
-                conn.dst_port,
-                client_addr,
-                &self.writer,
-                self.workspace_id,
-                self.exec_id.clone(),
-            )
-            .await
-            .map_err(Into::into),
+            Class::RawTcp => {
+                let (ws, exec) = self.flow_attr(&conn);
+                rawtcp::run(
+                    stream,
+                    prefix,
+                    conn.dst_ip,
+                    conn.dst_port,
+                    client_addr,
+                    &self.writer,
+                    ws,
+                    exec,
+                )
+                .await
+                .map_err(Into::into)
+            }
         }
     }
 
     /// Build an [`HttpContext`] for a plaintext origin.
     fn cleartext_ctx(&self, conn: &PassedConn, client_addr: String) -> HttpContext {
+        let (workspace_id, exec_id) = self.flow_attr(conn);
         HttpContext {
             writer: self.writer.clone(),
             intercept: self.intercept.clone(),
             rules: self.rules(),
-            workspace_id: self.workspace_id,
-            exec_id: self.exec_id.clone(),
+            workspace_id,
+            exec_id,
             client_addr,
             dst_ip: conn.dst_ip.to_string(),
             dst_port: conn.dst_port,
@@ -242,12 +260,13 @@ impl Proxy {
                 } else {
                     upstream_connector_alpn(&[b"http/1.1"])
                 };
+                let (workspace_id, exec_id) = self.flow_attr(&conn);
                 let ctx = HttpContext {
                     writer: self.writer.clone(),
                     intercept: self.intercept.clone(),
                     rules: self.rules(),
-                    workspace_id: self.workspace_id,
-                    exec_id: self.exec_id.clone(),
+                    workspace_id,
+                    exec_id,
                     client_addr,
                     dst_ip: conn.dst_ip.to_string(),
                     dst_port: conn.dst_port,
@@ -341,7 +360,8 @@ impl Proxy {
             let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
             std_sock.set_nonblocking(true)?;
             let sock = tokio::net::UdpSocket::from_std(std_sock)?;
-            let cfg = crate::dns::DnsConfig::from_host(self.workspace_id, self.exec_id.clone());
+            let (ws, exec) = self.flow_attr(&conn);
+            let cfg = crate::dns::DnsConfig::from_host(ws, exec);
             return crate::dns::serve_socket(sock, cfg, self.writer.clone())
                 .await
                 .map_err(Into::into);
@@ -467,6 +487,8 @@ impl Proxy {
             dst_ip: addr.ip(),
             dst_port: addr.port(),
             l4: L4::Tcp,
+            workspace_id: self.workspace_id,
+            exec_id: String::new(), // explicit proxy: fall back to daemon defaults
         };
         let ctx = self.cleartext_ctx(&conn, client_addr);
         crate::http::handle_explicit(req, ctx).await
@@ -497,6 +519,8 @@ impl Proxy {
             dst_ip: addr.ip(),
             dst_port: addr.port(),
             l4: L4::Tcp,
+            workspace_id: self.workspace_id,
+            exec_id: String::new(), // explicit proxy: fall back to daemon defaults
         };
 
         // Re-classify the tunneled stream (TLS ClientHello, cleartext, etc.).
@@ -560,28 +584,44 @@ fn bad_gateway(msg: &'static str) -> Response<Full<Bytes>> {
 fn recv_passed(sock: &UnixStream) -> Result<Option<(RawFd, PassedConn)>, nix::errno::Errno> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr};
     use std::io::IoSliceMut;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
     let res = sock.try_io(tokio::io::Interest::READABLE, || {
         let raw = sock.as_raw_fd();
-        let mut data = [0u8; wire::HEADER_LEN];
-        let mut iov = [IoSliceMut::new(&mut data)];
-        let mut cmsg_space = nix::cmsg_space!([RawFd; 1]);
-        let msg: nix::sys::socket::RecvMsg<UnixAddr> =
-            recvmsg(raw, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
-                .map_err(std::io::Error::from)?;
-        if msg.bytes == 0 {
-            return Ok(None); // peer closed
-        }
-        let mut fd = None;
-        for c in msg.cmsgs().map_err(std::io::Error::from)? {
-            if let ControlMessageOwned::ScmRights(fds) = c {
-                let mut it = fds.into_iter();
-                fd = it.next();
-                for extra in it {
-                    // SAFETY: surplus received fds we don't use are owned by us.
-                    unsafe {
-                        libc::close(extra);
+        // The header is variable-length (fixed prefix + exec_id); read up to the
+        // maximum and decode the actual length from the prefix.
+        let mut data = [0u8; wire::MAX_HEADER_LEN];
+        // The header is variable-length (fixed prefix + exec_id); read up to the
+        // maximum and decode the actual length from the prefix. `recvmsg`
+        // mutably borrows `data` via the iov, so we extract everything we need
+        // (byte count + the passed fd) inside this block and let that borrow end
+        // before reading `data` immutably for decoding.
+        let n: usize;
+        // Take ownership of the passed fd IMMEDIATELY as an `OwnedFd`, so any
+        // later error path (a malformed header) closes it instead of leaking it.
+        let mut fd: Option<OwnedFd> = None;
+        {
+            let mut iov = [IoSliceMut::new(&mut data)];
+            let mut cmsg_space = nix::cmsg_space!([RawFd; 1]);
+            let msg: nix::sys::socket::RecvMsg<UnixAddr> =
+                recvmsg(raw, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
+                    .map_err(std::io::Error::from)?;
+            if msg.bytes == 0 {
+                return Ok(None); // peer closed
+            }
+            n = msg.bytes;
+            for c in msg.cmsgs().map_err(std::io::Error::from)? {
+                if let ControlMessageOwned::ScmRights(fds) = c {
+                    let mut it = fds.into_iter();
+                    if let Some(first) = it.next() {
+                        // SAFETY: a freshly-received, owned fd.
+                        fd = Some(unsafe { OwnedFd::from_raw_fd(first) });
+                    }
+                    for extra in it {
+                        // SAFETY: surplus received fds we don't use are owned by us.
+                        unsafe {
+                            libc::close(extra);
+                        }
                     }
                 }
             }
@@ -589,9 +629,11 @@ fn recv_passed(sock: &UnixStream) -> Result<Option<(RawFd, PassedConn)>, nix::er
         let fd = fd.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "no SCM_RIGHTS fd")
         })?;
-        let conn = PassedConn::decode(&data)
+        // A decode error here drops `fd` (OwnedFd) → the fd is closed, no leak.
+        let conn = PassedConn::decode(&data[..n])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        Ok(Some((fd, conn)))
+        // Hand the fd to the caller only on success.
+        Ok(Some((fd.into_raw_fd(), conn)))
     });
     match res {
         Ok(v) => Ok(v),

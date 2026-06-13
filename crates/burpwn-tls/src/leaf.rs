@@ -4,14 +4,20 @@
 //! Every intercepted connection needs a server certificate the client will
 //! accept *as if* it were the real site's: same name in the SAN, signed by our
 //! CA (which the user has trusted once). Minting is comparatively expensive
-//! (keygen + signature), so results are cached in a [`DashMap`] keyed by the SNI
-//! / IP string; concurrent requests for the same key mint exactly once via the
-//! entry API.
+//! (keygen + signature), so results are cached keyed by the SNI / IP string.
+//!
+//! The cache is a **bounded** LRU ([`lru::LruCache`] behind a
+//! [`parking_lot::Mutex`]). The key is client-supplied (SNI or destination IP),
+//! so an unbounded map would let an attacker opening TLS with endless distinct
+//! SNIs grow memory and burn ECDSA keygen without limit. Capping at
+//! [`CACHE_CAP`] entries evicts the least-recently-used leaf instead.
 
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use lru::LruCache;
+use parking_lot::Mutex;
 use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, Ia5String, KeyPair, KeyUsagePurpose,
     SanType,
@@ -23,19 +29,29 @@ use rustls::sign::CertifiedKey;
 use crate::ca::CertAuthority;
 use crate::error::{Result, TlsError};
 
+/// Maximum number of distinct leaf certificates kept in the cache. Once full,
+/// inserting a new key evicts the least-recently-used one. Bounds attacker-driven
+/// memory + keygen cost from many distinct client-supplied SNIs.
+const CACHE_CAP: usize = 2048;
+
 /// Mints and caches leaf certificates signed by the install CA.
 #[derive(Debug)]
 pub struct LeafGenerator {
     ca: CertAuthority,
-    cache: DashMap<String, Arc<CertifiedKey>>,
+    /// Bounded LRU keyed by SNI (lowercased) or destination IP. Guarded by a
+    /// `parking_lot::Mutex` — lookups are short (hash + `Arc` clone) so the
+    /// critical section is tiny.
+    cache: Mutex<LruCache<String, Arc<CertifiedKey>>>,
 }
 
 impl LeafGenerator {
     /// Build a generator over a loaded CA.
     pub fn new(ca: CertAuthority) -> Self {
+        // CACHE_CAP is a non-zero constant; the unwrap can never fire.
+        let cap = NonZeroUsize::new(CACHE_CAP).expect("CACHE_CAP must be non-zero");
         Self {
             ca,
-            cache: DashMap::new(),
+            cache: Mutex::new(LruCache::new(cap)),
         }
     }
 
@@ -44,9 +60,14 @@ impl LeafGenerator {
         &self.ca
     }
 
-    /// Number of cached leaves (diagnostics / tests).
+    /// Number of cached leaves (diagnostics / tests). Always `<= CACHE_CAP`.
     pub fn cache_len(&self) -> usize {
-        self.cache.len()
+        self.cache.lock().len()
+    }
+
+    /// The cache capacity (upper bound on [`Self::cache_len`]).
+    pub fn cache_cap(&self) -> usize {
+        CACHE_CAP
     }
 
     /// Get a leaf for `(sni, dst_ip)`, minting and caching it on first use.
@@ -55,9 +76,12 @@ impl LeafGenerator {
     /// least one of the two must be supplied; with neither there is nothing to
     /// put in the certificate, so this returns [`TlsError::InvalidSan`].
     ///
-    /// Concurrency: two callers racing on the same key both go through the
-    /// `entry` API, so the leaf is minted exactly once and the loser gets the
-    /// winner's `Arc`.
+    /// Concurrency: the lock is held only for the (cheap) cache lookup and
+    /// insert, never across minting — so concurrent callers for *different* keys
+    /// mint in parallel. Two callers racing on the *same* key may both mint
+    /// (a benign double-mint, never a panic); the second insert collapses them
+    /// back to one cached `Arc` and the first minted key is dropped. The cache
+    /// is bounded at [`CACHE_CAP`]; a full cache evicts the LRU entry.
     pub fn get_or_make(
         &self,
         sni: Option<&str>,
@@ -65,17 +89,21 @@ impl LeafGenerator {
     ) -> Result<Arc<CertifiedKey>> {
         let key = cache_key(sni, dst_ip)?;
 
-        // Fast path: already cached.
-        if let Some(existing) = self.cache.get(&key) {
-            return Ok(existing.value().clone());
+        // Fast path: already cached (and marks the entry most-recently-used).
+        if let Some(existing) = self.cache.lock().get(&key) {
+            return Ok(existing.clone());
         }
 
-        // Slow path: mint, then insert via the entry API so concurrent callers
-        // for the same key dedupe — if another task won the race, we drop our
-        // freshly minted key and return theirs.
+        // Slow path: mint *without* holding the lock (keygen + signature are
+        // expensive), then insert. If another task inserted the same key while
+        // we were minting, return the already-cached one and drop ours.
         let minted = Arc::new(self.mint(sni, dst_ip)?);
-        let entry = self.cache.entry(key).or_insert(minted);
-        Ok(entry.value().clone())
+        let mut cache = self.cache.lock();
+        if let Some(existing) = cache.get(&key) {
+            return Ok(existing.clone());
+        }
+        cache.put(key, minted.clone());
+        Ok(minted)
     }
 
     /// Build (without caching) a `CertifiedKey` for the given SAN inputs.
@@ -147,11 +175,12 @@ fn leaf_params(sni: Option<&str>, dst_ip: Option<IpAddr>) -> Result<CertificateP
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
-    // Short-ish validity: minted on demand, regenerated freely. Spans the
-    // current year through next year-end (~1-2 years).
-    let year = crate::current_year();
-    params.not_before = rcgen::date_time_ymd(year, 1, 1);
-    params.not_after = rcgen::date_time_ymd(year + 2, 1, 1);
+    // Validity anchored to a real civil timestamp: `not_before` is a couple of
+    // days in the past (clock-skew tolerant, never "not yet valid"), `not_after`
+    // ~2 years out. Leaves are minted on demand and regenerated freely.
+    let validity = crate::Validity::for_years(2);
+    params.not_before = validity.not_before;
+    params.not_after = validity.not_after;
 
     Ok(params)
 }
@@ -258,5 +287,50 @@ mod tests {
         let _ = gen.get_or_make(Some("a.example"), None).unwrap();
         let _ = gen.get_or_make(Some("b.example"), None).unwrap();
         assert_eq!(gen.cache_len(), 2);
+    }
+
+    /// Inserting more than the cache cap of distinct keys must keep the cache
+    /// bounded (never grows without limit) while still returning valid certs.
+    #[test]
+    fn cache_is_bounded_under_many_keys() {
+        let (_d, gen) = generator();
+        let cap = gen.cache_cap();
+        // Mint cap + a healthy overflow of distinct SNIs.
+        for i in 0..(cap + 100) {
+            let sni = format!("host-{i}.example");
+            let ck = gen.get_or_make(Some(&sni), None).unwrap();
+            // Each minted leaf is well-formed: chain = [leaf, ca] and carries
+            // its own SNI as a DNS SAN.
+            assert_eq!(ck.cert.len(), 2);
+            assert_eq!(leaf_dns_sans(&ck), vec![sni]);
+        }
+        assert!(
+            gen.cache_len() <= cap,
+            "cache must stay bounded: len {} > cap {cap}",
+            gen.cache_len()
+        );
+        assert_eq!(gen.cache_len(), cap, "cache should be saturated at the cap");
+    }
+
+    /// A freshly minted leaf's `not_before` must be at or before "now": never
+    /// in the future, or every client rejects the handshake as not-yet-valid.
+    #[test]
+    fn fresh_leaf_not_before_is_in_the_past() {
+        use x509_parser::prelude::*;
+        let (_d, gen) = generator();
+        let ck = gen.get_or_make(Some("example.com"), None).unwrap();
+        let (_, cert) = X509Certificate::from_der(ck.cert[0].as_ref()).unwrap();
+
+        let now = ::time::OffsetDateTime::now_utc().unix_timestamp();
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        assert!(
+            not_before <= now,
+            "not_before {not_before} must be <= now {now}"
+        );
+        assert!(
+            not_after > now,
+            "not_after {not_after} must be in the future"
+        );
     }
 }

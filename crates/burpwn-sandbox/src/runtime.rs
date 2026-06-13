@@ -61,6 +61,11 @@ pub struct ExecSpec {
     /// Path to the CA PEM to bind into the sandbox and trust via the standard
     /// `SSL_CERT_FILE`/`CURL_CA_BUNDLE`/… env vars (what makes MITM trusted).
     pub ca_path: PathBuf,
+    /// Correlation id stamped on every flow this command produces (carried in
+    /// the SCM wire header so the proxy attributes captures at capture time).
+    pub exec_id: String,
+    /// Workspace id this command's captured flows are attributed to.
+    pub workspace_id: i64,
     /// Optional wall-clock timeout for the command.
     pub timeout: Option<Duration>,
     /// When true, inherit the parent's stdio (pass-through mode for the CLI);
@@ -80,6 +85,8 @@ impl ExecSpec {
             proxy_tcp_port: 8080,
             proxy_dns_port: 5353,
             ca_path: PathBuf::from("/etc/burpwn/ca.pem"),
+            exec_id: String::new(),
+            workspace_id: 1,
             timeout: None,
             inherit_stdio: false,
         }

@@ -176,6 +176,34 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+/// Default per-request read timeout for non-blocking control ops. A wedged
+/// daemon that accepts the connection but never replies must not hang the
+/// CLI/MCP call forever (fatal for the stdio MCP server).
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Extra margin added on top of an `InterceptAwait`'s server-side
+/// `timeout_secs` to derive the client read timeout: the request legitimately
+/// long-polls up to `timeout_secs` on the daemon, so the client must wait at
+/// least that long plus slack for the round-trip.
+pub const AWAIT_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Connect timeout for [`ControlClient::connect`]: a half-alive daemon (socket
+/// bound but the accept loop wedged) should be treated as dead rather than
+/// blocking the connect indefinitely.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Compute the client-side read timeout appropriate for a given request. The
+/// blocking `InterceptAwait` gets `timeout_secs + margin`; everything else uses
+/// the short default.
+fn request_timeout(req: &ControlRequest) -> Duration {
+    match req {
+        ControlRequest::InterceptAwait { timeout_secs } => {
+            Duration::from_secs(*timeout_secs) + AWAIT_TIMEOUT_MARGIN
+        }
+        _ => DEFAULT_REQUEST_TIMEOUT,
+    }
+}
+
 /// A small async client for the control protocol. The MCP server should reuse
 /// this type verbatim: `ControlClient::connect(paths.control_sock(session))`,
 /// then call the typed methods.
@@ -189,11 +217,20 @@ pub struct ControlClient {
 }
 
 impl ControlClient {
-    /// Connect to a daemon's control socket.
+    /// Connect to a daemon's control socket. Bounded by [`CONNECT_TIMEOUT`] so a
+    /// daemon that is bound-but-wedged is treated as unreachable.
     pub async fn connect(sock: impl AsRef<Path>) -> Result<Self> {
-        let stream = UnixStream::connect(sock.as_ref())
+        let sock = sock.as_ref();
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(sock))
             .await
-            .with_context(|| format!("connecting to control socket {}", sock.as_ref().display()))?;
+            .map_err(|_| {
+                anyhow!(
+                    "timed out connecting to control socket {} after {}s",
+                    sock.display(),
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
+            .with_context(|| format!("connecting to control socket {}", sock.display()))?;
         Ok(Self::from_stream(stream))
     }
 
@@ -226,8 +263,22 @@ impl ControlClient {
         }
     }
 
-    /// Send one request and read exactly one response line.
+    /// Send one request and read exactly one response line, bounded by a
+    /// per-request read timeout (see [`request_timeout`]). On timeout the call
+    /// returns a clear error rather than hanging on a wedged daemon.
     pub async fn request(&mut self, req: ControlRequest) -> Result<ControlResponse> {
+        let timeout = request_timeout(&req);
+        match tokio::time::timeout(timeout, self.request_inner(req)).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!(
+                "control request timed out after {}s (daemon not responding)",
+                timeout.as_secs()
+            )),
+        }
+    }
+
+    /// The un-timed request/response round-trip wrapped by [`Self::request`].
+    async fn request_inner(&mut self, req: ControlRequest) -> Result<ControlResponse> {
         let line = encode_request(&req);
         self.write.write_all(line.as_bytes()).await?;
         self.write.flush().await?;
@@ -359,5 +410,49 @@ mod tests {
             ..Default::default()
         }
         .is_empty());
+    }
+
+    #[test]
+    fn request_timeout_scales_with_await() {
+        // Non-blocking ops use the short default.
+        assert_eq!(
+            request_timeout(&ControlRequest::Status),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        // Await uses its server-side timeout plus the margin.
+        let t = request_timeout(&ControlRequest::InterceptAwait { timeout_secs: 30 });
+        assert_eq!(t, Duration::from_secs(30) + AWAIT_TIMEOUT_MARGIN);
+    }
+
+    /// A daemon that accepts the connection but never replies must not hang the
+    /// client forever: the per-request read timeout must fire. With paused tokio
+    /// time, the runtime auto-advances the clock to the request timeout once the
+    /// only pending work is that timer, so the test resolves instantly.
+    #[tokio::test(start_paused = true)]
+    async fn request_times_out_on_non_responding_server() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+
+        // Server: accept one connection, then never reply (hold it open).
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Park the connection open forever (until the test ends).
+            let _held = stream;
+            std::future::pending::<()>().await;
+        });
+
+        let mut client = ControlClient::connect(&sock).await.unwrap();
+
+        // The server never replies; the read inside `request` blocks. With paused
+        // time, tokio advances the clock to fire the request timeout.
+        let res = client.status().await;
+        assert!(res.is_err(), "expected a timeout error, got {res:?}");
+        let msg = format!("{}", res.unwrap_err());
+        assert!(msg.contains("timed out"), "unexpected error: {msg}");
+
+        server.abort();
     }
 }

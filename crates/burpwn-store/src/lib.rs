@@ -265,6 +265,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn re_recording_request_replaces_stale_fts_text() {
+        // Bug 2 regression: re-recording a request must not leave the OLD body
+        // text searchable, and must not produce duplicate hits for the flow.
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+
+        let flow_id = w.flow_start(sample_flow()).await.unwrap();
+        w.request(
+            flow_id,
+            RequestData {
+                method: "POST".into(),
+                authority: "example.com".into(),
+                path: "/login".into(),
+                http_version: "HTTP/1.1".into(),
+                headers: Vec::new(),
+                body: b"oldbodytoken".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The old text is searchable for now.
+        assert!(store
+            .reader()
+            .search("oldbodytoken")
+            .unwrap()
+            .contains(&flow_id));
+
+        // Re-record the same flow's request with different body text.
+        w.request(
+            flow_id,
+            RequestData {
+                method: "POST".into(),
+                authority: "example.com".into(),
+                path: "/login".into(),
+                http_version: "HTTP/1.1".into(),
+                headers: Vec::new(),
+                body: b"newbodytoken".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // OLD text gone, NEW text present.
+        assert!(
+            store.reader().search("oldbodytoken").unwrap().is_empty(),
+            "stale FTS text must be removed on re-record"
+        );
+        let hits = store.reader().search("newbodytoken").unwrap();
+        assert_eq!(hits, vec![flow_id], "latest text wins, exactly one hit");
+    }
+
+    #[tokio::test]
+    async fn response_status_and_headers_are_searchable() {
+        // Bug 3 regression: response FTS must index status + headers, not just body.
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+
+        let flow_id = w.flow_start(sample_flow()).await.unwrap();
+        w.response(
+            flow_id,
+            ResponseData {
+                status: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: b"Set-Cookie: session=abrakadabra; HttpOnly\r\nLocation: /next\r\n"
+                    .to_vec(),
+                body: b"ok".to_vec(),
+                timing_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let reader = store.reader();
+        assert!(
+            reader.search("abrakadabra").unwrap().contains(&flow_id),
+            "Set-Cookie header value should be searchable"
+        );
+        assert!(
+            reader.search("Location").unwrap().contains(&flow_id),
+            "response header name should be searchable"
+        );
+    }
+
+    #[tokio::test]
     async fn filters_narrow_flow_listing() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("session.db")).unwrap();

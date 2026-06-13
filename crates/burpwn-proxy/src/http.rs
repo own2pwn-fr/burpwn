@@ -41,9 +41,10 @@ use crate::intercept::{InterceptController, InterceptData, InterceptDecision, In
 use crate::matchreplace::{apply_request, apply_response, Message};
 use crate::util::now_millis;
 
-/// Hard cap on a buffered body we will fully read for capture + rule application.
-/// Larger bodies are still forwarded (streamed via `Full` after collection up to
-/// this cap; bodies above it are truncated for storage only — see notes).
+/// Cap applied to the STORED copy of a body (via [`cap_for_store`]). Bodies are
+/// always FORWARDED in full — only the copy persisted to the session DB is
+/// bounded, so large uploads/downloads are captured-but-truncated rather than
+/// corrupted on the wire.
 const BODY_CAP: usize = 8 * 1024 * 1024;
 
 /// How the proxy reaches the origin for a given served connection.
@@ -170,7 +171,7 @@ async fn handle_inner(
         .unwrap_or_else(|| parts.uri.path().to_string());
     let host = request_host(&parts);
     let raw_req_headers = serialize_headers(&parts.headers);
-    let req_body = collect_capped(body).await?;
+    let req_body = collect_body(body).await?;
 
     // --- request-side match/replace ---
     let mut msg = Message {
@@ -243,7 +244,7 @@ async fn handle_inner(
                 path: msg.url.clone(),
                 http_version: version_str(version).into(),
                 headers: msg.headers.clone(),
-                body: msg.body.clone(),
+                body: cap_for_store(&msg.body),
             },
         )
         .await;
@@ -330,7 +331,7 @@ async fn handle_inner(
                 status: status.as_u16(),
                 http_version: version_str(version).into(),
                 headers: store_headers,
-                body: store_body,
+                body: cap_for_store(&store_body),
                 timing_ms: Some(timing),
             },
         )
@@ -508,16 +509,22 @@ fn build_upstream_request(
     Ok(builder.body(Full::new(Bytes::from(msg.body.clone())))?)
 }
 
-/// Collect a request/response body up to [`BODY_CAP`].
-async fn collect_capped(body: Incoming) -> anyhow::Result<Vec<u8>> {
+/// Collect a request body in FULL (so it can be forwarded upstream unchanged).
+/// Truncation applies only to the STORED copy, via [`cap_for_store`].
+async fn collect_body(body: Incoming) -> anyhow::Result<Vec<u8>> {
     let collected = body
         .collect()
         .await
         .map_err(|e| anyhow::anyhow!("read body: {e}"))?
         .to_bytes();
-    let mut v = collected.to_vec();
-    v.truncate(BODY_CAP);
-    Ok(v)
+    Ok(collected.to_vec())
+}
+
+/// A copy of a body bounded to [`BODY_CAP`] for STORAGE only (never for
+/// forwarding). Bodies above the cap are truncated in the store but forwarded
+/// in full, so large uploads/downloads are not corrupted.
+fn cap_for_store(bytes: &[u8]) -> Vec<u8> {
+    bytes[..bytes.len().min(BODY_CAP)].to_vec()
 }
 
 /// Serialize a `HeaderMap` to order-preserving `Name: Value\r\n…` bytes.

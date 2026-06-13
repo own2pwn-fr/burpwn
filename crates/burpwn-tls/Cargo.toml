@@ -23,6 +23,15 @@ directories.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Bounded leaf-cert cache: an LRU keyed by SNI/IP, guarded by a parking_lot
+# Mutex. Caps attacker-driven memory + ECDSA-keygen blow-up from unbounded
+# distinct SNIs.
+lru = "0.12"
+parking_lot = "0.12"
+# Real civil time for cert validity windows (rcgen's not_before/not_after are
+# `time::OffsetDateTime`). Avoids the drifting `1970 + secs/31_557_600` year
+# approximation that could backdate/forward leaves into "not yet valid".
+time = "0.3"
 
 [dev-dependencies]
 tempfile = "3.12"

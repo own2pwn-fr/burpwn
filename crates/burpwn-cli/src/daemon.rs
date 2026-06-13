@@ -72,6 +72,14 @@ impl ControlState {
             path: data.path.clone(),
         }
     }
+
+    /// Insert an already-pulled intercept into the parked table, keyed by id.
+    /// Used by the connection handler *after* the `Pending` response has been
+    /// written, so a client disconnect mid-long-poll never orphans the entry
+    /// (see [`handle_connection`]).
+    async fn park(&self, p: PendingIntercept) {
+        self.parked.lock().await.insert(p.id, p);
+    }
 }
 
 /// Apply control-protocol [`Edits`] to a parked intercept's data, producing the
@@ -218,17 +226,44 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
 /// inline (the protocol is request/response and low-volume).
 pub async fn serve_control(state: ControlState, sock: impl AsRef<Path>) -> Result<()> {
     let sock = sock.as_ref();
-    let _ = std::fs::remove_file(sock);
+    // Don't unconditionally unlink: a *live* daemon may already be bound here
+    // (TOCTOU between the exec's check and this bind). Only remove a stale
+    // socket — one that fails to accept a connection — so we never unlink a
+    // socket another daemon is actively serving (Bug #3b).
+    if sock.exists() {
+        match UnixStream::connect(sock).await {
+            Ok(_) => {
+                // Something is already listening here: refuse to clobber it.
+                anyhow::bail!(
+                    "control socket {} is already served by a live daemon",
+                    sock.display()
+                );
+            }
+            Err(_) => {
+                // Stale socket file (no listener): safe to remove and rebind.
+                let _ = std::fs::remove_file(sock);
+            }
+        }
+    }
     let listener = UnixListener::bind(sock)
         .with_context(|| format!("binding control socket {}", sock.display()))?;
     tracing::info!(?sock, "control server listening");
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let stop = handle_connection(&state, stream).await?;
-        if stop {
-            tracing::info!("control server shutting down");
-            return Ok(());
+        // A per-connection error (e.g. the client disconnected mid-request, as
+        // happens when an MCP long-poll is cancelled) must NOT tear the whole
+        // control server down — log it and keep serving. Only a `Shutdown`
+        // request (Ok(true)) stops the loop.
+        match handle_connection(&state, stream).await {
+            Ok(true) => {
+                tracing::info!("control server shutting down");
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "control connection ended with error");
+            }
         }
     }
 }
@@ -250,11 +285,44 @@ async fn handle_connection(state: &ControlState, stream: UnixStream) -> Result<b
             continue;
         }
         let resp = match serde_json::from_str::<ControlRequest>(trimmed) {
+            Ok(ControlRequest::InterceptAwait { timeout_secs }) => {
+                // Long-poll handled inline so we can WRITE the `Pending` response
+                // BEFORE parking the pulled intercept. If the client has
+                // disconnected during the long-poll, the write fails and we
+                // resolve the just-pulled intercept with `Forward(None)` instead
+                // of orphaning it in the parked table with nobody to resolve it
+                // (Bug #6).
+                let pulled = state
+                    .intercept
+                    .take_next(Duration::from_secs(timeout_secs))
+                    .await;
+                match pulled {
+                    Some(p) => {
+                        let item = ControlState::summary_item(p.id, p.kind, &p.data);
+                        let resp = ControlResponse::Pending { item: Some(item) };
+                        match write_response(&mut write, &resp).await {
+                            Ok(()) => {
+                                // Response delivered: now it is safe to park the
+                                // intercept for a later Forward/Drop.
+                                state.park(p).await;
+                            }
+                            Err(e) => {
+                                // Client vanished mid-long-poll: fail open so the
+                                // sandboxed in-flight request proceeds unmodified
+                                // rather than hanging until InterceptDisable.
+                                let _ = p.reply.send(InterceptDecision::Forward(None));
+                                return Err(e);
+                            }
+                        }
+                        continue;
+                    }
+                    None => ControlResponse::Pending { item: None },
+                }
+            }
             Ok(req) => {
                 let is_shutdown = matches!(req, ControlRequest::Shutdown);
                 let resp = handle_request(state, req).await;
-                write.write_all(encode_response(&resp).as_bytes()).await?;
-                write.flush().await?;
+                write_response(&mut write, &resp).await?;
                 if is_shutdown {
                     return Ok(true);
                 }
@@ -264,9 +332,18 @@ async fn handle_connection(state: &ControlState, stream: UnixStream) -> Result<b
                 message: format!("bad request: {e}"),
             },
         };
-        write.write_all(encode_response(&resp).as_bytes()).await?;
-        write.flush().await?;
+        write_response(&mut write, &resp).await?;
     }
+}
+
+/// Write a single response line and flush it.
+async fn write_response(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    resp: &ControlResponse,
+) -> Result<()> {
+    write.write_all(encode_response(resp).as_bytes()).await?;
+    write.flush().await?;
+    Ok(())
 }
 
 /// The fixed redirect port the in-netns acceptor binds and the nft ruleset
@@ -546,5 +623,88 @@ mod tests {
         let p = dir.path().join("ports.json");
         write_ports(&p, 5353).unwrap();
         assert_eq!(read_dns_port(&p), Some(5353));
+    }
+
+    /// Bug #6: if the client disconnects during a long-poll `InterceptAwait`,
+    /// the daemon must NOT leave the pulled intercept parked with nobody to
+    /// resolve it. The just-pulled intercept must be resolved with
+    /// `Forward(None)` so the in-flight sandboxed request proceeds, and the
+    /// parked table must stay empty.
+    #[tokio::test]
+    async fn await_client_disconnect_does_not_leak_parked_intercept() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let state = ctrl_state();
+        state.intercept.set_enabled(true);
+
+        let server_state = state.clone();
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move { serve_control(server_state, &server_sock).await });
+
+        // Wait for the server to bind the socket (avoid a connect-before-bind race).
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Connect and send an `InterceptAwait` while NOTHING is parked yet, so
+        // the daemon blocks in `take_next`.
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        let req =
+            crate::control::encode_request(&ControlRequest::InterceptAwait { timeout_secs: 5 });
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Let the daemon read the request and enter the long-poll.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now disconnect the client (drop the socket) *before* an intercept
+        // arrives, then park one. The daemon will pull it and fail to write the
+        // `Pending` response.
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let ctrl = state.intercept.clone();
+        let handler = tokio::spawn(async move {
+            ctrl.intercept(
+                InterceptKind::Request,
+                InterceptData {
+                    host: "example.com".into(),
+                    method: "GET".into(),
+                    path: "/x".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+            .await
+        });
+
+        // The handler must resolve to Forward(None) (resolve-on-write-failure),
+        // not hang forever.
+        let decision = tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .expect("handler must not hang when client disconnects")
+            .unwrap();
+        assert!(
+            matches!(decision, InterceptDecision::Forward(None)),
+            "expected fail-open Forward(None), got {decision:?}"
+        );
+
+        // And the parked table must be empty (no leak): a Status reports 0.
+        let resp = handle_request(&state, ControlRequest::Status).await;
+        match resp {
+            ControlResponse::Status { pending, .. } => assert_eq!(pending, 0),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Shut the server down cleanly.
+        let mut admin = ControlClient::connect(&sock).await.unwrap();
+        let _ = admin.shutdown().await;
+        let _ = server.await;
     }
 }

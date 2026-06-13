@@ -29,3 +29,5 @@ libc.workspace = true
 [dev-dependencies]
 tempfile = "3"
 rustls.workspace = true
+# `test-util` enables `#[tokio::test(start_paused = true)]` for timeout tests.
+tokio = { workspace = true, features = ["test-util"] }

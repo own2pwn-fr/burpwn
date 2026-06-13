@@ -306,7 +306,7 @@ mod privileged {
     use std::thread;
 
     use nix::sched::{unshare, CloneFlags};
-    use nix::sys::socket::sockopt::OriginalDst;
+    use nix::sys::socket::sockopt::{Ip6tOriginalDst, OriginalDst};
     use nix::sys::socket::{getsockopt, sendmsg, ControlMessage, MsgFlags};
     use nix::unistd::{fork, ForkResult};
 
@@ -364,6 +364,21 @@ mod privileged {
         let (go_r, go_w) =
             nix::unistd::pipe().map_err(|e| SandboxError::Runtime(format!("pipe: {e}")))?;
 
+        // In capture mode (the default), create stdout/stderr pipes BEFORE
+        // forking. The child `dup2`s the write-ends onto fd 1/2 before
+        // `execve`, so the agent → bwrap → command all inherit them; the host
+        // parent drains the read-ends to EOF into the `ExecOutcome` buffers.
+        // In inherit_stdio mode we create no pipes and the real fds pass through.
+        let (out_pipe, err_pipe) = if spec.inherit_stdio {
+            (None, None)
+        } else {
+            let out = nix::unistd::pipe()
+                .map_err(|e| SandboxError::Runtime(format!("stdout pipe: {e}")))?;
+            let err = nix::unistd::pipe()
+                .map_err(|e| SandboxError::Runtime(format!("stderr pipe: {e}")))?;
+            (Some(out), Some(err))
+        };
+
         let host_uid = nix::unistd::getuid().as_raw();
         let host_gid = nix::unistd::getgid().as_raw();
 
@@ -374,6 +389,22 @@ mod privileged {
             ForkResult::Child => {
                 drop(ready_r);
                 drop(go_w);
+                // Redirect stdout/stderr onto the capture pipes' write-ends (if
+                // any) BEFORE execve so the agent — and the bwrap'd command it
+                // forks — inherit them. We `dup2` the write-end onto fd 1/2, then
+                // close BOTH original pipe fds (the read-end must not leak into
+                // the command, or the host parent would never observe EOF).
+                // dup2/_exit are async-signal-safe; OwnedFd::drop just closes.
+                if let Some((out_r, out_w)) = out_pipe {
+                    let _ = nix::unistd::dup2(out_w.as_raw_fd(), libc::STDOUT_FILENO);
+                    drop(out_w);
+                    drop(out_r);
+                }
+                if let Some((err_r, err_w)) = err_pipe {
+                    let _ = nix::unistd::dup2(err_w.as_raw_fd(), libc::STDERR_FILENO);
+                    drop(err_w);
+                    drop(err_r);
+                }
                 // We need only NEWUSER (for scoped CAP_NET_ADMIN) + NEWNET (the
                 // isolated network). bwrap handles mount/pid isolation for the
                 // command itself.
@@ -391,13 +422,23 @@ mod privileged {
             ForkResult::Parent { child } => {
                 drop(ready_w);
                 drop(go_r);
+                // Close the write-ends in the parent so our read-ends see EOF
+                // when the command (and all inheritors) exit. Keep the read-ends.
+                let out_r = out_pipe.map(|(r, w)| {
+                    drop(w);
+                    r
+                });
+                let err_r = err_pipe.map(|(r, w)| {
+                    drop(w);
+                    r
+                });
                 let res = parent_setup_maps(child, host_uid, host_gid, ready_r, go_w);
                 if let Err(e) = res {
                     let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(child, None);
                     return Err(e);
                 }
-                reap_child(child, &spec)
+                reap_child(child, out_r, err_r)
             }
         }
     }
@@ -426,11 +467,25 @@ mod privileged {
         }
 
         let tcp_port = spec.proxy_tcp_port;
-        let listener = match TcpListener::bind(("127.0.0.1", tcp_port)) {
+        // Bind the acceptor DUAL-STACK as two separate listeners — one IPv4
+        // (`127.0.0.1`) and one IPv6 (`[::1]`) — so both v4- and v6-redirected
+        // connections are accepted. We avoid `[::]` with IPV6_V6ONLY=0 because
+        // toggling that option needs `socket2` (a new dep). Two `std::net`
+        // listeners + one acceptor thread each (sharing the stop flag) is the
+        // simplest robust approach with no extra deps. The v6 listener is
+        // best-effort: if the netns has no usable v6 loopback we proceed v4-only.
+        let listener_v4 = match TcpListener::bind(("127.0.0.1", tcp_port)) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("burpwn __netns-agent: bind 127.0.0.1:{tcp_port} failed: {e}");
                 return 123;
+            }
+        };
+        let listener_v6 = match TcpListener::bind(("::1", tcp_port)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("burpwn __netns-agent: bind [::1]:{tcp_port} failed (v4-only): {e}");
+                None
             }
         };
 
@@ -444,6 +499,8 @@ mod privileged {
                 dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 dst_port: 53,
                 l4: L4::Udp,
+                workspace_id: spec.workspace_id,
+                exec_id: spec.exec_id.clone(),
             };
             if let Err(e) = send_fd(udp.as_raw_fd(), meta, &spec.proxy_sock) {
                 eprintln!("burpwn __netns-agent: DNS socket hand-off failed: {e}");
@@ -455,16 +512,48 @@ mod privileged {
         // killing the listener the instant the command starts).
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                drop(listener);
+                drop(listener_v4);
+                drop(listener_v6);
                 exec_bwrap(&spec);
                 unsafe { libc::_exit(127) };
             }
             Ok(ForkResult::Parent { child: cmd_pid }) => {
-                let proxy_sock = spec.proxy_sock.clone();
                 let stop = Arc::new(AtomicBool::new(false));
-                let stop_thread = Arc::clone(&stop);
-                let acceptor =
-                    thread::spawn(move || run_acceptor(listener, &proxy_sock, &stop_thread));
+                let workspace_id = spec.workspace_id;
+                let exec_id = spec.exec_id.clone();
+
+                // One acceptor thread per listener, all sharing the stop flag.
+                // Each hands accepted clients off to the host proxy, stamping
+                // every PassedConn with this exec's workspace_id + exec_id.
+                let mut acceptors = Vec::new();
+                {
+                    let proxy_sock = spec.proxy_sock.clone();
+                    let stop_thread = Arc::clone(&stop);
+                    let exec_id = exec_id.clone();
+                    acceptors.push(thread::spawn(move || {
+                        run_acceptor(
+                            listener_v4,
+                            &proxy_sock,
+                            &stop_thread,
+                            workspace_id,
+                            &exec_id,
+                        )
+                    }));
+                }
+                if let Some(listener_v6) = listener_v6 {
+                    let proxy_sock = spec.proxy_sock.clone();
+                    let stop_thread = Arc::clone(&stop);
+                    let exec_id = exec_id.clone();
+                    acceptors.push(thread::spawn(move || {
+                        run_acceptor(
+                            listener_v6,
+                            &proxy_sock,
+                            &stop_thread,
+                            workspace_id,
+                            &exec_id,
+                        )
+                    }));
+                }
 
                 let code = match nix::sys::wait::waitpid(cmd_pid, None) {
                     Ok(nix::sys::wait::WaitStatus::Exited(_, c)) => c,
@@ -472,9 +561,12 @@ mod privileged {
                     _ => 127,
                 };
                 stop.store(true, Ordering::Relaxed);
-                // Nudge the blocking accept() so the loop observes `stop`.
+                // Nudge each blocking accept() so the loops observe `stop`.
                 let _ = std::net::TcpStream::connect(("127.0.0.1", tcp_port));
-                let _ = acceptor.join();
+                let _ = std::net::TcpStream::connect(("::1", tcp_port));
+                for acceptor in acceptors {
+                    let _ = acceptor.join();
+                }
                 code
             }
             Err(e) => {
@@ -569,16 +661,24 @@ mod privileged {
         Ok(())
     }
 
-    /// The in-netns acceptor: bind `127.0.0.1:tcp_port`, accept clients, recover
-    /// `SO_ORIGINAL_DST`, and hand each client fd to the host proxy over the
-    /// unix socket using SCM_RIGHTS + the [`crate::wire`] header.
-    fn run_acceptor(listener: TcpListener, proxy_sock: &std::path::Path, stop: &AtomicBool) {
+    /// The in-netns acceptor: accept clients on `listener`, recover the original
+    /// destination (`SO_ORIGINAL_DST` for v4, `IP6T_SO_ORIGINAL_DST` for v6), and
+    /// hand each client fd to the host proxy over the unix socket using
+    /// SCM_RIGHTS + the [`crate::wire`] header. Every hand-off is stamped with
+    /// `workspace_id` + `exec_id` so the proxy attributes the flow at capture time.
+    fn run_acceptor(
+        listener: TcpListener,
+        proxy_sock: &std::path::Path,
+        stop: &AtomicBool,
+        workspace_id: i64,
+        exec_id: &str,
+    ) {
         for client in listener.incoming() {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             let Ok(client) = client else { continue };
-            if let Err(e) = handoff(&client, proxy_sock) {
+            if let Err(e) = handoff(&client, proxy_sock, workspace_id, exec_id) {
                 tracing::warn!(error = %e, "burpwn sandbox: connection hand-off failed");
             }
             // The host proxy now owns a dup of the fd; drop our copy.
@@ -587,19 +687,42 @@ mod privileged {
     }
 
     /// Recover the original destination and pass the client fd to the host proxy.
+    /// The original-destination sockopt differs by family: IPv4 sockets use
+    /// `SO_ORIGINAL_DST` (`sockaddr_in`), IPv6 sockets use `IP6T_SO_ORIGINAL_DST`
+    /// (`sockaddr_in6`). We pick by the accepted socket's local address family.
+    /// On recovery failure we return an error (the caller logs + drops the conn).
     fn handoff(
         client: &std::net::TcpStream,
         proxy_sock: &std::path::Path,
+        workspace_id: i64,
+        exec_id: &str,
     ) -> Result<(), SandboxError> {
-        let orig = getsockopt(client, OriginalDst)
-            .map_err(|e| SandboxError::Runtime(format!("SO_ORIGINAL_DST: {e}")))?;
-        // sockaddr_in fields are network byte order.
-        let dst_port = u16::from_be(orig.sin_port);
-        let dst_ip = std::net::Ipv4Addr::from(u32::from_be(orig.sin_addr.s_addr));
+        let is_v6 = client
+            .local_addr()
+            .map(|a| a.is_ipv6())
+            .map_err(|e| SandboxError::Runtime(format!("local_addr: {e}")))?;
+        let (dst_ip, dst_port) = if is_v6 {
+            let orig = getsockopt(client, Ip6tOriginalDst)
+                .map_err(|e| SandboxError::Runtime(format!("IP6T_SO_ORIGINAL_DST: {e}")))?;
+            // sockaddr_in6 fields are network byte order; `sin6_addr` is already
+            // a big-endian byte array, so feed the octets straight in.
+            let dst_port = u16::from_be(orig.sin6_port);
+            let dst_ip = std::net::Ipv6Addr::from(orig.sin6_addr.s6_addr);
+            (std::net::IpAddr::V6(dst_ip), dst_port)
+        } else {
+            let orig = getsockopt(client, OriginalDst)
+                .map_err(|e| SandboxError::Runtime(format!("SO_ORIGINAL_DST: {e}")))?;
+            // sockaddr_in fields are network byte order.
+            let dst_port = u16::from_be(orig.sin_port);
+            let dst_ip = std::net::Ipv4Addr::from(u32::from_be(orig.sin_addr.s_addr));
+            (std::net::IpAddr::V4(dst_ip), dst_port)
+        };
         let meta = PassedConn {
-            dst_ip: std::net::IpAddr::V4(dst_ip),
+            dst_ip,
             dst_port,
             l4: L4::Tcp,
+            workspace_id,
+            exec_id: exec_id.to_string(),
         };
         send_fd(client.as_raw_fd(), meta, proxy_sock)
     }
@@ -648,27 +771,52 @@ mod privileged {
         tracing::error!(error = %err, "burpwn sandbox: bwrap exec failed");
     }
 
-    /// PARENT: wait for the child (bwrap) to exit and build the outcome.
+    /// PARENT: drain the capture pipes (if any), wait for the child (which
+    /// re-exec'd the agent that forks bwrap) to exit, and build the outcome.
     ///
-    /// NOTE: in `inherit_stdio` mode we cannot capture output (it went to the
-    /// real fds), so stdout/stderr are empty by design; otherwise the child's
-    /// captured pipes would be wired here. For simplicity and because the spike
-    /// validated the exec-and-wait shape, capture-mode plumbing of the grandchild
-    /// pipes through bwrap is handled by redirecting bwrap's stdio to temp pipes
-    /// in a follow-up; today we wait and report the exit code, with captured
-    /// output left to the proxy-side transcript (the real value of this sandbox).
-    fn reap_child(child: nix::unistd::Pid, _spec: &ExecSpec) -> Result<ExecOutcome, SandboxError> {
+    /// In `inherit_stdio` mode `out_r`/`err_r` are `None` (output went straight
+    /// to the real fds) and the buffers are empty by design. In capture mode the
+    /// read-ends of the stdout/stderr pipes are drained to EOF by two reader
+    /// threads spawned BEFORE `waitpid` — draining concurrently is required, as a
+    /// command that fills the pipe buffer would otherwise block forever while the
+    /// parent waits on it (classic pipe deadlock). We join the readers AFTER the
+    /// child is reaped: every write-end (ours + the grandchildren's) is then
+    /// closed, so the reads have hit EOF and the joins return promptly.
+    fn reap_child(
+        child: nix::unistd::Pid,
+        out_r: Option<std::os::fd::OwnedFd>,
+        err_r: Option<std::os::fd::OwnedFd>,
+    ) -> Result<ExecOutcome, SandboxError> {
         use nix::sys::wait::{waitpid, WaitStatus};
-        match waitpid(child, None) {
+
+        let spawn_reader = |fd: Option<std::os::fd::OwnedFd>| {
+            fd.map(|fd| {
+                thread::spawn(move || {
+                    let mut file = std::fs::File::from(fd);
+                    let mut buf = Vec::new();
+                    let _ = file.read_to_end(&mut buf);
+                    buf
+                })
+            })
+        };
+        let out_reader = spawn_reader(out_r);
+        let err_reader = spawn_reader(err_r);
+
+        let status = waitpid(child, None);
+
+        let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+
+        match status {
             Ok(WaitStatus::Exited(_, code)) => Ok(ExecOutcome {
                 exit_code: code,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
+                stdout,
+                stderr,
             }),
             Ok(WaitStatus::Signaled(_, sig, _)) => Ok(ExecOutcome {
                 exit_code: 128 + sig as i32,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
+                stdout,
+                stderr,
             }),
             Ok(other) => Err(SandboxError::Runtime(format!(
                 "unexpected wait status: {other:?}"
@@ -692,6 +840,8 @@ mod tests {
             proxy_tcp_port: 8080,
             proxy_dns_port: 5353,
             ca_path: PathBuf::from("/etc/burpwn/ca.pem"),
+            exec_id: "exec-test-1".into(),
+            workspace_id: 42,
             timeout: None,
             inherit_stdio: false,
         }
@@ -749,6 +899,46 @@ mod tests {
         // The user command comes after the `--` separator, last.
         let sep = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[sep + 1..], &["curl", "-s", "https://example.com"]);
+    }
+
+    #[test]
+    fn passed_conn_carries_spec_exec_and_workspace() {
+        // The hand-off must stamp exec_id + workspace_id from the spec onto
+        // every PassedConn so the proxy can attribute the flow at capture time.
+        // We assert the wire round-trip preserves both (the privileged handoff
+        // path that builds this from a real socket is #[ignore]d).
+        use crate::wire::{PassedConn, L4};
+        let s = spec();
+        let meta = PassedConn {
+            dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            l4: L4::Tcp,
+            workspace_id: s.workspace_id,
+            exec_id: s.exec_id.clone(),
+        };
+        let decoded = PassedConn::decode(&meta.encode()).unwrap();
+        assert_eq!(decoded.workspace_id, 42);
+        assert_eq!(decoded.exec_id, "exec-test-1");
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn passed_conn_supports_ipv6_destination() {
+        // Change #9: IPv6 redirected connections produce a V6 PassedConn that
+        // round-trips through the wire format unchanged.
+        use crate::wire::{PassedConn, L4};
+        let meta = PassedConn {
+            dst_ip: std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2606, 0x4700, 0, 0, 0, 0, 0, 0x64,
+            )),
+            dst_port: 443,
+            l4: L4::Tcp,
+            workspace_id: 7,
+            exec_id: "exec-v6".into(),
+        };
+        let decoded = PassedConn::decode(&meta.encode()).unwrap();
+        assert!(decoded.dst_ip.is_ipv6());
+        assert_eq!(decoded, meta);
     }
 
     #[test]

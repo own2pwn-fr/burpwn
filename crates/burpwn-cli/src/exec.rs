@@ -123,6 +123,10 @@ pub fn build_spec(
         proxy_tcp_port: NETNS_TCP_PORT,
         proxy_dns_port: NETNS_DNS_PORT,
         ca_path: paths.ca_pem(),
+        // Defaults; `run_exec` overrides these per invocation so the proxy
+        // attributes captures to the right exec/workspace at capture time.
+        exec_id: String::new(),
+        workspace_id: 1,
         timeout,
         inherit_stdio,
     }
@@ -131,12 +135,11 @@ pub fn build_spec(
 /// Run one `exec` against the provided runtime. Pure orchestration: the caller
 /// is responsible for ensuring the daemon is up (so tests can skip it).
 ///
-/// The captured flows are attributed *after* the command finishes: we record a
-/// `since_ts` watermark before launching the sandbox, run the command, then ask
-/// the store to stamp every not-yet-attributed flow recorded since `since_ts`
-/// with this `exec_id` + `workspace_id`. The long-lived daemon records flows
-/// with a fixed `workspace_id=1` / `exec_id=NULL` (it cannot see this process's
-/// env), so post-hoc attribution by time window is the reliable correlator.
+/// Attribution is EXACT and per-connection: the `exec_id` + `workspace_id` are
+/// carried in the SCM wire header for every connection this command makes, so
+/// the proxy stamps each captured flow at capture time. After the command
+/// finishes we simply query the flows stamped with this `exec_id` — concurrent
+/// execs never cross-attribute (unlike a time-window guess).
 pub async fn run_exec(
     paths: &Paths,
     session: &str,
@@ -148,12 +151,11 @@ pub async fn run_exec(
 ) -> Result<ExecResult> {
     let exec_id = new_exec_id();
     let mut spec = build_spec(paths, session, argv, timeout, inherit_stdio);
-    // Stamp the exec id into the child's environment too (harmless): tools inside
-    // the sandbox may read it to correlate, even though the daemon does not.
+    // The proxy stamps flows from this run with these, via the wire header.
+    spec.exec_id = exec_id.clone();
+    spec.workspace_id = workspace_id;
+    // Also expose the id in the child's env (harmless): tools may read it.
     spec.env.push(("BURPWN_EXEC_ID".into(), exec_id.clone()));
-
-    // Watermark BEFORE launching, so flows the command produces fall in-window.
-    let since_ts = now_millis();
 
     let outcome = runtime
         .run(spec)
@@ -163,7 +165,7 @@ pub async fn run_exec(
     // Give the daemon's async writer a beat to flush the last flows it recorded.
     tokio::time::sleep(ATTRIBUTE_GRACE).await;
 
-    let captured_request_ids = attribute_captured(paths, session, since_ts, &exec_id, workspace_id)
+    let captured_request_ids = flows_for_exec(paths, session, &exec_id)
         .await
         .unwrap_or_default();
 
@@ -175,25 +177,15 @@ pub async fn run_exec(
     })
 }
 
-/// Stamp every not-yet-attributed flow recorded since `since_ts` with the given
-/// `exec_id` and `workspace_id`, returning the ids that were attributed. Opening
-/// the store is cheap; an absent db means nothing was captured.
-async fn attribute_captured(
-    paths: &Paths,
-    session: &str,
-    since_ts: i64,
-    exec_id: &str,
-    workspace_id: i64,
-) -> Result<Vec<i64>> {
+/// The flow ids stamped with `exec_id` (the proxy attributes at capture time).
+/// Opening the store is cheap; an absent db means nothing was captured.
+async fn flows_for_exec(paths: &Paths, session: &str, exec_id: &str) -> Result<Vec<i64>> {
     let db = paths.session_db(session);
     if !db.exists() {
         return Ok(Vec::new());
     }
     let store = Store::open(&db)?;
-    let ids = store
-        .writer()
-        .attribute_flows(since_ts, exec_id, workspace_id)
-        .await?;
+    let ids = store.reader().flow_ids_for_exec(exec_id)?;
     Ok(ids)
 }
 
@@ -239,7 +231,7 @@ pub fn write_json_envelope(env: &Envelope) {
 mod tests {
     use super::*;
     use burpwn_sandbox::MockRuntime;
-    use burpwn_store::model::{FlowStart, Protocol, RequestData};
+    use burpwn_store::model::{FlowStart, Protocol};
 
     #[test]
     fn exec_ids_are_unique() {
@@ -344,61 +336,38 @@ mod tests {
         assert_eq!(names.iter().filter(|n| *n == "recon").count(), 1);
     }
 
-    /// A flow recorded in-window (un-attributed: workspace 1 / exec NULL, like the
-    /// daemon writes) gets stamped with the exec id + target workspace, and its id
-    /// is returned as captured.
+    /// `flows_for_exec` returns exactly the flows the proxy stamped with this
+    /// exec_id (at capture time) — and ignores flows from other execs.
     #[tokio::test]
-    async fn attribute_captured_stamps_in_window_flows() {
+    async fn flows_for_exec_returns_only_matching_exec() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_base(dir.path());
         paths.ensure_session_dir("default").unwrap();
 
         let store = Store::open(paths.session_db("default")).unwrap();
         let w = store.writer();
-        let since = now_millis();
-        let fid = w
-            .flow_start(FlowStart {
-                workspace_id: 1,
-                ts_start: now_millis(),
-                exec_id: None,
-                client_addr: "127.0.0.1:1".into(),
-                dst_ip: "1.2.3.4".into(),
-                dst_port: 443,
-                sni: Some("x".into()),
-                scheme: "https".into(),
-                protocol: Protocol::H1,
-                intercepted: false,
-            })
-            .await
-            .unwrap();
-        w.request(
-            fid,
-            RequestData {
-                method: "GET".into(),
-                authority: "x".into(),
-                path: "/".into(),
-                http_version: "HTTP/1.1".into(),
-                headers: Vec::new(),
-                body: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        let mk = |exec: Option<&str>| FlowStart {
+            workspace_id: 1,
+            ts_start: now_millis(),
+            exec_id: exec.map(Into::into),
+            client_addr: "127.0.0.1:1".into(),
+            dst_ip: "1.2.3.4".into(),
+            dst_port: 443,
+            sni: Some("x".into()),
+            scheme: "https".into(),
+            protocol: Protocol::H1,
+            intercepted: false,
+        };
+        let mine1 = w.flow_start(mk(Some("exec-mine"))).await.unwrap();
+        let _other = w.flow_start(mk(Some("exec-other"))).await.unwrap();
+        let mine2 = w.flow_start(mk(Some("exec-mine"))).await.unwrap();
+        let _unattributed = w.flow_start(mk(None)).await.unwrap();
         drop(w);
         drop(store);
 
-        let ws = resolve_workspace_id(&paths, "default", Some("attr-ws"))
+        let ids = flows_for_exec(&paths, "default", "exec-mine")
             .await
             .unwrap();
-        let ids = attribute_captured(&paths, "default", since, "exec-xyz", ws)
-            .await
-            .unwrap();
-        assert_eq!(ids, vec![fid]);
-
-        // The flow now carries the exec id and target workspace.
-        let store = Store::open(paths.session_db("default")).unwrap();
-        let detail = store.reader().get_flow(fid).unwrap().unwrap();
-        assert_eq!(detail.exec_id.as_deref(), Some("exec-xyz"));
-        assert_eq!(detail.flow.workspace_id, ws);
+        assert_eq!(ids, vec![mine1, mine2]);
     }
 }

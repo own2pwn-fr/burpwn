@@ -177,11 +177,12 @@ fn ca_params() -> Result<CertificateParams> {
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-    // ~10 years of validity. This is a real binary (not a deterministic
-    // workflow), so wall-clock time is appropriate here.
-    let year = crate::current_year();
-    params.not_before = rcgen::date_time_ymd(year, 1, 1);
-    params.not_after = rcgen::date_time_ymd(year + 10, 1, 1);
+    // ~10 years of validity, anchored to a real civil timestamp. `not_before`
+    // sits a couple of days in the past so the CA is never "not yet valid"
+    // under clock skew or the old year approximation.
+    let validity = crate::Validity::for_years(10);
+    params.not_before = validity.not_before;
+    params.not_after = validity.not_after;
 
     Ok(params)
 }
@@ -249,6 +250,26 @@ mod tests {
         let key = ca.signing_key().unwrap();
         // Rebuilding the issuer cert must succeed (DN/key-id derived from store).
         let _issuer = ca.issuer_cert(&key).unwrap();
+    }
+
+    #[test]
+    fn fresh_ca_not_before_is_in_the_past() {
+        use x509_parser::prelude::*;
+        let dir = TempDir::new().unwrap();
+        let ca = CertAuthority::load_or_generate(dir.path()).unwrap();
+        let (_, cert) = X509Certificate::from_der(ca.cert_der().as_ref()).unwrap();
+
+        let now = ::time::OffsetDateTime::now_utc().unix_timestamp();
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        assert!(
+            not_before <= now,
+            "CA not_before {not_before} must be <= now {now}"
+        );
+        assert!(
+            not_after > now,
+            "CA not_after {not_after} must be in the future"
+        );
     }
 
     #[test]

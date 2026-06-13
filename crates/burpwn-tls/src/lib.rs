@@ -43,16 +43,46 @@ pub use upstream::{
     upstream_connector_alpn,
 };
 
-/// Current calendar year from the system clock, used for cert validity bounds.
-/// Approximate (a year boundary is all `date_time_ymd` needs); never panics.
-pub(crate) fn current_year() -> i32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // 1970 + seconds / (average seconds per year, incl. leap years).
-    1970 + (secs / 31_557_600) as i32
+use time::OffsetDateTime;
+
+/// A clock-skew-tolerant certificate validity window.
+///
+/// `not_before` is deliberately set a couple of days **in the past** and
+/// `not_after` several years in the future, both computed from a real civil
+/// timestamp ([`OffsetDateTime::now_utc`]). This is robust to:
+///
+/// - the old `1970 + secs / 31_557_600` year approximation, which drifts and,
+///   near a New-Year boundary, could return a year off-by-one — landing
+///   `not_before` in the *future* so freshly minted leaves were "not yet valid"
+///   and every client rejected the handshake;
+/// - small client/proxy clock skew, which would otherwise reject a cert minted
+///   "just now".
+pub(crate) struct Validity {
+    pub not_before: OffsetDateTime,
+    pub not_after: OffsetDateTime,
+}
+
+/// Slack subtracted from `now` for `not_before`, so a just-minted cert is never
+/// in the future for a slightly-behind client clock.
+const NOT_BEFORE_SLACK: time::Duration = time::Duration::days(2);
+
+impl Validity {
+    /// Build a window `[now - 2 days, now + `years` years]` from the real
+    /// system clock. Never panics: the only fallible step (`replace_year`) is
+    /// handled with a day-count approximation if it ever overflows the calendar.
+    pub(crate) fn for_years(years: i32) -> Self {
+        let now = OffsetDateTime::now_utc();
+        let not_before = now - NOT_BEFORE_SLACK;
+        // `replace_year` only fails for years outside ±9999; the small offsets
+        // we use keep us well inside that range, but stay total just in case.
+        let not_after = now
+            .replace_year(now.year() + years)
+            .unwrap_or_else(|_| now + time::Duration::days(365 * i64::from(years)));
+        Self {
+            not_before,
+            not_after,
+        }
+    }
 }
 
 #[cfg(test)]

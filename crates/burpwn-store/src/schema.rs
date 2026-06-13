@@ -13,14 +13,14 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
 
 type MigrationStep = fn(&Connection) -> Result<()>;
 
-const MIGRATIONS: &[(i64, MigrationStep)] = &[(1, migrate_v1)];
+const MIGRATIONS: &[(i64, MigrationStep)] = &[(1, migrate_v1), (2, migrate_v2)];
 
 /// Apply pending migrations, stamp the version, and ensure the default
 /// workspace exists. Refuses to open a file stamped with a newer schema.
@@ -174,11 +174,36 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_intercepts_state ON intercepts(state);
 
-        -- Contentless FTS5 index. We feed it decoded text (url + host + bodies)
-        -- keyed by the flow id stored in the unindexed `flow_id` column. Only the
-        -- writer task ever touches it, so it can never block a hot read path.
+        -- FTS5 index over decoded message text. We feed it decoded text
+        -- (url + host + bodies, status + headers + bodies) keyed by the flow id
+        -- stored in the unindexed `flow_id` column. The unindexed `kind` column
+        -- ('req' | 'resp' | 'raw') lets the writer replace a flow's prior text for
+        -- that kind on re-record, so the index never accumulates stale duplicate
+        -- rows. Only the writer task ever touches it, so it can never block a hot
+        -- read path.
         CREATE VIRTUAL TABLE IF NOT EXISTS flows_fts USING fts5(
             flow_id UNINDEXED,
+            kind UNINDEXED,
+            content,
+            tokenize = 'unicode61'
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v2: add the unindexed `kind` column to `flows_fts` so FTS indexing is
+/// idempotent per (flow_id, kind). FTS5 virtual tables can't be `ALTER`ed to add
+/// columns, so we drop and recreate the index. The index is a derived, fully
+/// rebuildable search cache (re-recording a request/response repopulates it), so
+/// dropping its rows here is safe — no message data lives only in the FTS table.
+fn migrate_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS flows_fts;
+        CREATE VIRTUAL TABLE flows_fts USING fts5(
+            flow_id UNINDEXED,
+            kind UNINDEXED,
             content,
             tokenize = 'unicode61'
         );
@@ -245,6 +270,77 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM workspaces", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        cols.iter().any(|c| c == column)
+    }
+
+    #[test]
+    fn fresh_db_has_kind_column_on_flows_fts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        assert!(
+            column_exists(&conn, "flows_fts", "kind"),
+            "flows_fts must carry the per-kind column"
+        );
+    }
+
+    #[test]
+    fn migrates_v1_fts_to_v2_kind_column() {
+        // Simulate a file created at schema v1 (no `kind` column on flows_fts),
+        // with a stray FTS row, then upgrade it via init().
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        migrate_v1(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        // The v1 baseline now ships the `kind` column too, but emulate an OLD
+        // 2-column index to exercise the v2 rebuild path.
+        conn.execute_batch(
+            "DROP TABLE flows_fts;
+             CREATE VIRTUAL TABLE flows_fts USING fts5(flow_id UNINDEXED, content);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flows_fts(flow_id, content) VALUES (1, 'legacytext')",
+            [],
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "flows_fts", "kind"));
+
+        // Upgrade.
+        init(&conn).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(column_exists(&conn, "flows_fts", "kind"));
+
+        // The index is rebuildable, so the legacy row is dropped; new inserts work
+        // with the per-kind shape and remain searchable.
+        conn.execute(
+            "INSERT INTO flows_fts(flow_id, kind, content) VALUES (2, 'req', 'freshtext')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flows_fts WHERE flows_fts MATCH 'freshtext'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

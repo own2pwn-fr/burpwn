@@ -364,26 +364,42 @@ pub async fn cmd_exec(
 
 /// Ensure a daemon answers `Status` on the session's control socket; spawn the
 /// hidden `burpwn proxy --session S` detached child and poll until ready.
+///
+/// The whole check-then-spawn is serialized under an exclusive `flock` on
+/// `<run_dir>/daemon.lock` (Bug #3b): without it, two execs racing on a cold
+/// session would each spawn a daemon, and the second daemon's `serve_control`
+/// would unlink the first's live control socket. Holding the lock until the
+/// daemon answers `Status` guarantees a single winner per session.
 async fn ensure_daemon(paths: &Paths, session: &str) -> Result<()> {
     let control = paths.control_sock(session);
+    // Fast path: a daemon is already answering — no need to take the lock.
     if let Ok(mut client) = ControlClient::connect(&control).await {
         if client.status().await.is_ok() {
             return Ok(());
         }
     }
-    paths.ensure_run_dir(session)?;
+    let run_dir = paths.ensure_run_dir(session)?;
 
-    // Spawn ourselves as the daemon, detached.
+    // Serialize the check-and-spawn critical section with an exclusive lock.
+    let lock_path = run_dir.join("daemon.lock");
+    let lock = DaemonLock::acquire(&lock_path)
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+
+    // Re-check under the lock: another exec may have won the race and already
+    // brought a daemon up while we were blocked on the flock.
+    if let Ok(mut client) = ControlClient::connect(&control).await {
+        if client.status().await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    // Spawn ourselves as the daemon, fully detached: a new session leader
+    // (setsid) so it's reparented to init immediately and decoupled from the
+    // exec's process group — Ctrl-C in the user's shell no longer kills the
+    // daemon, and it can't become a zombie nobody reaps (Bug #3). stdio is
+    // redirected to /dev/null so it never holds the terminal or inherits fd 3.
     let exe = std::env::current_exe().context("locating own executable")?;
-    std::process::Command::new(exe)
-        .arg("proxy")
-        .arg("--session")
-        .arg(session)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawning proxy daemon")?;
+    spawn_detached_daemon(&exe, session).context("spawning proxy daemon")?;
 
     // Poll until proxy.sock exists and control answers Status.
     let proxy_sock = paths.proxy_sock(session);
@@ -403,7 +419,64 @@ async fn ensure_daemon(paths: &Paths, session: &str) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    // Release the lock only after the daemon answers, so a racing exec that
+    // wakes next sees a live daemon on its own re-check.
+    drop(lock);
     Ok(())
+}
+
+/// Spawn `burpwn proxy --session <session>` as a detached daemon: a new session
+/// leader (via `setsid` in a `pre_exec` hook) with stdio routed to `/dev/null`.
+fn spawn_detached_daemon(exe: &std::path::Path, session: &str) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("proxy")
+        .arg("--session")
+        .arg(session)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only thing we call between
+    // fork and exec. Detaching the child into its own session makes it a
+    // session leader reparented to init, decoupled from our signal group.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    // Drop the returned Child handle: the daemon outlives us (it's its own
+    // session leader; init reaps it), so there's no zombie to wait on here.
+    cmd.spawn().map(|_child| ())
+}
+
+/// An exclusive advisory lock held on `<run_dir>/daemon.lock` for the duration
+/// of `ensure_daemon`'s critical section. Uses raw `flock(LOCK_EX)` (no extra
+/// deps); the lock is released when the file is closed (on drop).
+struct DaemonLock {
+    _file: std::fs::File,
+}
+
+impl DaemonLock {
+    /// Open (creating if needed) the lock file and block until an exclusive
+    /// `flock` is held.
+    fn acquire(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        // SAFETY: `file` owns the fd for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 // --- req -------------------------------------------------------------------
@@ -1195,6 +1268,39 @@ mod tests {
         assert!(!paths.session_exists("scratch"));
         // active pointer reset to default after removing the active session.
         assert_eq!(paths.active_session(), DEFAULT_SESSION);
+    }
+
+    #[test]
+    fn daemon_lock_is_mutually_exclusive() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+
+        // Hold the lock on this thread.
+        let held = DaemonLock::acquire(&lock_path).unwrap();
+
+        // A second thread must block on acquire until we drop ours.
+        let inside = Arc::new(AtomicUsize::new(0));
+        let inside2 = inside.clone();
+        let lp = lock_path.clone();
+        let t = std::thread::spawn(move || {
+            let _l = DaemonLock::acquire(&lp).unwrap();
+            inside2.store(1, Ordering::SeqCst);
+        });
+
+        // Give the thread a chance to (fail to) acquire.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            inside.load(Ordering::SeqCst),
+            0,
+            "second acquire must block while the first lock is held"
+        );
+
+        drop(held);
+        t.join().unwrap();
+        assert_eq!(inside.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

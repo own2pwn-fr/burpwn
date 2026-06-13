@@ -122,10 +122,21 @@ impl Reader {
             return Ok(None);
         };
 
+        // Reuse the connection we already checked out for tags + notes too, so a
+        // single `get_flow` call only ever holds ONE pooled connection (avoids
+        // exhausting/deadlocking the pool under concurrent readers).
         let request = self.load_request(&conn, id)?;
         let response = self.load_response(&conn, id)?;
-        let tags = self.flow_tags(id)?.into_iter().map(|t| t.name).collect();
-        let notes = self.flow_notes(id)?.into_iter().map(|n| n.body).collect();
+        let tags = self
+            .flow_tags_conn(&conn, id)?
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        let notes = self
+            .flow_notes_conn(&conn, id)?
+            .into_iter()
+            .map(|n| n.body)
+            .collect();
 
         Ok(Some(FlowDetail {
             flow,
@@ -196,6 +207,20 @@ impl Reader {
         get_blob(&conn, id)
     }
 
+    /// Flow ids stamped with `exec_id`, ascending. The proxy attributes each
+    /// captured flow to the originating `burpwn exec` at capture time (via the
+    /// SCM wire header), so this returns exactly that run's captures.
+    pub fn flow_ids_for_exec(&self, exec_id: &str) -> Result<Vec<i64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT id FROM flows WHERE exec_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([exec_id], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Full-text search over indexed request/response/raw text; returns matching
     /// flow ids (deduplicated, newest first).
     pub fn search(&self, query: &str) -> Result<Vec<i64>> {
@@ -250,6 +275,11 @@ impl Reader {
     /// List the tags attached to a flow.
     pub fn flow_tags(&self, flow_id: i64) -> Result<Vec<Tag>> {
         let conn = self.conn()?;
+        self.flow_tags_conn(&conn, flow_id)
+    }
+
+    /// List the tags attached to a flow using an already-checked-out connection.
+    fn flow_tags_conn(&self, conn: &Connection, flow_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = conn.prepare(
             "SELECT t.id, t.name, t.color FROM tags t
              JOIN flow_tags ft ON ft.tag_id = t.id
@@ -296,6 +326,11 @@ impl Reader {
     /// List notes on a flow, oldest first.
     pub fn flow_notes(&self, flow_id: i64) -> Result<Vec<Note>> {
         let conn = self.conn()?;
+        self.flow_notes_conn(&conn, flow_id)
+    }
+
+    /// List notes on a flow using an already-checked-out connection, oldest first.
+    fn flow_notes_conn(&self, conn: &Connection, flow_id: i64) -> Result<Vec<Note>> {
         let mut stmt =
             conn.prepare("SELECT id, flow_id, body, ts FROM notes WHERE flow_id = ?1 ORDER BY ts")?;
         let rows = stmt.query_map([flow_id], |r| {

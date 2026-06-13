@@ -624,7 +624,7 @@ fn do_request(conn: &Connection, flow_id: i64, d: &RequestData) -> Result<()> {
     // Feed FTS with url + host + decoded body text.
     let mut text = format!("{} {}\n{}\n", d.method, d.path, d.authority);
     text.push_str(&String::from_utf8_lossy(&d.body));
-    index_fts(conn, flow_id, &text)?;
+    index_fts(conn, flow_id, FtsKind::Request, &text)?;
     Ok(())
 }
 
@@ -647,7 +647,13 @@ fn do_response(conn: &Connection, flow_id: i64, d: &ResponseData) -> Result<()> 
             d.timing_ms,
         ],
     )?;
-    index_fts(conn, flow_id, &String::from_utf8_lossy(&d.body))?;
+    // Feed FTS with status + decoded headers (so Set-Cookie / Location / status
+    // are searchable) + decoded body text, mirroring the request side.
+    let mut text = format!("{}\n", d.status);
+    text.push_str(&String::from_utf8_lossy(&d.headers));
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&d.body));
+    index_fts(conn, flow_id, FtsKind::Response, &text)?;
     Ok(())
 }
 
@@ -663,7 +669,7 @@ fn do_raw_chunk(conn: &Connection, flow_id: i64, bytes: &[u8]) -> Result<()> {
     // Raw chunks live as blobs referenced from notes-like FTS only; we keep the
     // bytes deduplicated and index their (best-effort) text.
     BlobStore::put(conn, bytes)?;
-    index_fts(conn, flow_id, &String::from_utf8_lossy(bytes))?;
+    index_fts(conn, flow_id, FtsKind::Raw, &String::from_utf8_lossy(bytes))?;
     Ok(())
 }
 
@@ -755,14 +761,51 @@ fn do_attribute_flows(
     Ok(ids)
 }
 
-/// Append a text fragment to the contentless FTS index for a flow.
-fn index_fts(conn: &Connection, flow_id: i64, text: &str) -> Result<()> {
+/// The kind of FTS row, stored in the unindexed `kind` column. `Request` and
+/// `Response` are replaced in place on re-record (one row per flow per kind);
+/// `Raw` rows accumulate (a flow streams many raw chunks).
+#[derive(Clone, Copy)]
+enum FtsKind {
+    Request,
+    Response,
+    Raw,
+}
+
+impl FtsKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            FtsKind::Request => "req",
+            FtsKind::Response => "resp",
+            FtsKind::Raw => "raw",
+        }
+    }
+
+    /// Whether re-indexing this kind replaces the flow's prior text for it.
+    /// Request/response are singular per flow (replace on re-record); raw chunks
+    /// are streamed and must accumulate.
+    fn replaces_prior(self) -> bool {
+        matches!(self, FtsKind::Request | FtsKind::Response)
+    }
+}
+
+/// (Re)index a text fragment into the FTS index for a flow under `kind`.
+///
+/// For replace-style kinds (request/response) this first deletes the flow's prior
+/// rows for that kind, so re-recording a request/response never leaves stale,
+/// duplicated text searchable. Raw chunks accumulate.
+fn index_fts(conn: &Connection, flow_id: i64, kind: FtsKind, text: &str) -> Result<()> {
+    if kind.replaces_prior() {
+        conn.execute(
+            "DELETE FROM flows_fts WHERE flow_id = ?1 AND kind = ?2",
+            rusqlite::params![flow_id, kind.as_str()],
+        )?;
+    }
     if text.trim().is_empty() {
         return Ok(());
     }
     conn.execute(
-        "INSERT INTO flows_fts(flow_id, content) VALUES (?1, ?2)",
-        rusqlite::params![flow_id, text],
+        "INSERT INTO flows_fts(flow_id, kind, content) VALUES (?1, ?2, ?3)",
+        rusqlite::params![flow_id, kind.as_str(), text],
     )?;
     Ok(())
 }

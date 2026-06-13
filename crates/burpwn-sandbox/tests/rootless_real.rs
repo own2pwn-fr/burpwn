@@ -41,6 +41,8 @@ async fn runs_true_inside_a_real_sandbox() {
         proxy_tcp_port: 18080,
         proxy_dns_port: 15353,
         ca_path: PathBuf::from("/etc/ssl/cert.pem"),
+        exec_id: "exec-test".into(),
+        workspace_id: 1,
         timeout: None,
         inherit_stdio: false,
     };
