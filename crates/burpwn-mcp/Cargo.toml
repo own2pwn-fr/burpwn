@@ -1,0 +1,22 @@
+[package]
+name = "burpwn-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "burpwn MCP server: tools mapping to the CLI, long-poll await_intercept"
+
+[dependencies]
+rmcp.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+burpwn-store.workspace = true
+burpwn-proxy.workspace = true

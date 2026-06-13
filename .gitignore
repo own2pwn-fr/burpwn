@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.session.db*
+/tmp
+.DS_Store

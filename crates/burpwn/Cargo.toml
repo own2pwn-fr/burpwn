@@ -1,0 +1,23 @@
+[package]
+name = "burpwn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "burpwn: transparent intercepting proxy + sandbox + agent interface for AI-driven web pentesting"
+
+[[bin]]
+name = "burpwn"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+burpwn-cli.workspace = true
+burpwn-mcp.workspace = true

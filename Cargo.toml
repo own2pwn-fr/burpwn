@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/burpwn-store",
+    "crates/burpwn-tls",
+    "crates/burpwn-proxy",
+    "crates/burpwn-sandbox",
+    "crates/burpwn-wrap",
+    "crates/burpwn-cli",
+    "crates/burpwn-mcp",
+    "crates/burpwn",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "AGPL-3.0-only"
+authors = ["own2pwn <contact@own2pwn.fr>"]
+repository = "https://github.com/own2pwn-fr/burpwn"
+description = "Transparent intercepting proxy + sandbox + agent interface for AI-driven web pentesting"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+futures = "0.3"
+
+# http / tls
+hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http = "1.1"
+http-body-util = "0.1"
+bytes = "1.7"
+# ring (not the default aws_lc_rs) so we avoid a C toolchain build-dep and so
+# `rustls::crypto::ring` is available for the per-install crypto provider + leaf signing.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2.1"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+tokio-tungstenite = "0.24"
+flate2 = "1.0"
+brotli = "7.0"
+
+# dns
+hickory-proto = "0.25"
+
+# storage
+rusqlite = { version = "0.32", features = ["bundled", "blob", "functions"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+sha2 = "0.10"
+zstd = "0.13"
+
+# cli / serialization / config
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+directories = "5.0"
+
+# syscalls (rootless sandbox)
+nix = { version = "0.29", features = ["sched", "mount", "process", "socket", "fs", "user", "net", "uio", "signal"] }
+libc = "0.2"
+
+# mcp
+rmcp = { version = "0.2", features = ["server", "transport-io"] }
+schemars = "0.8"
+
+# concurrency / util
+dashmap = "6.1"
+parking_lot = "0.12"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+
+# internal crates
+burpwn-store = { path = "crates/burpwn-store" }
+burpwn-tls = { path = "crates/burpwn-tls" }
+burpwn-proxy = { path = "crates/burpwn-proxy" }
+burpwn-sandbox = { path = "crates/burpwn-sandbox" }
+burpwn-wrap = { path = "crates/burpwn-wrap" }
+burpwn-cli = { path = "crates/burpwn-cli" }
+burpwn-mcp = { path = "crates/burpwn-mcp" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

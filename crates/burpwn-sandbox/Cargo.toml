@@ -1,0 +1,23 @@
+[package]
+name = "burpwn-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "burpwn rootless sandbox: per-command userns+netns+nftables+bubblewrap, RAII teardown"
+
+[dependencies]
+nix.workspace = true
+libc.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile = "3.12"

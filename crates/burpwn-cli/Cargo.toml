@@ -1,0 +1,26 @@
+[package]
+name = "burpwn-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "burpwn CLI: clap subcommand tree, JSON envelope output, orchestration"
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+directories.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+burpwn-store.workspace = true
+burpwn-tls.workspace = true
+burpwn-proxy.workspace = true
+burpwn-sandbox.workspace = true
+burpwn-wrap.workspace = true

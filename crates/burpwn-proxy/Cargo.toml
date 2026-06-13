@@ -1,0 +1,40 @@
+[package]
+name = "burpwn-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "burpwn proxy core: peek/classify, HTTP/1.1+H2+WS, DNS decode, raw TCP, match/replace, intercept"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+hickory-proto.workspace = true
+flate2.workspace = true
+brotli.workspace = true
+nix.workspace = true
+libc.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+burpwn-store.workspace = true
+burpwn-tls.workspace = true
+
+[dev-dependencies]
+tempfile = "3.12"

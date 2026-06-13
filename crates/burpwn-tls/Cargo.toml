@@ -1,0 +1,31 @@
+[package]
+name = "burpwn-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "burpwn TLS-MITM: per-install CA, on-the-fly leaf certs, passthrough fallback"
+
+[dependencies]
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+# Mozilla root store (pure data) for VALIDATING upstream server certs. We tamper
+# with HTTP framing/content, never with upstream TLS trust — so the proxy's
+# client side keeps normal certificate validation against these roots.
+webpki-roots = "0.26"
+tokio.workspace = true
+dashmap.workspace = true
+directories.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.12"
+# Used only by tests to introspect the SAN/issuer of minted leaves. Already in
+# the lock via rcgen's x509-parser feature, so this adds no new dependency.
+x509-parser = "0.16"
