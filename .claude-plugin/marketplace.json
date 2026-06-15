@@ -1,0 +1,15 @@
+{
+  "name": "burpwn",
+  "owner": {
+    "name": "own2pwn",
+    "email": "contact@own2pwn.fr"
+  },
+  "plugins": [
+    {
+      "name": "burpwn",
+      "source": "./",
+      "description": "AI-driven intercepting proxy + rootless sandbox for web pentesting. Installs the burpwn agent skill (session-aware, selective capture). Requires the `burpwn` binary on PATH; the enforced PreToolUse hook is a separate opt-in via `burpwn init`.",
+      "version": "0.1.2"
+    }
+  ]
+}

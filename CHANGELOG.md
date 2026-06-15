@@ -3,6 +3,36 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2] - 2026-06-15
+
+### Fixed
+- **Claude Code / Copilot `PreToolUse` hook never actually wrapped commands**
+  (`burpwn-cli`): `burpwn wrap-hook` rewrote `tool_input.command` and echoed the
+  raw modified document back. Claude Code **ignores** a bare `{"tool_input":{…}}`
+  on stdout, so it ran the *original* command — traffic was silently never
+  captured. The hook now emits the documented envelope
+  (`hookSpecificOutput` + `permissionDecision: "allow"` + `updatedInput`), so the
+  rewrite is actually applied. The agent slug is now load-bearing (each agent has
+  its own response dialect), not advisory.
+- **Gemini CLI `BeforeTool` hook**: now emits its rewrite envelope
+  (`{"decision":"allow","hookSpecificOutput":{"tool_input":{…}}}`) instead of the
+  raw echo, so Gemini also wraps transparently.
+- **Cursor `beforeShellExecution` hook**: Cursor's hook API can only allow/deny —
+  it *cannot* rewrite a command. The raw echo was a silent no-op there. burpwn now
+  emits a valid non-blocking allow with an `agentMessage` nudge to re-run network
+  commands through `burpwn exec` (never a hard block). Cursor capture is advisory,
+  like Cline.
+
+### Added
+- **Claude Code plugin** (`.claude-plugin/`): the repo is now a single-plugin
+  marketplace, so the agent **skill** installs in one step —
+  `/plugin marketplace add own2pwn-fr/burpwn` then `/plugin install burpwn@burpwn`
+  (the `burpwn` binary must be on `PATH`). The plugin ships the **skill only**: the
+  enforced `PreToolUse` auto-capture hook stays a separate opt-in via `burpwn init`,
+  so the two integration layers are not stacked. The skill is session-aware and
+  selective (it creates a session and wraps only target-facing commands); the hook
+  is blunt (wraps every command, no session) — pick one.
+
 ## [0.1.1] - 2026-06-13
 
 A fourth, exhaustive security pass (5 parallel audits across every crate) plus the

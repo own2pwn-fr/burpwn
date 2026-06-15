@@ -1,45 +1,183 @@
 //! `burpwn wrap-hook`: the stdin filter the installed agent hooks pipe their
 //! tool-input JSON through. It reads a tool-input object on stdin, and if it is
 //! a shell/Bash tool call whose command [`should_wrap`], rewrites the command to
-//! `burpwn exec -- sh -c '<cmd>'` and emits the hook-response JSON on stdout.
+//! `burpwn exec -- sh -c '<cmd>'` and emits the hook-response JSON **in that
+//! agent's dialect** on stdout.
 //!
-//! It is **robust to unknown shapes**: anything it can't parse, or any tool it
-//! doesn't recognise, is passed through unchanged (echoed) so it never breaks an
-//! agent. The exact agent hook envelope varies (Claude Code PreToolUse, Cursor,
-//! Gemini…); we detect the common shapes generically.
+//! ## Why the agent slug is load-bearing (not advisory)
+//!
+//! Each agent applies a hook's stdout differently. A hook that simply *echoes a
+//! modified `tool_input` blob* does NOT rewrite the command for Claude Code: the
+//! harness ignores a raw `{"tool_input":{…}}` on stdout and runs the ORIGINAL
+//! command, so capture silently never happens. To actually rewrite, the hook
+//! must emit the agent's documented response envelope:
+//!
+//! * **Claude Code / Copilot** (`PreToolUse`): a `hookSpecificOutput` object with
+//!   `hookEventName: "PreToolUse"`, `permissionDecision: "allow"`, and
+//!   `updatedInput` carrying the modified tool input (see [`claude_response`]).
+//!   `updatedInput` is only honoured when `permissionDecision` is `allow`.
+//! * **Gemini CLI** (`BeforeTool`): a `{"decision":"allow","hookSpecificOutput":
+//!   {"tool_input":{…}}}` envelope — it likewise *can* rewrite (see
+//!   [`gemini_response`]).
+//! * **Cursor** (`beforeShellExecution`): CANNOT rewrite a command — only allow /
+//!   deny / ask. So burpwn can't transparently wrap there; we emit a non-blocking
+//!   allow + an `agentMessage` nudge instead (advisory capture, see
+//!   [`cursor_response`]). Cline is rules-text only and uses the legacy echo.
+//!
+//! When no rewrite is warranted (command excluded, already wrapped, or no command
+//! field present), we emit **nothing** and exit 0 — the documented "allow normal
+//! flow unchanged" no-op. This module never blocks a command (it never exits 2).
 //!
 //! The rewrite *decision* ([`should_wrap`]) and the rewrite *string*
 //! ([`rewrite_command`]) come from `burpwn-wrap`; this module only wires up the
 //! per-agent stdin/stdout JSON dialects.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use burpwn_wrap::{rewrite_command, should_wrap, WrapConfig};
+use burpwn_wrap::{rewrite_command, should_wrap, Agent, WrapConfig};
 
-/// Process one tool-input JSON document, returning the JSON to emit on stdout.
-///
-/// Recognised command locations (first hit wins):
-/// - `.tool_input.command` (Claude Code Bash PreToolUse)
-/// - `.params.command` / `.command` (generic / shell)
-///
-/// When found and `should_wrap` is true, the command string is replaced in place
-/// with `burpwn exec -- sh -c '<cmd>'`. Everything else is echoed unchanged.
+/// Process one tool-input JSON document with no agent dialect — the legacy
+/// shape-detecting echo path (used by the generic fallback and tests).
 pub fn process(input: &str, cfg: &WrapConfig) -> String {
     process_for(None, input, cfg)
 }
 
-/// Like [`process`] but with the originating `agent` slug (as passed by the
-/// installed hook via `burpwn wrap-hook --agent <slug>`). The command field is
-/// detected by shape, which covers every supported agent, so `agent` is
-/// currently advisory — it is accepted so the installed hooks invoke this binary
-/// successfully and stays available for future per-agent output dialects.
-pub fn process_for(_agent: Option<&str>, input: &str, cfg: &WrapConfig) -> String {
-    let Ok(mut v) = serde_json::from_str::<Value>(input) else {
-        // Not JSON we understand — pass through verbatim.
-        return input.to_string();
+/// Process a tool-input document for a specific `agent` slug (as passed by the
+/// installed hook via `burpwn wrap-hook --agent <slug>`), emitting that agent's
+/// hook-response dialect on stdout.
+///
+/// * Claude Code / Copilot → the `PreToolUse` `hookSpecificOutput` envelope.
+/// * Any other / unknown / no agent → the legacy shape-detecting in-place echo.
+pub fn process_for(agent: Option<&str>, input: &str, cfg: &WrapConfig) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(input) else {
+        // Not JSON we understand. For a known programmatic-hook agent the safe
+        // no-op is empty stdout (allow normal flow); for the legacy path we keep
+        // the verbatim pass-through.
+        return match agent.and_then(Agent::from_slug) {
+            Some(Agent::ClaudeCode | Agent::Copilot) => String::new(),
+            _ => input.to_string(),
+        };
     };
+
+    match agent.and_then(Agent::from_slug) {
+        Some(Agent::ClaudeCode | Agent::Copilot) => claude_response(&v, cfg),
+        Some(Agent::Gemini) => gemini_response(&v, cfg),
+        Some(Agent::Cursor) => cursor_response(&v, cfg),
+        // Cline (rules-text, no programmatic hook) / unknown / none: legacy
+        // in-place echo.
+        _ => legacy_echo(v, cfg),
+    }
+}
+
+/// Build the Claude-Code / Copilot `PreToolUse` response.
+///
+/// Emits, only when a rewrite is warranted:
+/// ```json
+/// { "hookSpecificOutput": {
+///     "hookEventName": "PreToolUse",
+///     "permissionDecision": "allow",
+///     "updatedInput": { …original tool_input with `command` replaced… } } }
+/// ```
+/// `updatedInput` is the FULL original `tool_input` object with only `command`
+/// swapped, so sibling fields (`description`, `timeout`, …) are preserved. When
+/// no rewrite is warranted we return an empty string → no stdout → the tool runs
+/// unmodified (the documented allow-normal-flow no-op).
+fn claude_response(v: &Value, cfg: &WrapConfig) -> String {
+    let Some(new_cmd) = rewritten_command_at(v, "/tool_input/command", cfg) else {
+        return String::new();
+    };
+    let mut updated = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+    // `tool_input` is an object for the Bash tool; guard defensively.
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert("command".to_string(), Value::String(new_cmd));
+    } else {
+        updated = json!({ "command": new_cmd });
+    }
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated,
+        }
+    })
+    .to_string()
+}
+
+/// Build the Gemini CLI `BeforeTool` (`run_shell_command`) response.
+///
+/// Gemini *can* rewrite the command: it honours
+/// ```json
+/// { "decision": "allow",
+///   "hookSpecificOutput": { "tool_input": { "command": "…" } } }
+/// ```
+/// where `tool_input` replaces the original. We send the full original
+/// `tool_input` with `command` swapped (preserving sibling fields). No rewrite →
+/// empty stdout → Gemini runs the command unmodified.
+///
+/// Confidence: based on the documented Gemini hook contract; if the exact shape
+/// drifts, the failure mode is fail-SAFE — Gemini ignores an unrecognised body
+/// and runs the original command (no capture), never a hard block.
+fn gemini_response(v: &Value, cfg: &WrapConfig) -> String {
+    let Some(new_cmd) = rewritten_command_at(v, "/tool_input/command", cfg) else {
+        return String::new();
+    };
+    let mut updated = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+    if let Some(obj) = updated.as_object_mut() {
+        obj.insert("command".to_string(), Value::String(new_cmd));
+    } else {
+        updated = json!({ "command": new_cmd });
+    }
+    json!({
+        "decision": "allow",
+        "hookSpecificOutput": { "tool_input": updated },
+    })
+    .to_string()
+}
+
+/// Build the Cursor `beforeShellExecution` response.
+///
+/// IMPORTANT: Cursor's `beforeShellExecution` hook CANNOT rewrite the command —
+/// it only allows / denies / asks. So burpwn cannot transparently wrap commands
+/// under Cursor the way it does for Claude Code / Gemini. We therefore emit a
+/// non-blocking *allow* with an `agentMessage` nudge so the operator/agent re-runs
+/// network commands through `burpwn exec` themselves (the standing SKILL.md rule).
+/// We never deny: a hard block on every shell command would be far worse than an
+/// un-captured one. Cursor capture is thus advisory (model-followed), like Cline.
+///
+/// The nudge is emitted only when a wrap WOULD have been warranted (network-ish
+/// command, not excluded, not already wrapped); otherwise empty stdout (clean
+/// allow, no message).
+fn cursor_response(v: &Value, cfg: &WrapConfig) -> String {
+    // Cursor sends the command at the top level (`.command`).
+    if rewritten_command_at(v, "/command", cfg).is_none() {
+        return String::new();
+    }
+    json!({
+        "continue": true,
+        "permission": "allow",
+        "agentMessage": "burpwn: Cursor cannot auto-wrap commands. Re-run network \
+    commands through `burpwn exec -- sh -c '<command>'` so their traffic is captured.",
+    })
+    .to_string()
+}
+
+/// Legacy shape-detecting echo: rewrite the first known command field in place
+/// and echo the whole (possibly-rewritten) document. Used by the generic
+/// fallback and by agents whose dedicated envelope is not yet wired.
+fn legacy_echo(mut v: Value, cfg: &WrapConfig) -> String {
     rewrite_in_place(&mut v, cfg);
-    serde_json::to_string(&v).unwrap_or_else(|_| input.to_string())
+    serde_json::to_string(&v).unwrap_or_default()
+}
+
+/// Find a command string at JSON pointer `ptr`, and return its `burpwn exec`
+/// rewrite iff one is warranted (parses as a string, not already wrapped, and
+/// [`should_wrap`]). `None` means "leave it alone".
+fn rewritten_command_at(v: &Value, ptr: &str, cfg: &WrapConfig) -> Option<String> {
+    let cmd = v.pointer(ptr)?.as_str()?;
+    if already_wrapped(cmd) {
+        return None;
+    }
+    should_wrap(cmd, cfg).then(|| rewrite_command(cmd))
 }
 
 /// Locate a command field and rewrite it. Returns whether a rewrite happened.
@@ -206,16 +344,144 @@ mod tests {
         );
     }
 
+    // --- Claude Code / Copilot PreToolUse envelope ------------------------
+
     #[test]
-    fn process_for_accepts_an_agent_slug() {
+    fn claude_code_emits_pretooluse_envelope_with_updated_input() {
+        // The crux of the "PreTool install doesn't work" bug: Claude Code only
+        // applies a rewrite if the hook emits the `hookSpecificOutput` envelope
+        // with `permissionDecision: allow` + `updatedInput`. A raw echo is
+        // ignored and the ORIGINAL command runs (no capture).
         let cfg = WrapConfig::default();
-        let input = json!({ "tool_input": { "command": "nmap t" } }).to_string();
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "curl https://target", "description": "fetch" }
+        })
+        .to_string();
         let out: Value =
             serde_json::from_str(&process_for(Some("claude-code"), &input, &cfg)).unwrap();
+        let hso = &out["hookSpecificOutput"];
+        assert_eq!(hso["hookEventName"], "PreToolUse");
+        assert_eq!(hso["permissionDecision"], "allow");
         assert_eq!(
-            out["tool_input"]["command"],
+            hso["updatedInput"]["command"],
+            "burpwn exec -- sh -c 'curl https://target'"
+        );
+        // sibling fields of tool_input survive the rewrite
+        assert_eq!(hso["updatedInput"]["description"], "fetch");
+        // the raw tool_input must NOT be echoed at top level
+        assert!(out.get("tool_input").is_none());
+    }
+
+    #[test]
+    fn copilot_uses_same_pretooluse_envelope() {
+        let cfg = WrapConfig::default();
+        let input = json!({ "tool_input": { "command": "nmap t" } }).to_string();
+        let out: Value = serde_json::from_str(&process_for(Some("copilot"), &input, &cfg)).unwrap();
+        assert_eq!(
+            out["hookSpecificOutput"]["updatedInput"]["command"],
             "burpwn exec -- sh -c 'nmap t'"
         );
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "allow");
+    }
+
+    #[test]
+    fn claude_no_rewrite_emits_empty_noop() {
+        let cfg = WrapConfig::default();
+        // already wrapped → no-op (empty stdout = allow normal flow)
+        let wrapped =
+            json!({ "tool_input": { "command": "burpwn exec -- sh -c 'id'" } }).to_string();
+        assert_eq!(process_for(Some("claude-code"), &wrapped, &cfg), "");
+        // excluded command → no-op
+        let cfg_excl = WrapConfig {
+            exclude_commands: vec!["git".into()],
+        };
+        let git = json!({ "tool_input": { "command": "git push" } }).to_string();
+        assert_eq!(process_for(Some("claude-code"), &git, &cfg_excl), "");
+        // no command field → no-op
+        let nocmd = json!({ "tool_input": { "description": "x" } }).to_string();
+        assert_eq!(process_for(Some("claude-code"), &nocmd, &cfg), "");
+        // unparseable stdin for a Claude hook → empty no-op (never block)
+        assert_eq!(process_for(Some("claude-code"), "not json {", &cfg), "");
+    }
+
+    #[test]
+    fn unknown_agent_falls_back_to_legacy_echo() {
+        let cfg = WrapConfig::default();
+        let input = json!({ "tool_input": { "command": "nmap t" } }).to_string();
+        // Cline (rules-text) and unknown slugs keep the in-place echo behaviour.
+        for slug in ["cline", "totally-unknown"] {
+            let out: Value = serde_json::from_str(&process_for(Some(slug), &input, &cfg)).unwrap();
+            assert_eq!(
+                out["tool_input"]["command"], "burpwn exec -- sh -c 'nmap t'",
+                "slug {slug}"
+            );
+        }
+    }
+
+    // --- Gemini BeforeTool envelope ---------------------------------------
+
+    #[test]
+    fn gemini_emits_decision_allow_with_modified_tool_input() {
+        let cfg = WrapConfig::default();
+        let input = json!({
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": "curl https://target", "description": "x" }
+        })
+        .to_string();
+        let out: Value = serde_json::from_str(&process_for(Some("gemini"), &input, &cfg)).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(
+            out["hookSpecificOutput"]["tool_input"]["command"],
+            "burpwn exec -- sh -c 'curl https://target'"
+        );
+        // sibling fields preserved
+        assert_eq!(out["hookSpecificOutput"]["tool_input"]["description"], "x");
+    }
+
+    #[test]
+    fn gemini_no_rewrite_is_empty_noop() {
+        let cfg = WrapConfig::default();
+        let wrapped =
+            json!({ "tool_input": { "command": "burpwn exec -- sh -c 'id'" } }).to_string();
+        assert_eq!(process_for(Some("gemini"), &wrapped, &cfg), "");
+    }
+
+    // --- Cursor beforeShellExecution (cannot rewrite) ---------------------
+
+    #[test]
+    fn cursor_emits_non_blocking_allow_with_nudge() {
+        // Cursor can't rewrite, so we never deny — we allow + nudge. The command
+        // lives at the top level `.command` in Cursor's stdin schema.
+        let cfg = WrapConfig::default();
+        let input = json!({
+            "hook_event_name": "beforeShellExecution",
+            "command": "curl https://target"
+        })
+        .to_string();
+        let out: Value = serde_json::from_str(&process_for(Some("cursor"), &input, &cfg)).unwrap();
+        assert_eq!(out["continue"], true);
+        assert_eq!(out["permission"], "allow");
+        assert!(out["agentMessage"]
+            .as_str()
+            .unwrap()
+            .contains("burpwn exec"));
+        // crucially: never a deny
+        assert_ne!(out["permission"], "deny");
+    }
+
+    #[test]
+    fn cursor_no_nudge_when_already_wrapped_or_excluded() {
+        let cfg = WrapConfig::default();
+        let wrapped = json!({ "command": "burpwn exec -- sh -c 'id'" }).to_string();
+        assert_eq!(process_for(Some("cursor"), &wrapped, &cfg), "");
+        let cfg_excl = WrapConfig {
+            exclude_commands: vec!["git".into()],
+        };
+        let git = json!({ "command": "git status" }).to_string();
+        assert_eq!(process_for(Some("cursor"), &git, &cfg_excl), "");
     }
 
     #[test]

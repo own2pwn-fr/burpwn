@@ -227,7 +227,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "burpwn"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "burpwn-cli",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "burpwn-proxy",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-proxy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-sandbox"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "r2d2",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-tls"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "burpwn-wrap"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "directories",
