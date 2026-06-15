@@ -28,8 +28,11 @@ configs:
 
 An instruction-tuning dataset that teaches an LLM to operate
 [`burpwn`](https://github.com/own2pwn/burpwn) — a transparent intercepting
-proxy and rootless sandbox for AI-driven web pentesting on Linux — both from the
-**shell CLI** and over the **MCP** (Model Context Protocol) tool interface.
+proxy and rootless sandbox for AI-driven web pentesting on Linux — across three
+interfaces: instruction-style **CLI** prose, real **`Bash` tool calls** (how an
+agent actually runs burpwn from a CLI session / under the PreToolUse hook), and
+the **MCP** (Model Context Protocol) tool interface. Roughly half the records are
+genuine **multi-turn** conversations.
 
 `burpwn exec -- <cmd>` runs a command inside a user+network namespace whose
 entire network egress is forced through burpwn's MITM proxy; every
@@ -48,10 +51,13 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-~2.6k deduplicated examples, roughly 62% `cli` / 38% `mcp`. The split is a
-deterministic, **style-stratified** 95/5 split (both `cli` and `mcp` appear in
-each split). Sizes are tunable — see *(Re)generate* — and the generator asserts
-zero near-duplicates.
+~1.5k deduplicated examples by default (`514 cli`, `299 mcp`, `655 shell`), of
+which **~50% are multi-turn**. The split is a deterministic, **style-stratified**
+95/5 split (all three styles appear in each split). The default emitted set is
+balanced to ~50% multi-turn by deterministically subsampling single-turn records;
+the **full corpus is ~3.3k examples** (`python generate.py --multiturn-frac 0`).
+Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
+the generator asserts zero near-duplicates.
 
 ## Files
 
@@ -72,10 +78,10 @@ One JSON object per line. Common keys:
 
 ```jsonc
 {
-  "schema_version": "2.0",
-  "style": "cli" | "mcp",     // which interface the example teaches
-  "tags": ["..."],            // non-empty list of topic labels (filtering/curation)
-  "messages": [ ... ]         // OpenAI-style chat turns (see below)
+  "schema_version": "2.1",
+  "style": "cli" | "shell" | "mcp",  // which interface the example teaches
+  "tags": ["..."],                   // non-empty list of topic labels (filtering/curation)
+  "messages": [ ... ]                // OpenAI-style chat turns (see below)
 }
 ```
 
@@ -89,7 +95,7 @@ output where useful.
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "style": "cli",
   "tags": ["req", "replay", "authz"],
   "messages": [
@@ -100,11 +106,49 @@ output where useful.
 }
 ```
 
+### `style: "shell"` — real `Bash` tool calls
+
+How an agent actually drives burpwn from a CLI session: the assistant emits a
+structured **`Bash`** tool call whose `command` runs burpwn (e.g. `burpwn exec --
+curl …`, `burpwn --json req list …`), the `tool` turn carries the command's **raw
+stdout**, and the assistant interprets it. This is exactly the surface Claude
+Code's PreToolUse hook rewrites. Most `shell` records are multi-turn.
+
+* The `assistant` tool-call turn's `tool_calls` array has exactly one call:
+  `{"id","type":"function","function":{"name":"Bash","arguments":"{\"command\": …}"}}`
+  (`arguments` is a JSON-encoded string).
+* The `tool` turn carries `tool_call_id`, `name:"Bash"`, and `content` = the
+  command's raw stdout **as a string** (a bare JSON array for `req list`, a
+  `{ok,data,error}` envelope for other `--json` commands, raw text otherwise — and
+  it may be empty, e.g. for `export har -o file`).
+* Conversations are one or more **exchanges** — each a `user` turn followed by one
+  or more `assistant(tool_calls) → tool → assistant(interp)` rounds — so a record
+  can be single- or multi-turn.
+
+```json
+{
+  "schema_version": "2.1",
+  "style": "shell",
+  "tags": ["shell", "exec", "recon", "curl", "restapi"],
+  "messages": [
+    {"role": "system", "content": "You are a web-application penetration-testing assistant that drives burpwn from a shell ..."},
+    {"role": "user", "content": "Fetch the api.shopwave.io homepage through burpwn so it gets captured."},
+    {"role": "assistant", "content": "Running curl inside the sandbox ...", "tool_calls": [
+      {"id": "call_1", "type": "function",
+       "function": {"name": "Bash", "arguments": "{\"command\": \"burpwn exec -- curl -s https://api.shopwave.io/\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "Bash",
+     "content": "{\"service\":\"api.shopwave.io\",\"version\":\"1.4.2\", ...}"},
+    {"role": "assistant", "content": "That returned the landing page; the GET (plus its DNS lookups) are now in the store ..."}
+  ]
+}
+```
+
 ### `style: "mcp"` — tool-calling
 
 `system → user`, then one or more **`assistant(tool_calls) → tool(result) →
 assistant(final)`** triples (multi-step tool chains), using the
-OpenAI-compatible tool-call shape.
+OpenAI-compatible tool-call shape. Multi-turn MCP conversations (several `user`
+turns, each driving tool rounds) follow the same grammar as `shell`.
 
 * The `assistant` tool-call turn's `tool_calls` array contains exactly one call:
   `{"id", "type":"function", "function":{"name", "arguments"}}` where
@@ -115,7 +159,7 @@ OpenAI-compatible tool-call shape.
 
 ```json
 {
-  "schema_version": "2.0",
+  "schema_version": "2.1",
   "style": "mcp",
   "tags": ["mcp", "req_list", "filter"],
   "messages": [
@@ -190,6 +234,13 @@ flags and phrasings, then deduplicated):
 * **Live interception**: enable → await → forward/drop, body/header tamper.
 * **Match/replace**: auth-header injection, scoped response rewrites, host/url.
 * **Tag/note/export (HAR)**, CLI-vs-MCP guidance.
+* **`Bash` tool-call (style `shell`)**: single-turn recon (`exec` a tool, read
+  stdout, point at the capture) and **multi-turn engagements** — session → recon →
+  `req list` → `req show` → tag/note/export — plus multi-turn vuln workflows
+  (IDOR/BOLA, SQLi, reflected XSS, broken authz, SSRF, open-redirect,
+  path-traversal, JWT `alg:none`) driven entirely through real `Bash` tool calls.
+* **Multi-turn MCP conversations**: several user turns over the MCP tools
+  (orientation → search → show, probe → inspect → tag).
 * **Negatives/recovery**: pcap unimplemented, match-replace rm unsupported, DNS
   works, cert pinning → tls-passthru, agent LLM traffic never captured,
   missing-flow / FK errors, await timeout, daemon-not-running guidance.
@@ -198,11 +249,18 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                 # writes dataset.jsonl + train/validation splits
-python generate.py --target 3000   # aim for ~N examples (style-balanced subsample)
-python generate.py --seed 7        # change the deterministic RNG seed
+python generate.py                     # writes dataset.jsonl + splits (~50% multi-turn by default)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (~3.3k records)
+python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
+python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
+python generate.py --seed 7            # change the deterministic RNG seed
 python generate.py --stdout > out.jsonl
 ```
+
+`--multiturn-frac F` balances the emitted set to ~F multi-turn conversations by
+deterministically subsampling single-turn records (it never drops multi-turn, and
+keeps the per-style mix); the families remain the source of truth, so the full
+single-turn corpus is always one flag (`--multiturn-frac 0`) away.
 
 The generator is deterministic (no network, stdlib only, fixed default seed) so
 regeneration is **byte-identical** and the diff is reviewable.
@@ -217,17 +275,20 @@ python generate.py --stdout | python generate.py --validate -
 ```
 
 Checks: valid JSON per line; `schema_version`/`style`/`tags`; role ordering
-(`cli` = alternating user/assistant ending assistant; `mcp` =
-assistant(tool_calls)/tool/assistant triples); single, **known** MCP tool name
-per call with JSON-parseable `arguments` and matching `tool_call_id`/`name`;
-only known burpwn subcommands/flags appear in emitted commands; and **no
+(`cli` = alternating user/assistant ending assistant; `mcp`/`shell` = one or more
+exchanges of `user` then `assistant(tool_calls) → tool → assistant(interp)`
+rounds, single tool call per round, matching `tool_call_id`/`name`, JSON-parseable
+`arguments`); `shell` calls target the `Bash` tool with a non-empty `command`;
+`mcp` calls target a **known** MCP tool with a JSON-encoded tool result; only
+known burpwn subcommands/flags appear in emitted commands; and **no
 near-duplicates** (normalized-content hash). Exit code is non-zero on any
 problem.
 
 ## Intended use (SFT for tool-use)
 
 Standard chat-format SFT, **train-on-responses-only** (mask everything but the
-assistant turns). Both `cli` and `mcp` records use the OpenAI `messages` shape,
+assistant turns). All three styles (`cli`, `shell`, `mcp`) use the OpenAI
+`messages` shape — `shell` and `mcp` carry native `tool_calls`/`tool` turns —
 which most trainers ingest directly:
 
 * **LLaMA-Factory** (recommended; see `finetune/`): register with
@@ -236,7 +297,8 @@ which most trainers ingest directly:
 * **TRL `SFTTrainer`** / **Axolotl**: map `messages` to the chat template and
   enable completion-only / response masking.
 
-Filter or weight by `style` and `tags` to balance CLI vs MCP or focus a run.
+Filter or weight by `style` (`cli`/`shell`/`mcp`) and `tags` to balance the
+interfaces, emphasize tool-calling, or focus a run.
 
 ## Upload to the Hugging Face Hub
 

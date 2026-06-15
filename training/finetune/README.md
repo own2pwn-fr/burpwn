@@ -85,6 +85,10 @@ dataset this size — watch validation loss for overfit), and `lora_rank` (8–3
      → expect `burpwn exec -- curl -s https://juice-shop.local/`.
    * *CLI negative:* "Export the session as a pcap." → expect it to explain pcap
      is unimplemented and steer to `burpwn export har`.
+   * *Shell (Bash tool call):* "Start testing api.shopwave.io: create a session and
+     hit the login endpoint." → expect a `Bash` tool call running
+     `burpwn --json session new --name …` then `burpwn exec -- curl …`, and a
+     follow-up turn that lists/inspects the captured flow.
    * *MCP:* "List successful GET requests to api.shopwave.io." → expect a
      `req_list` tool call with `{"host":"api.shopwave.io","method":"GET","status":200}`.
    * *MCP multi-step:* "Enable interception, grab the next checkout request, bump
