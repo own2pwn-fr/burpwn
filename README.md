@@ -80,9 +80,35 @@ cargo test               # the privileged rootless-sandbox test is #[ignore]d
 
 ## Agent integration
 
-`burpwn init` installs an rtk-style command-rewrite hook so every shell command your agent runs is
-transparently routed through `burpwn exec` (captured + decrypted), while the agent's own LLM traffic
-is never touched. There is also an MCP server and a ready-made agent skill:
+There are two integration layers. The **skill** is the recommended default; the **hook** is an
+explicit opt-in. They are not meant to be stacked.
+
+### Skill (recommended)
+
+The bundled agent skill ([`skills/burpwn/`](./skills/burpwn)) teaches the agent the workflow:
+create a named session first, then route **target-facing** network commands through
+`burpwn exec`, and query/replay/intercept the captures. It is *selective* (only the commands that
+touch the target are sandboxed) and *session-aware* — no surprise sandboxing of `ls`/`git`/builds,
+and no captures landing in an unnamed default session.
+
+On Claude Code this repo is a **plugin marketplace**, so the skill installs in one step (the
+`burpwn` binary must already be on `PATH`):
+
+```sh
+# in Claude Code:
+/plugin marketplace add own2pwn-fr/burpwn
+/plugin install burpwn@burpwn
+```
+
+For other agents, copy the skill dir into your agent's skills folder, e.g.
+`cp -r skills/burpwn ~/.claude/skills/`.
+
+### Hook (opt-in: enforced auto-capture)
+
+`burpwn init` installs an rtk-style command-rewrite hook so **every** shell command is auto-routed
+through `burpwn exec`. This guarantees capture even if the model forgets to wrap a command — but it
+sandboxes *all* commands (not just network ones) and does not create a session for you (captures go
+to the active/default session). Use it only when you want enforced capture and accept that trade-off.
 
 ```sh
 burpwn init --agent claude   # Claude Code / Copilot PreToolUse hook (also: cursor, gemini, cline)
@@ -90,8 +116,14 @@ burpwn init --global         # generic shell hook — works for any agent
 burpwn mcp                   # MCP server over stdio (session/exec/req/intercept tools)
 ```
 
-The bundled agent skill lives in [`skills/burpwn/`](./skills/burpwn) — copy it into
-`~/.claude/skills/` (or your agent's skills dir) to teach an agent the workflow.
+Hook support differs by what each agent's hook API allows:
+
+| Agent | Mechanism | Auto-rewrites commands? |
+|-------|-----------|-------------------------|
+| Claude Code / Copilot | `PreToolUse` (`updatedInput`) | **Yes** — transparent |
+| Gemini CLI | `BeforeTool` (`hookSpecificOutput.tool_input`) | **Yes** — transparent |
+| Cursor | `beforeShellExecution` | No — its hook can only allow/deny, so burpwn emits a non-blocking nudge; rely on the skill rule to prefix `burpwn exec` |
+| Cline / Roo | `.clinerules` text | No — advisory (model-followed) |
 
 ## License
 

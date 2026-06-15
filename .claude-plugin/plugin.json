@@ -1,0 +1,13 @@
+{
+  "name": "burpwn",
+  "description": "AI-driven intercepting proxy + rootless execution sandbox for web pentesting. Installs the burpwn skill, which teaches the agent to create a session and route target-facing network commands through `burpwn exec` so their traffic is captured, MITM-decrypted, searchable, replayable, and live-interceptable. Requires the `burpwn` binary on PATH. (The enforced PreToolUse auto-capture hook is a separate opt-in via `burpwn init`.)",
+  "version": "0.1.2",
+  "author": {
+    "name": "own2pwn",
+    "email": "contact@own2pwn.fr"
+  },
+  "homepage": "https://github.com/own2pwn-fr/burpwn",
+  "repository": "https://github.com/own2pwn-fr/burpwn",
+  "license": "see LICENSE",
+  "keywords": ["pentest", "security", "proxy", "mitm", "intercept", "burp"]
+}
