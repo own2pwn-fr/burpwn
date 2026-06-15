@@ -50,7 +50,18 @@ def _resolve_token(explicit: str | None) -> str | None:
     for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"):
         if os.environ.get(var):
             return os.environ[var]
-    # Fall back to a cached login, if any.
+    # Fall back to a cached login, if any. huggingface_hub >= 1.0 exposes
+    # `get_token()`; older versions only had `HfFolder.get_token()`. Try both so
+    # the cached `hf auth login` / `huggingface-cli login` token is picked up
+    # across hub versions.
+    try:
+        from huggingface_hub import get_token
+
+        tok = get_token()
+        if tok:
+            return tok
+    except Exception:
+        pass
     try:
         from huggingface_hub import HfFolder
 
