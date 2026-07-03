@@ -1,8 +1,14 @@
-# burpwn
+<p align="center">
+  <img src="assets/logo.png" alt="burpwn" width="440">
+</p>
 
-[![CI](https://github.com/own2pwn-fr/burpwn/actions/workflows/ci.yml/badge.svg)](https://github.com/own2pwn-fr/burpwn/actions/workflows/ci.yml)
+<p align="center">
+  <a href="https://github.com/own2pwn-fr/burpwn/actions/workflows/ci.yml"><img src="https://github.com/own2pwn-fr/burpwn/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
 
-**A transparent intercepting proxy + execution sandbox + agent interface for AI-driven web pentesting.**
+<p align="center">
+  <b>A transparent intercepting proxy + execution sandbox + agent interface for AI-driven web pentesting.</b>
+</p>
 
 burpwn is to an AI agent what Burp Suite is to a human pentester. It runs every command an agent
 executes inside a rootless Linux sandbox whose **entire** network (HTTP/HTTPS/DNS/TCP) is forced
