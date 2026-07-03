@@ -120,7 +120,12 @@ def _parse_help(text: str) -> tuple[list[str], set[str]]:
                 if name not in META_SUBCOMMANDS:
                     commands.append(name)
         elif section == "options":
-            for tok in _FLAG_RE.findall(line):
+            # Only scan the flag/value column — the part before the 2+-space gap
+            # that separates it from the description. Clap example text in a
+            # description (e.g. `curl -s https://… -d user=…`) can otherwise be
+            # mis-harvested as real `-s`/`-d` flags.
+            column = re.split(r"\s{2,}", line, maxsplit=1)[0]
+            for tok in _FLAG_RE.findall(column):
                 flags.add(tok)
     return commands, flags
 
@@ -224,9 +229,9 @@ def _enum_variants(src: str, enum_name: str) -> list[tuple[str, bool]]:
 
 # Action enums whose kebab variants are subcommand tokens.
 _ACTION_ENUMS = [
-    "CaAction", "SessionAction", "ReqAction", "InterceptAction",
-    "MatchReplaceAction", "WorkspaceAction", "TagAction", "NoteAction",
-    "ExportAction",
+    "CaAction", "SessionAction", "SessionAuthAction", "FuzzAction",
+    "ReqAction", "InterceptAction", "MatchReplaceAction", "WorkspaceAction",
+    "TagAction", "NoteAction", "ExportAction",
 ]
 
 

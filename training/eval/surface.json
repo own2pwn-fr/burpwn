@@ -2,43 +2,65 @@
   "cli": {
     "flags": [
       "--agent",
+      "--check",
+      "--clear",
+      "--concurrency",
+      "--delay",
+      "--extract",
+      "--flow",
       "--global",
+      "--header",
       "--help",
       "--host",
       "--json",
       "--limit",
+      "--login",
+      "--marker",
       "--method",
+      "--mode",
       "--name",
       "--offset",
       "--on",
       "--output",
+      "--path",
+      "--payload",
+      "--payloads",
       "--port",
+      "--position",
       "--protocol",
       "--raw",
+      "--request",
       "--session",
       "--set-body",
       "--set-header",
+      "--sort",
       "--status",
       "--timeout",
       "--version",
+      "--what",
       "--workspace",
       "-V",
       "-g",
       "-h",
       "-o"
     ],
-    "provenance": "binary:/home/me/.local/bin/burpwn",
+    "provenance": "source:crates/burpwn-cli/src/cli.rs",
     "subcommands": [
       "add",
+      "auth",
       "await",
       "ca",
+      "compare",
+      "decode",
       "disable",
       "doctor",
       "drop",
       "enable",
+      "encode",
       "exec",
       "export",
       "forward",
+      "fuzz",
       "har",
       "init",
       "intercept",
@@ -47,12 +69,18 @@
       "new",
       "note",
       "pcap",
+      "refresh",
       "replay",
       "req",
       "rm",
+      "run",
+      "scope",
       "search",
       "session",
+      "set",
       "show",
+      "stats",
+      "status",
       "tag",
       "use",
       "workspace"
@@ -63,10 +91,37 @@
       "await_intercept": [
         "timeout_secs"
       ],
+      "compare": [
+        "flow_a",
+        "flow_b",
+        "what"
+      ],
+      "encode": [
+        "scheme",
+        "value"
+      ],
       "exec": [
         "argv",
         "workspace",
         "timeout_secs"
+      ],
+      "fuzz": [
+        "flow",
+        "positions",
+        "payloads",
+        "mode",
+        "concurrency",
+        "delay_ms",
+        "marker",
+        "name"
+      ],
+      "fuzz_list": [
+        "workspace"
+      ],
+      "fuzz_results": [
+        "attack_id",
+        "sort",
+        "limit"
       ],
       "intercept_drop": [
         "id"
@@ -74,7 +129,15 @@
       "intercept_forward": [
         "id",
         "set_headers",
-        "set_body"
+        "set_body",
+        "method",
+        "path"
+      ],
+      "intercept_scope": [
+        "host",
+        "path",
+        "method",
+        "clear"
       ],
       "match_replace_add": [
         "scope",
@@ -97,12 +160,27 @@
         "limit",
         "offset"
       ],
+      "req_replay": [
+        "id",
+        "set_headers",
+        "set_body",
+        "method"
+      ],
       "req_search": [
         "query"
       ],
       "req_show": [
         "id",
         "raw"
+      ],
+      "session_auth_refresh": [
+        "host"
+      ],
+      "session_auth_set": [
+        "login",
+        "extract",
+        "header",
+        "host"
       ],
       "tag_add": [
         "flow_id",
@@ -117,6 +195,10 @@
     "tools": [
       "session_list",
       "session_current",
+      "session_stats",
+      "session_auth_set",
+      "session_auth_refresh",
+      "session_auth_status",
       "req_list",
       "req_show",
       "req_search",
@@ -132,8 +214,16 @@
       "intercept_list",
       "await_intercept",
       "intercept_forward",
+      "intercept_scope",
       "intercept_drop",
-      "exec"
+      "exec",
+      "req_replay",
+      "fuzz",
+      "fuzz_list",
+      "fuzz_results",
+      "compare",
+      "encode",
+      "decode"
     ]
   }
 }

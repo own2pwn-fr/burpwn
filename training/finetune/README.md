@@ -67,7 +67,7 @@ FORCE_TORCHRUN=1 NPROC_PER_NODE=4 \
 ## Expected resources (rough)
 
 * **4B LoRA**: ~16–22GB VRAM at `cutoff_len: 4096`, batch 2 × accum 8. ~1.4k
-  training examples (the 1,394-row `dataset.train.jsonl`) × 3 epochs ≈ a few
+  training examples (the 1,415-row `dataset.train.jsonl`) × 3 epochs ≈ a few
   hundred steps; **~15–40 min** on one 4090/A100.
 * **70B QLoRA**: 4-bit weights ~38–40GB; with ZeRO-3 + offload, runs on 2×80GB
   (tight) or 4×48GB. Expect **a few hours** for 3 epochs. Lower `cutoff_len` to
