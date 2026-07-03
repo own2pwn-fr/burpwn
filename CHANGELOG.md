@@ -3,6 +3,109 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-07-03
+
+This release turns burpwn from a strong capture engine into an offensive
+substrate for an AI agent: a native Intruder/fuzzer, Repeater over MCP, response
+comparison, encode/decode, session auth handling — plus the engine fixes those
+need (streaming bodies, structured WebSocket capture, TLS metadata) and the first
+executable evaluation harness for the trained model.
+
+### Added — offensive loop
+- **Intruder / `fuzz`** (`burpwn-cli` + `burpwn-mcp`): `fuzz run --flow <id>
+  [--position start:end | § markers] [--payload <p> | --payloads <file>] --mode
+  sniper|battering-ram|pitchfork|cluster-bomb [--concurrency N] [--delay MS]`
+  builds a request template from a stored flow (or `--request <file>`), runs the
+  `burpwn-proxy` attack engine through the same replay transport as `req replay`,
+  and persists an `attacks` row plus one `attack_results` row per payload. Ctrl-C
+  cancels the run. `fuzz list` / `fuzz show <id> [--sort anomaly|status|len]
+  [--limit N]` inspect stored attacks. MCP tools `fuzz`, `fuzz_list`,
+  `fuzz_results`.
+- **Repeater over MCP** (`req_replay`): the CLI `req replay` capability is now an
+  MCP tool sharing the same `replay_flow` path (closes the biggest MCP gap).
+- **`compare` / diff** (CLI + MCP): structured JSON diff of two flows —
+  status-line delta, header add/remove/change, line-based body diff, and a
+  reflection check (tokens from flow A's request echoed in flow B's response).
+  `--what headers|body|all`.
+- **`encode` / `decode`** (CLI + MCP): pure byte transforms — `base64`,
+  `base64url`, `url`, `hex`, and `jwt` (decode-only; splits header.payload.
+  signature and decodes to JSON without verifying the signature).
+- **MCP server** now exposes **26 tools** (was 19): +`req_replay`, `fuzz`,
+  `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.
+
+### Added — session robustness / integration hardening
+- **Intercept scope** (CLI `intercept scope <pattern> [--path P] [--method M]` /
+  `intercept scope --clear`; MCP `intercept_scope`): narrows blocking
+  interception to a host/path/method so not every flow parks. Wires the proxy's
+  previously-dead `InterceptController::set_scope` through a new
+  `InterceptSetScope` control-plane message. MCP `intercept_forward` now also
+  reaches CLI parity — it can change the parked request's `method`/`path`.
+- **Session auth handling** (`session auth set|refresh|status`; MCP
+  `session_auth_set`/`_refresh`/`_status`): persist a login command + a
+  one-capture-group extraction regex + a `Header: … {} …` injection template
+  (schema v4 `auth_profiles` table). `refresh` runs the login command in the
+  sandbox, extracts the token, and installs/UPDATES a single match/replace rule
+  that injects the fresh header into in-scope requests (idempotent). Best-effort
+  AUTO-refresh: the proxy's new `AuthWatcher` signals 401/403 hosts (debounced,
+  recursion-safe) and the daemon spawns a refresh.
+- **`init --check`** (`init --check [--agent <slug>]`): drives a synthetic
+  network command through each agent's `wrap-hook` path and asserts the command
+  is actually rewritten to route through `burpwn exec`. Per-agent PASS / FAIL /
+  ADVISORY (Cursor/Cline are advisory, never FAIL); exits non-zero if any
+  rewrite-capable agent fails, de-risking the best-effort envelope dialects.
+- **Capture-completeness telemetry** (schema v4 `execs` table; `session stats`,
+  MCP `session_stats`): tracks per-session exec count vs captured-flow count and
+  emits a `tracing::warn!` + a `warning` in the `exec` result when a clearly
+  network-facing command (curl/wget/…) completes with ZERO new flows (traffic
+  likely escaped capture). Conservative classifier (program-position only — no
+  false alarms on `ls`/`git`/`grep curl`).
+- **Store schema v4**: `auth_profiles` + `execs` tables (idempotent migration).
+
+### Changed — capture engine (`burpwn-proxy`)
+- **Streaming response bodies.** Bodies were buffered whole before forwarding,
+  which stalled Server-Sent Events, chunked streaming and long-poll until EOF or
+  the 120 s upstream timeout, and pinned up to 256 MiB per connection. Forwarding
+  is now hybrid: when no intercept is active and no match/replace rule targets the
+  host, upstream frames are relayed verbatim while a size-capped (8 MiB) copy is
+  tee'd to the store; the full buffer path runs only when a rule actually needs
+  the body. Streaming APIs now flow incrementally instead of hanging.
+- **Structured WebSocket capture.** Replaced the marker-in-blob hack (which
+  prepended `ws-c2s:` into the payload and capped at 256 KiB) with a real RFC 6455
+  frame parser (FIN/opcode/mask, unmasking, continuation reassembly, control
+  frames). Messages are stored structured via the new `ws_messages` table.
+- **TLS/connection metadata.** Flows now record the negotiated TLS version,
+  cipher and ALPN, plus a SHA-256 of the origin's leaf certificate.
+- **HTTP/3 deterministic downgrade.** `Alt-Svc` is stripped from responses so
+  clients don't attempt QUIC (blackholed in the sandbox) and stay on h2/h1
+  instead of hanging on the h3 handshake.
+- **gRPC visibility.** `application/grpc` length-prefixed framing is deframed for
+  the stored/searchable copy.
+
+### Changed — sandbox (`burpwn-sandbox`)
+- **Fail-fast QUIC egress.** Non-DNS UDP out of the netns egress interface is now
+  `reject`ed (was silently blackholed), so a wrapped `curl --http3` gets an
+  immediate port-unreachable and falls back to TCP instead of hanging. DNS is
+  spared; falls back to `drop` on kernels without `nf_reject`.
+- **Resource limits on wrapped commands.** `RLIMIT_AS` (8 GiB), `RLIMIT_NPROC`
+  (4096) and `RLIMIT_CPU` (3600 s) bound a fork bomb or memory hog beyond the
+  wall-clock timeout. Generous defaults, all overridable via `BURPWN_RLIMIT_*`.
+
+### Changed — storage (`burpwn-store`)
+- **Schema v3**: TLS metadata columns, the `ws_messages` table, the `attacks`/
+  `attack_results` tables for correlated fuzz runs, and `idx_flows_exec_id`
+  (exec attribution was a full scan). Request headers are now indexed in FTS
+  (searchable bearer tokens / `X-` headers), and flow queries gained
+  time-range / response-size / header-substring filters plus a raw FTS5 variant.
+
+### Added — tooling
+- **Executable eval harness** (`training/eval/`): behavioural evaluation, which
+  did not exist — the model was judged on validation loss and eyeballed prompts.
+  `harness.py` scores predictions on a held-out split (valid command, correct
+  tool, envelope shape, negative handling), with an optional `--live` grader that
+  spawns real `burpwn`/`burpwn mcp`. `surface.py --check` derives the real
+  CLI/MCP surface from the binary and fails on any drift from the dataset's
+  hand-maintained sets.
+
 ## [0.1.2] - 2026-06-15
 
 ### Fixed
