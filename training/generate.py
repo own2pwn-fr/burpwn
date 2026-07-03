@@ -92,6 +92,25 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     * ``intercept scope <pat> [--path P] [--method M] | --clear`` → {type:"Ack"}.
     * ``init --check`` → data {checks:[{agent,verdict:"pass"|"fail"|"advisory",
       detail,rewritten}], ok:<bool>}; exit code 1 if any agent fails to rewrite.
+    * ``skill install --agent <slug>|--all [--project|--global] [--print]
+      [--force]`` (0.2.0) installs the agent-workflow skill into a framework's
+      native format → data {installed:[{action:"Installed"|"AlreadyPresent",
+      agent,path}]}; ``--print`` writes nothing and streams a "# <agent> ->
+      <path>" header + the SKILL.md body to stdout. ``skill list`` → data
+      {targets:[{agent,name,format:"SkillDir"|"RulesFile"|"InstructionsAppend",
+      project_path,global_path(nullable),note}]} (slugs: claude-code, strix,
+      cursor, cline, gemini, codex, copilot, antigravity, agents). ``skill
+      uninstall --agent <slug> [--global]`` → data {removed:[{action:"Removed",
+      agent,path}]} (strips only burpwn-owned content).
+    * ``mcp register --agent <slug> [--print]`` (0.2.0) writes the burpwn stdio
+      MCP server into a host's MCP config → data {registered:[{action,agent,
+      path}]}; ``mcp register --list`` → data {hosts:[{agent,name,config,format:
+      "toml"|"json"}]} (hosts: codex, copilot, antigravity). NOTE: bare ``burpwn
+      mcp`` (no subcommand) starts the stdio server and is routed before clap;
+      only ``mcp register`` is a clap subcommand. Codex's default
+      ``workspace-write`` sandbox blocks egress, so its MCP tools need
+      ``network_access=true`` to capture anything. These are CLI-only admin
+      commands: there is no MCP-tool equivalent (``MCP_TOOL_NAMES`` unchanged).
 
   MCP tool results (the handlers wrap differently — NO {ok,data,error}, NO
   "type" tag):
@@ -243,6 +262,12 @@ KNOWN_CLI_SUBCOMMANDS = {
     "list", "show", "search", "replay", "new", "use", "rm", "run",
     "enable", "disable", "await", "forward", "drop", "scope", "add",
     "har", "pcap", "auth", "set", "refresh", "status", "stats",
+    # 0.2.0 integration surface: `skill install/list/uninstall` (skill install
+    # the agent-workflow instructions) and `mcp register` (register the stdio MCP
+    # server into a host config). Bare `mcp` starts the server and is routed
+    # before clap, so it is hidden from `--help`; `mcp`/`register` still appear in
+    # the derived surface (top-level `mcp` variant + the explicit register probe).
+    "skill", "mcp", "install", "uninstall", "register",
 }
 KNOWN_CLI_FLAGS = {
     "--json", "-g", "--global", "--agent", "--name", "--workspace",
@@ -253,6 +278,8 @@ KNOWN_CLI_FLAGS = {
     "--check", "--clear", "--concurrency", "--delay", "--extract", "--flow",
     "--header", "--login", "--marker", "--mode", "--path", "--payload",
     "--payloads", "--position", "--request", "--sort", "--what",
+    # 0.2.0 skill/mcp integration flags
+    "--all", "--force", "--print", "--project", "--list",
 }
 
 # Tools the engine commonly drives via `exec` (the sandboxed pentest tooling).
@@ -4857,6 +4884,560 @@ def fam_shell_offensive() -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# 0.2.0 integration surface: `burpwn skill install/list/uninstall` (drop the
+# agent-workflow instructions into a framework's native format) and
+# `burpwn mcp register` (write the stdio MCP server into a host's MCP config).
+# These are CLI-only administration commands (no MCP tool equivalents), so the
+# families are `cli`/`shell` style. Grounded against the real `--help`/`--json`
+# surface: skill targets {claude-code, strix, cursor, cline, gemini, codex,
+# copilot, antigravity, agents}; MCP hosts {codex, copilot, antigravity}.
+# --------------------------------------------------------------------------- #
+
+# Engagement roots used for realistic absolute install paths (varied phrasing).
+_SKILL_ROOTS = [
+    "/home/op/engagements/acme",
+    "/home/pentest/clients/shopwave",
+    "/srv/audits/fintrack",
+]
+
+
+def _skill_installed(agent: str, path: str, action: str = "Installed") -> dict[str, Any]:
+    return {"action": action, "agent": agent, "path": path}
+
+
+def fam_skill_install() -> list[dict[str, Any]]:
+    """`burpwn skill install/list/uninstall`: drop the burpwn agent-workflow
+    skill into each framework's native file/format (CLI + a couple of shell)."""
+    out: list[dict[str, Any]] = []
+    root = _SKILL_ROOTS[0]
+
+    # Per-framework single-shot installs (project scope, the default).
+    installs = [
+        ("claude-code", f"{root}/.claude/skills/burpwn/SKILL.md", "SkillDir",
+         "a native Claude Code skill directory"),
+        ("cursor", f"{root}/.cursor/rules/burpwn.mdc", "RulesFile",
+         "a Cursor project rules file (`.mdc`)"),
+        ("cline", f"{root}/.clinerules/burpwn.md", "RulesFile",
+         "a Cline project rules file"),
+    ]
+    for agent, path, fmt, blurb in installs:
+        data = {"installed": [_skill_installed(agent, path)]}
+        out.append(
+            cli_example(
+                tags=["skill", "install", "integration", agent],
+                turns=[
+                    (
+                        "user",
+                        f"Teach my {agent} agent how to use burpwn automatically in this repo.",
+                    ),
+                    (
+                        "assistant",
+                        f"Install the burpwn skill into {agent} — it writes {blurb} "
+                        f"({fmt}) so the agent always routes target traffic through "
+                        f"`burpwn exec`:\n\n```\nburpwn --json skill install --agent {agent}"
+                        "\n```\n\n```json\n" + _ok(data) + "\n```\n\n`action:\"Installed\"` — the "
+                        f"skill now lives at `{path}`. This is separate from `burpwn init` "
+                        "(the command-rewrite hook); the skill is the *instructions*, the hook "
+                        "is the *enforcement*. Re-running is idempotent (`AlreadyPresent`).",
+                    ),
+                ],
+            )
+        )
+
+    # `skill list` — discover supported frameworks (grounded full target table).
+    list_data = {
+        "targets": [
+            {"agent": "claude-code", "name": "Claude Code", "format": "SkillDir",
+             "project_path": ".claude/skills/burpwn/SKILL.md",
+             "global_path": ".claude/skills/burpwn/SKILL.md", "note": ""},
+            {"agent": "cursor", "name": "Cursor", "format": "RulesFile",
+             "project_path": ".cursor/rules/burpwn.mdc", "global_path": None,
+             "note": "Cursor has no file-based global rules; use --project"},
+            {"agent": "cline", "name": "Cline", "format": "RulesFile",
+             "project_path": ".clinerules/burpwn.md", "global_path": None, "note": ""},
+            {"agent": "gemini", "name": "Gemini CLI", "format": "InstructionsAppend",
+             "project_path": "GEMINI.md", "global_path": ".gemini/GEMINI.md", "note": ""},
+            {"agent": "codex", "name": "Codex CLI", "format": "InstructionsAppend",
+             "project_path": "AGENTS.md", "global_path": ".codex/AGENTS.md", "note": ""},
+            {"agent": "copilot", "name": "GitHub Copilot CLI", "format": "InstructionsAppend",
+             "project_path": ".github/copilot-instructions.md", "global_path": None,
+             "note": "no well-defined global instructions file; use --project"},
+        ],
+    }
+    out.append(
+        cli_example(
+            tags=["skill", "list", "integration", "frameworks"],
+            turns=[
+                ("user", "Which agents can burpwn install its skill into, and where does each go?"),
+                (
+                    "assistant",
+                    "List the supported skill targets — each row is the framework slug, its "
+                    "on-disk format and the destination path:\n\n```\nburpwn --json skill list"
+                    "\n```\n\n```json\n" + _ok(list_data) + "\n```\n\nThree formats: **SkillDir** "
+                    "(Claude Code — a real skill folder), **RulesFile** (Cursor/Cline — a project "
+                    "rules file), and **InstructionsAppend** (Gemini/Codex/Copilot — a managed "
+                    "section appended to `AGENTS.md`/`GEMINI.md`). `global_path:null` means that "
+                    "framework only supports `--project` scope. Pick one with `--agent <slug>` or "
+                    "do them all with `--all`.",
+                ),
+            ],
+        )
+    )
+
+    # `skill install --all` (project scope).
+    all_data = {
+        "installed": [
+            _skill_installed("claude-code", f"{root}/.claude/skills/burpwn/SKILL.md"),
+            _skill_installed("cursor", f"{root}/.cursor/rules/burpwn.mdc"),
+            _skill_installed("cline", f"{root}/.clinerules/burpwn.md"),
+            _skill_installed("gemini", f"{root}/GEMINI.md"),
+            _skill_installed("codex", f"{root}/AGENTS.md"),
+            _skill_installed("copilot", f"{root}/.github/copilot-instructions.md"),
+        ],
+    }
+    out.append(
+        cli_example(
+            tags=["skill", "install", "all", "integration"],
+            turns=[
+                ("user", "This repo gets opened in several different AI editors — set the burpwn "
+                 "skill up for all of them at once."),
+                (
+                    "assistant",
+                    "Install into every supported framework in one shot with `--all`:\n\n```\n"
+                    "burpwn --json skill install --all\n```\n\n```json\n" + _ok(all_data)
+                    + "\n```\n\nEach framework gets the skill in its own native format at project "
+                    "scope (cwd-relative). Any already-configured target comes back "
+                    "`AlreadyPresent` instead of `Installed`, so it's safe to re-run whenever the "
+                    "skill text is refreshed.",
+                ),
+            ],
+        )
+    )
+
+    # Global-scope install for a framework that supports it (codex).
+    global_data = {"installed": [_skill_installed("codex", "/home/op/.codex/AGENTS.md")]}
+    out.append(
+        cli_example(
+            tags=["skill", "install", "global", "codex", "integration"],
+            turns=[
+                ("user", "I want burpwn's instructions available to Codex in every project, not "
+                 "just this one."),
+                (
+                    "assistant",
+                    "Install at **global** (HOME-relative) scope with `--global` — Codex reads "
+                    "`~/.codex/AGENTS.md`:\n\n```\nburpwn --json skill install --agent codex "
+                    "--global\n```\n\n```json\n" + _ok(global_data) + "\n```\n\nNow every Codex "
+                    "session picks up the burpwn workflow. Not all frameworks have a global "
+                    "location (e.g. Cursor/Copilot are project-only — `skill list` shows "
+                    "`global_path:null` for those); for them use `--project` (the default).",
+                ),
+            ],
+        )
+    )
+
+    # `--print` dry-run preview.
+    out.append(
+        cli_example(
+            tags=["skill", "install", "print", "dry-run", "integration"],
+            turns=[
+                ("user", "Before it writes anything, show me exactly what burpwn would drop into "
+                 "my Claude Code skill file and where."),
+                (
+                    "assistant",
+                    "Use `--print` for a dry run — it resolves the destination and streams the "
+                    "content to stdout but writes **nothing**:\n\n```\nburpwn skill install "
+                    "--agent claude-code --print\n```\n\nStdout starts with a "
+                    "`# claude-code -> <path>` header line (the resolved destination) followed by "
+                    "the full `SKILL.md` body (YAML front-matter + the burpwn workflow). Nothing "
+                    "touches disk until you drop `--print`. Add `--force` if a non-burpwn file "
+                    "already occupies that path and you want to overwrite it.",
+                ),
+            ],
+        )
+    )
+
+    # Uninstall (strips only burpwn-owned content).
+    uninstall_data = {"removed": [_skill_installed("cursor", f"{root}/.cursor/rules/burpwn.mdc",
+                                                   action="Removed")]}
+    out.append(
+        cli_example(
+            tags=["skill", "uninstall", "integration", "cursor"],
+            turns=[
+                ("user", "Remove the burpwn skill from Cursor in this project."),
+                (
+                    "assistant",
+                    "```\nburpwn --json skill uninstall --agent cursor\n```\n\n```json\n"
+                    + _ok(uninstall_data) + "\n```\n\n`Removed` — for the append-style targets "
+                    "(Codex/Gemini) uninstall strips only burpwn's managed section and leaves the "
+                    "rest of your `AGENTS.md` intact; for the standalone files (Cursor/Cline/"
+                    "Claude Code) it deletes the burpwn file. Add `--global` to remove the "
+                    "HOME-scoped install instead of the project one.",
+                ),
+            ],
+        )
+    )
+
+    # Shell-style: install via the Bash tool from an agent session.
+    root2 = _SKILL_ROOTS[1]
+    out.append(
+        shell_example(
+            tags=["shell", "skill", "install", "gemini", "integration"],
+            exchanges=[
+                {
+                    "user": "Set this project up so the Gemini CLI knows to use burpwn.",
+                    "steps": [
+                        {
+                            "preamble": "Installing the burpwn skill for Gemini — it appends a "
+                            "managed section to GEMINI.md.",
+                            "command": "burpwn --json skill install --agent gemini",
+                            "result": _ok({"installed": [
+                                _skill_installed("gemini", f"{root2}/GEMINI.md")]}),
+                            "interp": "Done — burpwn's workflow is now in `GEMINI.md` "
+                            "(InstructionsAppend format). Gemini will route target traffic "
+                            "through `burpwn exec` from now on. Confirm the full target table any "
+                            "time with `burpwn skill list`.",
+                        }
+                    ],
+                }
+            ],
+        )
+    )
+    return out
+
+
+def fam_mcp_register() -> list[dict[str, Any]]:
+    """`burpwn mcp register`: write the burpwn stdio MCP server into a host's MCP
+    config (Codex/Copilot/Antigravity). Includes the Codex network_access caveat."""
+    out: list[dict[str, Any]] = []
+
+    # Codex — TOML config, plus the network_access sandbox caveat.
+    codex_data = {"registered": [_skill_installed("codex", "/home/op/.codex/config.toml")]}
+    out.append(
+        cli_example(
+            tags=["mcp", "register", "codex", "integration", "network-access"],
+            turns=[
+                ("user", "Wire burpwn up as an MCP server for my Codex CLI."),
+                (
+                    "assistant",
+                    "Register the burpwn stdio MCP server into Codex's config "
+                    "(`~/.codex/config.toml`, a `[mcp_servers.burpwn]` table):\n\n```\n"
+                    "burpwn --json mcp register --agent codex\n```\n\n```json\n" + _ok(codex_data)
+                    + "\n```\n\nCodex now launches `burpwn mcp` (stdio) and can call the 31 "
+                    "burpwn tools. **Caveat:** Codex's default `workspace-write` sandbox blocks "
+                    "outbound network, so burpwn's tools — which make network calls on your "
+                    "behalf via `exec` — need `network_access=true` in the Codex sandbox config, "
+                    "otherwise every capture attempt fails with no traffic.",
+                ),
+            ],
+        )
+    )
+
+    # Copilot — JSON config.
+    copilot_data = {"registered": [_skill_installed("copilot", "/home/op/.copilot/mcp-config.json")]}
+    out.append(
+        cli_example(
+            tags=["mcp", "register", "copilot", "integration"],
+            turns=[
+                ("user", "Add burpwn to GitHub Copilot CLI as an MCP tool server."),
+                (
+                    "assistant",
+                    "```\nburpwn --json mcp register --agent copilot\n```\n\n```json\n"
+                    + _ok(copilot_data) + "\n```\n\nThat writes a `burpwn` entry into Copilot's "
+                    "`~/.copilot/mcp-config.json` (`command: burpwn`, `args: [\"mcp\"]`). MCP host "
+                    "configs are user-level (HOME), so there's no project vs global distinction "
+                    "here — `--global` is accepted only for symmetry. Restart the Copilot session "
+                    "to pick up the new server.",
+                ),
+            ],
+        )
+    )
+
+    # `mcp register --list` — enumerate supported hosts.
+    hosts_data = {
+        "hosts": [
+            {"agent": "codex", "name": "Codex CLI", "config": ".codex/config.toml",
+             "format": "toml"},
+            {"agent": "copilot", "name": "GitHub Copilot CLI",
+             "config": ".copilot/mcp-config.json", "format": "json"},
+            {"agent": "antigravity", "name": "Antigravity",
+             "config": ".gemini/config/mcp_config.json", "format": "json"},
+        ],
+    }
+    out.append(
+        cli_example(
+            tags=["mcp", "register", "list", "hosts", "integration"],
+            turns=[
+                ("user", "Which MCP hosts can burpwn register itself into?"),
+                (
+                    "assistant",
+                    "List them with `--list` (config paths are relative to HOME):\n\n```\n"
+                    "burpwn --json mcp register --list\n```\n\n```json\n" + _ok(hosts_data)
+                    + "\n```\n\nThree hosts: **codex** (TOML, `.codex/config.toml`), **copilot** "
+                    "(JSON, `.copilot/mcp-config.json`) and **antigravity** (JSON, "
+                    "`.gemini/config/mcp_config.json`). Register into one with `--agent <slug>`. "
+                    "Note this is distinct from `burpwn skill install`: `register` wires up the "
+                    "MCP *tools*, the skill installs the *instructions*.",
+                ),
+            ],
+        )
+    )
+
+    # Shell-style register.
+    out.append(
+        shell_example(
+            tags=["shell", "mcp", "register", "antigravity", "integration"],
+            exchanges=[
+                {
+                    "user": "Register burpwn's MCP server into Antigravity from here.",
+                    "steps": [
+                        {
+                            "preamble": "Writing the burpwn stdio server into Antigravity's MCP "
+                            "config (JSON).",
+                            "command": "burpwn --json mcp register --agent antigravity",
+                            "result": _ok({"registered": [_skill_installed(
+                                "antigravity", "/home/op/.gemini/config/mcp_config.json")]}),
+                            "interp": "Registered — Antigravity now has a `burpwn` MCP server "
+                            "(`burpwn mcp` over stdio) in `~/.gemini/config/mcp_config.json`. "
+                            "Reload the host and the burpwn tools become available.",
+                        }
+                    ],
+                }
+            ],
+        )
+    )
+    return out
+
+
+def fam_integration_setup() -> list[dict[str, Any]]:
+    """Multi-turn 'set up burpwn in <framework>' flows that combine `skill
+    install` + `mcp register` (with the Codex network_access caveat)."""
+    out: list[dict[str, Any]] = []
+    root = _SKILL_ROOTS[2]
+
+    # CLI multi-turn: full Codex setup (skill + MCP + caveat).
+    out.append(
+        cli_example(
+            tags=["skill", "install", "mcp", "register", "codex", "integration", "multi-turn"],
+            turns=[
+                ("user", "I use the Codex CLI. Get me completely set up to use burpwn with it."),
+                (
+                    "assistant",
+                    "Two pieces: install the **skill** (so Codex knows the burpwn workflow) and "
+                    "register the **MCP server** (so it can call burpwn as tools). Start with the "
+                    "skill:\n\n```\nburpwn --json skill install --agent codex\n```\n\n```json\n"
+                    + _ok({"installed": [_skill_installed("codex", f"{root}/AGENTS.md")]})
+                    + "\n```\n\nThat appended burpwn's managed section to `AGENTS.md`. Next, "
+                    "register the MCP server?",
+                ),
+                ("user", "Yes, do the MCP part."),
+                (
+                    "assistant",
+                    "```\nburpwn --json mcp register --agent codex\n```\n\n```json\n"
+                    + _ok({"registered": [_skill_installed("codex", "/home/op/.codex/config.toml")]})
+                    + "\n```\n\nCodex now launches `burpwn mcp` (stdio) with the 31 burpwn tools. "
+                    "**One required tweak:** Codex's default `workspace-write` sandbox blocks "
+                    "outbound network, so burpwn's tools (they reach the target via `exec`) will "
+                    "capture nothing until you set `network_access=true` in Codex's sandbox "
+                    "config. After that, you're fully wired: instructions + tools + network.",
+                ),
+            ],
+        )
+    )
+
+    # CLI multi-turn: Claude Code — skill (SkillDir) then verify with skill list.
+    out.append(
+        cli_example(
+            tags=["skill", "install", "list", "claude-code", "integration", "multi-turn"],
+            turns=[
+                ("user", "Set up burpwn for Claude Code in this engagement folder."),
+                (
+                    "assistant",
+                    "Install the skill as a native Claude Code skill directory:\n\n```\nburpwn "
+                    "--json skill install --agent claude-code\n```\n\n```json\n"
+                    + _ok({"installed": [_skill_installed(
+                        "claude-code", f"{root}/.claude/skills/burpwn/SKILL.md")]})
+                    + "\n```\n\nThe skill is at `.claude/skills/burpwn/SKILL.md`. Claude Code "
+                    "doesn't need a separate MCP registration for the skill to work — the skill "
+                    "drives the `burpwn` CLI directly. Want me to confirm the install landed?",
+                ),
+                ("user", "Yeah, double-check it's registered."),
+                (
+                    "assistant",
+                    "```\nburpwn --json skill list\n```\n\nLook at the `claude-code` row: "
+                    "`format:\"SkillDir\"`, `project_path:\".claude/skills/burpwn/SKILL.md\"` — "
+                    "matching the file we just wrote. `skill list` only enumerates the supported "
+                    "targets and their destinations (it doesn't report install state), so the "
+                    "authoritative confirmation is that the previous `install` returned "
+                    "`action:\"Installed\"` and the file exists at that path.",
+                ),
+            ],
+        )
+    )
+
+    # CLI multi-turn: Cursor project skill, then widen to all editors.
+    out.append(
+        cli_example(
+            tags=["skill", "install", "cursor", "all", "integration", "multi-turn"],
+            turns=[
+                ("user", "Drop the burpwn skill into Cursor for this project."),
+                (
+                    "assistant",
+                    "```\nburpwn --json skill install --agent cursor\n```\n\n```json\n"
+                    + _ok({"installed": [_skill_installed(
+                        "cursor", f"{root}/.cursor/rules/burpwn.mdc")]})
+                    + "\n```\n\nCursor now has a `.cursor/rules/burpwn.mdc` rules file. Note "
+                    "Cursor is **project-only** — it has no file-based global rules, so there's "
+                    "no `--global` for it. Anything else on this box open the repo too?",
+                ),
+                ("user", "Yeah, teammates use Cline and Gemini here as well."),
+                (
+                    "assistant",
+                    "Then just install for everyone at once — `--all` covers each framework in "
+                    "its own native format:\n\n```\nburpwn --json skill install --all\n```\n\n"
+                    "Cursor comes back `AlreadyPresent` (we just did it), while Cline gets "
+                    "`.clinerules/burpwn.md` and Gemini gets its section in `GEMINI.md`. "
+                    "Idempotent, so re-running is harmless.",
+                ),
+            ],
+        )
+    )
+
+    # CLI multi-turn: Gemini global skill, verify via list.
+    out.append(
+        cli_example(
+            tags=["skill", "install", "global", "gemini", "list", "integration", "multi-turn"],
+            turns=[
+                ("user", "Make burpwn's workflow available to the Gemini CLI everywhere, not per "
+                 "project."),
+                (
+                    "assistant",
+                    "Gemini supports a global instructions file (`~/.gemini/GEMINI.md`), so install "
+                    "with `--global`:\n\n```\nburpwn --json skill install --agent gemini --global"
+                    "\n```\n\n```json\n" + _ok({"installed": [_skill_installed(
+                        "gemini", "/home/op/.gemini/GEMINI.md")]}) + "\n```\n\nEvery Gemini session "
+                    "now inherits the burpwn instructions. Want to see the full framework/scope "
+                    "table to sanity-check the path?",
+                ),
+                ("user", "Please."),
+                (
+                    "assistant",
+                    "```\nburpwn --json skill list\n```\n\nThe `gemini` row shows "
+                    "`format:\"InstructionsAppend\"`, `project_path:\"GEMINI.md\"` and "
+                    "`global_path:\".gemini/GEMINI.md\"` — the latter is exactly where we wrote. "
+                    "Rows whose `global_path` is `null` (Cursor, Cline, Copilot) can only be "
+                    "installed with `--project`.",
+                ),
+            ],
+        )
+    )
+
+    # CLI multi-turn: Antigravity — MCP register then skill.
+    out.append(
+        cli_example(
+            tags=["mcp", "register", "skill", "install", "antigravity", "integration",
+                  "multi-turn"],
+            turns=[
+                ("user", "Hook burpwn into Antigravity so it can call the tools."),
+                (
+                    "assistant",
+                    "Register the MCP server into Antigravity's host config:\n\n```\nburpwn --json "
+                    "mcp register --agent antigravity\n```\n\n```json\n"
+                    + _ok({"registered": [_skill_installed(
+                        "antigravity", "/home/op/.gemini/config/mcp_config.json")]})
+                    + "\n```\n\nAntigravity can now spawn `burpwn mcp` and call the tools. Want "
+                    "the instructions (skill) installed too so it knows *when* to use them?",
+                ),
+                ("user", "Good idea, add the skill."),
+                (
+                    "assistant",
+                    "```\nburpwn --json skill install --agent antigravity\n```\n\n```json\n"
+                    + _ok({"installed": [_skill_installed("antigravity", f"{root}/AGENTS.md")]})
+                    + "\n```\n\nAntigravity uses the generic `AGENTS.md` for instructions "
+                    "(project-only), so both halves are in place: the **skill** (workflow) and "
+                    "the **MCP registration** (tools).",
+                ),
+            ],
+        )
+    )
+
+    # Shell multi-turn: full Codex setup via Bash (skill + register + caveat).
+    out.append(
+        shell_example(
+            tags=["shell", "skill", "install", "mcp", "register", "codex", "integration",
+                  "network-access", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Set up burpwn end-to-end for my Codex CLI here.",
+                    "steps": [
+                        {
+                            "preamble": "First the skill — appends burpwn's managed section to "
+                            "AGENTS.md.",
+                            "command": "burpwn --json skill install --agent codex",
+                            "result": _ok({"installed": [_skill_installed(
+                                "codex", f"{root}/AGENTS.md")]}),
+                            "interp": "Skill installed in `AGENTS.md`. Next the MCP server.",
+                        },
+                        {
+                            "preamble": "Now register the stdio MCP server into Codex's TOML "
+                            "config.",
+                            "command": "burpwn --json mcp register --agent codex",
+                            "result": _ok({"registered": [_skill_installed(
+                                "codex", "/home/op/.codex/config.toml")]}),
+                            "interp": "Registered `[mcp_servers.burpwn]` in "
+                            "`~/.codex/config.toml`. **Important:** Codex's default "
+                            "`workspace-write` sandbox blocks outbound network, so burpwn's tools "
+                            "(which reach the target via `exec`) capture nothing until you set "
+                            "`network_access=true` in the Codex sandbox config. Set that and Codex "
+                            "is fully wired.",
+                        },
+                    ],
+                }
+            ],
+        )
+    )
+
+    # Shell multi-turn: Copilot — skill install then mcp register via Bash.
+    out.append(
+        shell_example(
+            tags=["shell", "skill", "install", "mcp", "register", "copilot",
+                  "integration", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Onboard burpwn into GitHub Copilot CLI for this repo.",
+                    "steps": [
+                        {
+                            "preamble": "Step 1: install the skill (Copilot is project-only, so "
+                            "this lands in .github/copilot-instructions.md).",
+                            "command": "burpwn --json skill install --agent copilot",
+                            "result": _ok({"installed": [_skill_installed(
+                                "copilot", f"{root}/.github/copilot-instructions.md")]}),
+                            "interp": "Skill installed at `.github/copilot-instructions.md`. Now "
+                            "the MCP server so Copilot can call burpwn as tools.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Good, now the tools.",
+                    "steps": [
+                        {
+                            "preamble": "Step 2: register the stdio MCP server into Copilot's "
+                            "user-level config.",
+                            "command": "burpwn --json mcp register --agent copilot",
+                            "result": _ok({"registered": [_skill_installed(
+                                "copilot", "/home/op/.copilot/mcp-config.json")]}),
+                            "interp": "Registered in `~/.copilot/mcp-config.json`. Copilot now has "
+                            "both the burpwn instructions (skill) and the burpwn tools (MCP). "
+                            "Restart the session and route target traffic through `burpwn exec`.",
+                        }
+                    ],
+                },
+            ],
+        )
+    )
+    return out
+
+
 # Assembly, dedup, split.
 # --------------------------------------------------------------------------- #
 
@@ -4902,6 +5483,10 @@ FAMILIES = [
     fam_mcp_offensive,
     fam_mcp_offensive_convos,
     fam_shell_offensive,
+    # 0.2.0 integration surface: skill install / mcp register.
+    fam_skill_install,
+    fam_mcp_register,
+    fam_integration_setup,
 ]
 
 

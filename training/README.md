@@ -51,12 +51,12 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-**1,489** deduplicated examples by default (`525 cli`, `306 mcp`, `658 shell`), of
+**1,500** deduplicated examples by default (`534 cli`, `307 mcp`, `659 shell`), of
 which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
-(split 1,415 train / 74 validation). The split is a deterministic,
+(split 1,425 train / 75 validation). The split is a deterministic,
 **style-stratified** 95/5 split (all three styles appear in each split). The
 default emitted set is balanced to ~50% multi-turn by deterministically
-subsampling single-turn records; the **full corpus is 3,305 examples**
+subsampling single-turn records; the **full corpus is 3,325 examples**
 (`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
@@ -246,6 +246,12 @@ flags and phrasings, then deduplicated):
   path-traversal, JWT `alg:none`) driven entirely through real `Bash` tool calls.
 * **Multi-turn MCP conversations**: several user turns over the MCP tools
   (orientation → search → show, probe → inspect → tag).
+* **Framework integration** (CLI-only admin): `skill install`/`list`/`uninstall`
+  (drop the burpwn agent-workflow skill into Claude Code, Cursor, Cline, Gemini,
+  Codex, Copilot, … in each one's native format, at `--project`/`--global` scope,
+  with `--all`/`--print`/`--force`) and `mcp register` (write the stdio MCP server
+  into Codex/Copilot/Antigravity host configs), including multi-turn "set up
+  burpwn in <framework>" flows and the Codex `network_access=true` sandbox caveat.
 * **Negatives/recovery**: pcap unimplemented, match-replace rm unsupported, DNS
   works, cert pinning → tls-passthru, agent LLM traffic never captured,
   missing-flow / FK errors, await timeout, daemon-not-running guidance.
@@ -254,8 +260,8 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (1,489 records, ~50% multi-turn)
-python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,305 records)
+python generate.py                     # writes dataset.jsonl + splits (1,500 records, ~50% multi-turn)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,325 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
 python generate.py --seed 7            # change the deterministic RNG seed

@@ -167,6 +167,20 @@ def cli_surface_from_binary(binary: str) -> dict[str, Any] | None:
             walk(path + [c])
 
     walk([])
+
+    # `burpwn mcp` (with no subcommand) starts the stdio MCP server directly and
+    # is routed in crates/burpwn/src/main.rs *before* burpwn-cli's clap tree, so
+    # `burpwn mcp --help` prints the server usage and hides the real
+    # `burpwn mcp register …` clap subcommand from the recursive walk. Probe it
+    # explicitly so the derived surface stays complete (matches the cli.rs parse).
+    if "mcp" in subcommands:
+        reg_help = _run_help(binary, ["mcp", "register"])
+        if reg_help:
+            reg_cmds, reg_flags = _parse_help(reg_help)
+            subcommands.add("register")
+            subcommands.update(reg_cmds)
+            flags.update(reg_flags)
+
     if not subcommands:
         return None
     flags.update(CLAP_BUILTIN_FLAGS)
@@ -232,6 +246,8 @@ _ACTION_ENUMS = [
     "CaAction", "SessionAction", "SessionAuthAction", "FuzzAction",
     "ReqAction", "InterceptAction", "MatchReplaceAction", "WorkspaceAction",
     "TagAction", "NoteAction", "ExportAction",
+    # 0.2.0 integration surface: `skill install/list/uninstall`, `mcp register`.
+    "SkillAction", "McpAction",
 ]
 
 
