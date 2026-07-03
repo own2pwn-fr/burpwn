@@ -1,0 +1,139 @@
+{
+  "cli": {
+    "flags": [
+      "--agent",
+      "--global",
+      "--help",
+      "--host",
+      "--json",
+      "--limit",
+      "--method",
+      "--name",
+      "--offset",
+      "--on",
+      "--output",
+      "--port",
+      "--protocol",
+      "--raw",
+      "--session",
+      "--set-body",
+      "--set-header",
+      "--status",
+      "--timeout",
+      "--version",
+      "--workspace",
+      "-V",
+      "-g",
+      "-h",
+      "-o"
+    ],
+    "provenance": "binary:/home/me/.local/bin/burpwn",
+    "subcommands": [
+      "add",
+      "await",
+      "ca",
+      "disable",
+      "doctor",
+      "drop",
+      "enable",
+      "exec",
+      "export",
+      "forward",
+      "har",
+      "init",
+      "intercept",
+      "list",
+      "match-replace",
+      "new",
+      "note",
+      "pcap",
+      "replay",
+      "req",
+      "rm",
+      "search",
+      "session",
+      "show",
+      "tag",
+      "use",
+      "workspace"
+    ]
+  },
+  "mcp": {
+    "params": {
+      "await_intercept": [
+        "timeout_secs"
+      ],
+      "exec": [
+        "argv",
+        "workspace",
+        "timeout_secs"
+      ],
+      "intercept_drop": [
+        "id"
+      ],
+      "intercept_forward": [
+        "id",
+        "set_headers",
+        "set_body"
+      ],
+      "match_replace_add": [
+        "scope",
+        "kind",
+        "pattern",
+        "replacement",
+        "on_request"
+      ],
+      "note_add": [
+        "flow_id",
+        "body"
+      ],
+      "req_list": [
+        "host",
+        "status",
+        "method",
+        "protocol",
+        "port",
+        "workspace",
+        "limit",
+        "offset"
+      ],
+      "req_search": [
+        "query"
+      ],
+      "req_show": [
+        "id",
+        "raw"
+      ],
+      "tag_add": [
+        "flow_id",
+        "name",
+        "color"
+      ],
+      "workspace_new": [
+        "name"
+      ]
+    },
+    "provenance": "source:crates/burpwn-mcp/src/server.rs",
+    "tools": [
+      "session_list",
+      "session_current",
+      "req_list",
+      "req_show",
+      "req_search",
+      "workspace_list",
+      "tag_list",
+      "match_replace_list",
+      "match_replace_add",
+      "tag_add",
+      "note_add",
+      "workspace_new",
+      "intercept_enable",
+      "intercept_disable",
+      "intercept_list",
+      "await_intercept",
+      "intercept_forward",
+      "intercept_drop",
+      "exec"
+    ]
+  }
+}

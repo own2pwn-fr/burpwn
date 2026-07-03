@@ -51,11 +51,13 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-~1.5k deduplicated examples by default (`514 cli`, `299 mcp`, `655 shell`), of
-which **~50% are multi-turn**. The split is a deterministic, **style-stratified**
-95/5 split (all three styles appear in each split). The default emitted set is
-balanced to ~50% multi-turn by deterministically subsampling single-turn records;
-the **full corpus is ~3.3k examples** (`python generate.py --multiturn-frac 0`).
+**1,468** deduplicated examples by default (`514 cli`, `299 mcp`, `655 shell`), of
+which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
+(split 1,394 train / 74 validation). The split is a deterministic,
+**style-stratified** 95/5 split (all three styles appear in each split). The
+default emitted set is balanced to ~50% multi-turn by deterministically
+subsampling single-turn records; the **full corpus is 3,271 examples**
+(`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
 
@@ -249,8 +251,8 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (~50% multi-turn by default)
-python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (~3.3k records)
+python generate.py                     # writes dataset.jsonl + splits (1,468 records, ~50% multi-turn)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,271 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
 python generate.py --seed 7            # change the deterministic RNG seed
