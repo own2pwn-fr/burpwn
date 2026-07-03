@@ -1429,7 +1429,11 @@ async fn cmd_fuzz_run(
     }
 
     // Payloads: inline --payload plus --payloads file (one per line).
-    let mut payloads: Vec<Vec<u8>> = args.payload.iter().map(|p| p.clone().into_bytes()).collect();
+    let mut payloads: Vec<Vec<u8>> = args
+        .payload
+        .iter()
+        .map(|p| p.clone().into_bytes())
+        .collect();
     if let Some(file) = &args.payloads {
         let data = std::fs::read_to_string(file)
             .map_err(|e| anyhow!("reading --payloads file failed: {}", e.kind()))?;
@@ -1482,10 +1486,7 @@ async fn cmd_fuzz_run(
             v["status"].as_str().unwrap_or("-"),
         );
         if let Some(b) = v["baseline"].as_object() {
-            println!(
-                "  baseline: status {} len {}",
-                b["status"], b["resp_len"]
-            );
+            println!("  baseline: status {} len {}", b["status"], b["resp_len"]);
         }
         let empty = Vec::new();
         for r in v["results"].as_array().unwrap_or(&empty) {

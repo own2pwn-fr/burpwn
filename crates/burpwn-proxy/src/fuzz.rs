@@ -167,7 +167,9 @@ impl Template {
         for (idx, pos) in self.positions.iter().enumerate() {
             out.extend_from_slice(&self.clean[cursor..pos.start]);
             match assignment.get(idx).copied().flatten() {
-                Some(pi) => out.extend_from_slice(payloads.get(pi).map(|v| v.as_slice()).unwrap_or(b"")),
+                Some(pi) => {
+                    out.extend_from_slice(payloads.get(pi).map(|v| v.as_slice()).unwrap_or(b""))
+                }
                 None => out.extend_from_slice(&self.originals[idx]),
             }
             cursor = pos.end;
@@ -337,13 +339,14 @@ pub async fn run_attack(
     // Baseline: the unmodified request (all positions keep their original value).
     let baseline = if n > 0 {
         let base_req = template.render(&vec![None; n], payloads);
-        measure(sender.as_ref(), &base_req).await.ok().map(|(r, ms)| {
-            BaselineStats {
+        measure(sender.as_ref(), &base_req)
+            .await
+            .ok()
+            .map(|(r, ms)| BaselineStats {
                 status: r.status,
                 resp_len: r.resp_len,
                 latency_ms: ms,
-            }
-        })
+            })
     } else {
         None
     };
@@ -431,10 +434,7 @@ pub async fn run_attack(
 }
 
 /// Send one request and time it.
-async fn measure(
-    sender: &dyn RequestSender,
-    raw: &[u8],
-) -> anyhow::Result<(SentResponse, u64)> {
+async fn measure(sender: &dyn RequestSender, raw: &[u8]) -> anyhow::Result<(SentResponse, u64)> {
     let started = Instant::now();
     let resp = sender.send(raw).await?;
     let ms = started.elapsed().as_millis() as u64;
@@ -490,9 +490,7 @@ impl RequestSender for HttpReplaySender {
         .await?;
         // Render the response head + body into raw bytes for display/storage.
         let mut raw = Vec::new();
-        raw.extend_from_slice(
-            format!("{} {}\r\n", resp.http_version, resp.status).as_bytes(),
-        );
+        raw.extend_from_slice(format!("{} {}\r\n", resp.http_version, resp.status).as_bytes());
         for (name, value) in &resp.headers {
             raw.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
@@ -568,9 +566,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// serde helper: serialize `Option<Duration>` as optional whole milliseconds.
@@ -604,8 +600,14 @@ mod tests {
         assert_eq!(tpl.clean, b"GET /?id=5&q=x HTTP/1.1");
         assert_eq!(tpl.originals, vec![b"5".to_vec(), b"x".to_vec()]);
         // Positions delimit the original values in the clean template.
-        assert_eq!(&tpl.clean[tpl.positions[0].start..tpl.positions[0].end], b"5");
-        assert_eq!(&tpl.clean[tpl.positions[1].start..tpl.positions[1].end], b"x");
+        assert_eq!(
+            &tpl.clean[tpl.positions[0].start..tpl.positions[0].end],
+            b"5"
+        );
+        assert_eq!(
+            &tpl.clean[tpl.positions[1].start..tpl.positions[1].end],
+            b"x"
+        );
     }
 
     #[test]

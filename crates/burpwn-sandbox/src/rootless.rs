@@ -782,8 +782,7 @@ mod privileged {
     fn setup_netns(spec: &ExecSpec) -> Result<(), SandboxError> {
         use crate::nft::{redirect_ruleset_with, UdpAction};
 
-        let (cmds, reject_ruleset) =
-            netns_setup_commands(spec.proxy_tcp_port, spec.proxy_dns_port);
+        let (cmds, reject_ruleset) = netns_setup_commands(spec.proxy_tcp_port, spec.proxy_dns_port);
         for argv in &cmds {
             run_ok(argv)?;
         }

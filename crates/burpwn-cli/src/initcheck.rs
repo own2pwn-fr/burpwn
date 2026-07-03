@@ -103,7 +103,9 @@ fn rewritten_command(agent: Agent, out: &Value) -> Option<String> {
             if hso.get("hookEventName")?.as_str()? != "PreToolUse" {
                 return None;
             }
-            hso.pointer("/updatedInput/command")?.as_str().map(Into::into)
+            hso.pointer("/updatedInput/command")?
+                .as_str()
+                .map(Into::into)
         }
         Agent::Gemini => {
             if out.get("decision")?.as_str()? != "allow" {
@@ -245,7 +247,10 @@ mod tests {
     fn a_fail_drives_nonzero_exit() {
         // All-known-agents check on correct code has no FAIL.
         let reports = check_agents(&Agent::all());
-        assert!(!any_failure(&reports), "correct code must not FAIL any agent");
+        assert!(
+            !any_failure(&reports),
+            "correct code must not FAIL any agent"
+        );
         assert!(reports
             .iter()
             .any(|r| r.verdict == Verdict::Pass && r.agent == "claude-code"));

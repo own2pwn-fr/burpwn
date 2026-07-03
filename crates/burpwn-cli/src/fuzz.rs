@@ -100,7 +100,11 @@ pub fn flow_request_bytes(req: &RequestData) -> Vec<u8> {
 
 /// Build a [`Template`] from clean/marked bytes: explicit `positions` win;
 /// otherwise the `§…§` (or custom) markers delimit the positions.
-pub fn build_template(bytes: &[u8], positions: &[(usize, usize)], marker: Option<&[u8]>) -> Template {
+pub fn build_template(
+    bytes: &[u8],
+    positions: &[(usize, usize)],
+    marker: Option<&[u8]>,
+) -> Template {
     if !positions.is_empty() {
         Template::from_offsets(bytes, positions)
     } else {
@@ -375,9 +379,7 @@ pub fn parse_position(spec: &str) -> Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burpwn_store::model::{
-        FlowStart, Protocol, RequestData, ResponseData,
-    };
+    use burpwn_store::model::{FlowStart, Protocol, RequestData, ResponseData};
 
     fn base_req() -> RequestData {
         RequestData {

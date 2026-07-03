@@ -392,14 +392,14 @@ impl BurpwnServer {
             .and_then(ok_json)
     }
 
-    #[tool(
-        description = "Encode a value. scheme = base64|base64url|url|hex. Pure (no network)."
-    )]
+    #[tool(description = "Encode a value. scheme = base64|base64url|url|hex. Pure (no network).")]
     async fn encode(
         &self,
         Parameters(params): Parameters<EncodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        handlers::encode(&params).map_err(to_mcp_err).and_then(ok_json)
+        handlers::encode(&params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
     }
 
     #[tool(
@@ -409,7 +409,9 @@ impl BurpwnServer {
         &self,
         Parameters(params): Parameters<EncodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        handlers::decode(&params).map_err(to_mcp_err).and_then(ok_json)
+        handlers::decode(&params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
     }
 }
 

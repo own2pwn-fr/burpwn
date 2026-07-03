@@ -302,7 +302,10 @@ mod tests {
         assert!(apply_request(&[rule], &mut msg));
         let hdrs = String::from_utf8(msg.headers).unwrap();
         assert!(hdrs.contains("Authorization: Bearer fresh-token"), "{hdrs}");
-        assert!(!hdrs.contains("stale-token"), "stale token replaced: {hdrs}");
+        assert!(
+            !hdrs.contains("stale-token"),
+            "stale token replaced: {hdrs}"
+        );
     }
 
     #[test]
@@ -348,7 +351,11 @@ mod tests {
             .await
             .unwrap();
         let rules = store.reader().list_match_replace().unwrap();
-        assert_eq!(rules.len(), 1, "still exactly one injection rule (no stack)");
+        assert_eq!(
+            rules.len(),
+            1,
+            "still exactly one injection rule (no stack)"
+        );
         assert_eq!(rules[0].id, rid2, "the profile tracks the current rule");
         assert_eq!(rules[0].replacement, "Authorization: Bearer tok2");
         let _ = rid1;

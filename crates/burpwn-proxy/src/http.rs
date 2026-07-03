@@ -373,19 +373,17 @@ async fn handle_inner(
     // buffer the whole body to rewrite / hold it.
     if should_stream(&ctx, &msg.host) {
         return Ok(stream_response(
-            resp_parts,
-            resp_body,
-            up_guard,
-            &ctx,
-            flow_id,
-            started,
-            version,
+            resp_parts, resp_body, up_guard, &ctx, flow_id, started, version,
         ));
     }
 
     // --- buffer path: collect the full body (bounded) then rewrite/intercept ---
-    let resp_body_bytes = with_timeout(UPSTREAM_TIMEOUT, "upstream body", collect_incoming(resp_body))
-        .await??;
+    let resp_body_bytes = with_timeout(
+        UPSTREAM_TIMEOUT,
+        "upstream body",
+        collect_incoming(resp_body),
+    )
+    .await??;
     drop(up_guard);
     let raw_resp_headers = serialize_headers(&resp_parts.headers);
 
@@ -521,7 +519,11 @@ fn should_stream(ctx: &HttpContext, host: &str) -> bool {
 /// design — no protobuf decoding.
 fn maybe_degrpc(content_type: Option<&str>, body: &[u8]) -> Option<Vec<u8>> {
     let ct = content_type?;
-    if !ct.trim_start().to_ascii_lowercase().starts_with("application/grpc") {
+    if !ct
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("application/grpc")
+    {
         return None;
     }
     let mut out = Vec::with_capacity(body.len());
@@ -711,9 +713,12 @@ async fn forward_streaming(
             .await??;
             // No ALPN on a cleartext upstream: default to HTTP/1.1 (prior-knowledge
             // h2c is rare and not something we negotiated).
-            let (parts, body, guard) =
-                with_timeout(UPSTREAM_TIMEOUT, "upstream headers", send_over_streaming(tcp, req, false, "http"))
-                    .await??;
+            let (parts, body, guard) = with_timeout(
+                UPSTREAM_TIMEOUT,
+                "upstream headers",
+                send_over_streaming(tcp, req, false, "http"),
+            )
+            .await??;
             Ok((parts, body, guard, None))
         }
         Upstream::Tls {
@@ -1477,13 +1482,22 @@ mod tests {
     fn sanitize_strips_alt_svc_and_hop_by_hop() {
         let mut h = hyper::HeaderMap::new();
         h.append("alt-svc", HeaderValue::from_static("h3=\":443\"; ma=86400"));
-        h.append(hyper::header::CONTENT_LENGTH, HeaderValue::from_static("10"));
+        h.append(
+            hyper::header::CONTENT_LENGTH,
+            HeaderValue::from_static("10"),
+        );
         h.append(
             hyper::header::TRANSFER_ENCODING,
             HeaderValue::from_static("chunked"),
         );
-        h.append(hyper::header::CONNECTION, HeaderValue::from_static("keep-alive"));
-        h.append(hyper::header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        h.append(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("keep-alive"),
+        );
+        h.append(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html"),
+        );
         sanitize_downstream_headers(&mut h);
         assert!(!h.contains_key("alt-svc"), "alt-svc must be stripped");
         assert!(!h.contains_key(hyper::header::CONTENT_LENGTH));

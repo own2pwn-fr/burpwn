@@ -708,7 +708,10 @@ mod tests {
 
         let reader = store.reader();
         assert!(
-            reader.search("sekrit_bearer_jwt").unwrap().contains(&flow_id),
+            reader
+                .search("sekrit_bearer_jwt")
+                .unwrap()
+                .contains(&flow_id),
             "request bearer token must be searchable"
         );
         assert!(
@@ -716,10 +719,7 @@ mod tests {
             "custom request header value must be searchable"
         );
         // The raw-syntax variant supports FTS5 prefix queries.
-        assert!(reader
-            .search_raw("findme_*")
-            .unwrap()
-            .contains(&flow_id));
+        assert!(reader.search_raw("findme_*").unwrap().contains(&flow_id));
     }
 
     #[tokio::test]
@@ -768,7 +768,11 @@ mod tests {
 
         // A flow with no ws frames returns an empty list.
         let other = w.flow_start(sample_flow()).await.unwrap();
-        assert!(store.reader().ws_messages_for_flow(other).unwrap().is_empty());
+        assert!(store
+            .reader()
+            .ws_messages_for_flow(other)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -801,7 +805,12 @@ mod tests {
         // Status update is reflected.
         w.update_attack_status(attack_id, "running").await.unwrap();
         assert_eq!(
-            reader.attack_get(attack_id).unwrap().unwrap().status.as_deref(),
+            reader
+                .attack_get(attack_id)
+                .unwrap()
+                .unwrap()
+                .status
+                .as_deref(),
             Some("running")
         );
 

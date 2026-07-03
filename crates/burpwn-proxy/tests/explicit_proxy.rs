@@ -174,9 +174,7 @@ async fn spawn_sse_origin() -> SocketAddr {
                         let _ = tx.send(Bytes::from_static(b"data: 2\n\n")).await;
                         // Dropping `tx` ends the stream.
                     });
-                    let body = StreamBody::new(
-                        rx.map(|b| Ok::<_, Infallible>(Frame::data(b))),
-                    );
+                    let body = StreamBody::new(rx.map(|b| Ok::<_, Infallible>(Frame::data(b))));
                     Ok::<_, Infallible>(
                         Response::builder()
                             .status(200)

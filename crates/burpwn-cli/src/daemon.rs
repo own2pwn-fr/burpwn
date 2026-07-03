@@ -567,11 +567,7 @@ async fn auth_refresh_consumer(
 /// Spawn a detached `burpwn --json session auth refresh --host <scope>` child.
 /// Detached (its own session) so a slow login command never blocks the daemon;
 /// stdio to /dev/null and fd 3 closed so it never pins the exec envelope pipe.
-fn spawn_auth_refresh(
-    exe: &Path,
-    session: &str,
-    scope: &str,
-) -> std::io::Result<()> {
+fn spawn_auth_refresh(exe: &Path, session: &str, scope: &str) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--json")

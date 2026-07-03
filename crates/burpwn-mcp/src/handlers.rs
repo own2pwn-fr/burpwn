@@ -412,7 +412,11 @@ pub async fn fuzz_run(
     for spec in &params.positions {
         positions.push(burpwn_cli::fuzz::parse_position(spec)?);
     }
-    let payloads: Vec<Vec<u8>> = params.payloads.iter().map(|p| p.clone().into_bytes()).collect();
+    let payloads: Vec<Vec<u8>> = params
+        .payloads
+        .iter()
+        .map(|p| p.clone().into_bytes())
+        .collect();
 
     let spec = burpwn_cli::fuzz::FuzzSpec {
         flow_id: params.flow,
@@ -521,9 +525,14 @@ pub async fn session_auth_set(
 ) -> Result<Value> {
     let store = open_store(paths, session)?;
     let host = params.host.clone().unwrap_or_default();
-    let id =
-        burpwn_cli::auth::auth_set(&store, &host, &params.login, &params.extract, &params.header)
-            .await?;
+    let id = burpwn_cli::auth::auth_set(
+        &store,
+        &host,
+        &params.login,
+        &params.extract,
+        &params.header,
+    )
+    .await?;
     Ok(json!({ "id": id, "host": host }))
 }
 

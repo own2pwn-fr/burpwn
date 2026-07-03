@@ -239,7 +239,10 @@ mod tests {
         let reject_lines: Vec<&str> = rs.lines().filter(|l| l.contains("reject")).collect();
         assert_eq!(reject_lines.len(), 1, "exactly one reject rule expected");
         let line = reject_lines[0];
-        assert!(line.contains("oifname \"burp0\""), "reject must be scoped to burp0: {line}");
+        assert!(
+            line.contains("oifname \"burp0\""),
+            "reject must be scoped to burp0: {line}"
+        );
         assert!(line.contains("!= 53"), "reject must exclude DNS: {line}");
     }
 

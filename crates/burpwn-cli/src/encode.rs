@@ -64,10 +64,8 @@ pub fn decode(scheme: &str, value: &str) -> Result<Value> {
 
 // --- base64 ----------------------------------------------------------------
 
-const STD_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const URL_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const STD_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Base64-encode `data` with `alphabet`, optionally appending `=` padding.
 fn base64_encode(data: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
@@ -208,7 +206,10 @@ fn url_decode(input: &str) -> Result<Vec<u8>> {
 fn jwt_decode(token: &str) -> Result<Value> {
     let parts: Vec<&str> = token.trim().split('.').collect();
     if parts.len() != 3 {
-        bail!("not a JWT: expected 3 dot-separated segments, got {}", parts.len());
+        bail!(
+            "not a JWT: expected 3 dot-separated segments, got {}",
+            parts.len()
+        );
     }
     let header_bytes = base64_decode(parts[0])?;
     let payload_bytes = base64_decode(parts[1])?;

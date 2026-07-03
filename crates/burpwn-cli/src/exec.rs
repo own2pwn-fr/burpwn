@@ -112,9 +112,35 @@ pub struct ExecResult {
 /// traffic, so an `ls`/`git`/`cat` that legitimately captures nothing never
 /// warns. Matched against a command token's basename (whole word).
 const NETWORK_TOOLS: &[&str] = &[
-    "curl", "wget", "http", "https", "httpie", "httpx", "nc", "ncat", "netcat", "socat", "telnet",
-    "nmap", "masscan", "ffuf", "gobuster", "feroxbuster", "dirb", "dirbuster", "nikto", "sqlmap",
-    "wpscan", "whatweb", "wfuzz", "hydra", "nuclei", "katana", "amass", "subfinder", "arjun",
+    "curl",
+    "wget",
+    "http",
+    "https",
+    "httpie",
+    "httpx",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "telnet",
+    "nmap",
+    "masscan",
+    "ffuf",
+    "gobuster",
+    "feroxbuster",
+    "dirb",
+    "dirbuster",
+    "nikto",
+    "sqlmap",
+    "wpscan",
+    "whatweb",
+    "wfuzz",
+    "hydra",
+    "nuclei",
+    "katana",
+    "amass",
+    "subfinder",
+    "arjun",
     "dalfox",
 ];
 
@@ -492,7 +518,11 @@ mod tests {
             "-c".into(),
             "cat notes.txt | grep curl".into(),
         ]));
-        assert!(!is_network_facing(&["grep".into(), "curl".into(), "f".into()]));
+        assert!(!is_network_facing(&[
+            "grep".into(),
+            "curl".into(),
+            "f".into()
+        ]));
     }
 
     #[test]

@@ -57,14 +57,30 @@ pub fn diff_flows(a: &FlowDetail, b: &FlowDetail, what: CompareWhat) -> Value {
     );
 
     if what.wants_headers() {
-        let ha = a.response.as_ref().map(|r| r.headers.as_slice()).unwrap_or(&[]);
-        let hb = b.response.as_ref().map(|r| r.headers.as_slice()).unwrap_or(&[]);
+        let ha = a
+            .response
+            .as_ref()
+            .map(|r| r.headers.as_slice())
+            .unwrap_or(&[]);
+        let hb = b
+            .response
+            .as_ref()
+            .map(|r| r.headers.as_slice())
+            .unwrap_or(&[]);
         obj.insert("headers".into(), diff_headers(ha, hb));
     }
 
     if what.wants_body() {
-        let ba = a.response.as_ref().map(|r| r.body.as_slice()).unwrap_or(&[]);
-        let bb = b.response.as_ref().map(|r| r.body.as_slice()).unwrap_or(&[]);
+        let ba = a
+            .response
+            .as_ref()
+            .map(|r| r.body.as_slice())
+            .unwrap_or(&[]);
+        let bb = b
+            .response
+            .as_ref()
+            .map(|r| r.body.as_slice())
+            .unwrap_or(&[]);
         let mut body = diff_body(ba, bb);
         // Reflection: tokens from A's request reflected in B's response body.
         let reflected = a
@@ -114,9 +130,7 @@ fn diff_headers(a: &[u8], b: &[u8]) -> Value {
     for (n, v) in &hb {
         match find(&ha, n) {
             None => added.push(json!({ "name": n, "value": v })),
-            Some(av) if &av != v => {
-                changed.push(json!({ "name": n, "a": av, "b": v }))
-            }
+            Some(av) if &av != v => changed.push(json!({ "name": n, "a": av, "b": v })),
             Some(_) => {}
         }
     }
@@ -275,14 +289,7 @@ mod tests {
     fn reflection_hit_detected() {
         // A's request carries a token in the query that B's response echoes back.
         let a = flow(1, "/p?name=injecthere", b"", 200, b"", b"");
-        let b = flow(
-            2,
-            "/p",
-            b"",
-            200,
-            b"",
-            b"<div>hello injecthere world</div>",
-        );
+        let b = flow(2, "/p", b"", 200, b"", b"<div>hello injecthere world</div>");
         let v = diff_flows(&a, &b, CompareWhat::All);
         let reflected = v["body"]["reflected"].as_array().unwrap();
         assert!(
@@ -305,7 +312,10 @@ mod tests {
 
     #[test]
     fn what_parses() {
-        assert_eq!(CompareWhat::from_str_opt("headers"), Some(CompareWhat::Headers));
+        assert_eq!(
+            CompareWhat::from_str_opt("headers"),
+            Some(CompareWhat::Headers)
+        );
         assert_eq!(CompareWhat::from_str_opt("body"), Some(CompareWhat::Body));
         assert_eq!(CompareWhat::from_str_opt("all"), Some(CompareWhat::All));
         assert_eq!(CompareWhat::from_str_opt("nope"), None);
