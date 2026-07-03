@@ -118,17 +118,133 @@ create a named session first, then route **target-facing** network commands thro
 touch the target are sandboxed) and *session-aware* — no surprise sandboxing of `ls`/`git`/builds,
 and no captures landing in an unnamed default session.
 
-On Claude Code this repo is a **plugin marketplace**, so the skill installs in one step (the
-`burpwn` binary must already be on `PATH`):
+#### Install the skill (per framework)
+
+Two portable commands cover every supported agent — one installs the skill in the framework's
+**native** format (skill dir, rules file, or an `AGENTS.md` append), the other registers the MCP
+tools for the hosts that speak stdio MCP:
+
+```sh
+burpwn skill install --agent <framework>   # teach the agent the workflow
+burpwn mcp register --agent <framework>    # give it the tools (MCP hosts)
+```
+
+`skill install` writes into the **project** by default; pass `--global` for the per-user location,
+`--all` to target every known framework at once, `--print` to preview without writing, and
+`--force` to overwrite a burpwn-owned block. It is idempotent and anti-clobber: re-running is safe
+and it never overwrites content it didn't author. Manage installs with `burpwn skill list` and
+`burpwn skill uninstall --agent <slug>`; list MCP hosts with `burpwn mcp register --list`.
+
+Pick your framework:
+
+<details>
+<summary><b>Claude Code</b> — skill dir</summary>
+
+```sh
+burpwn skill install --agent claude-code            # → .claude/skills/burpwn/SKILL.md
+burpwn skill install --agent claude-code --global   # → ~/.claude/skills/burpwn/SKILL.md
+```
+
+This repo is also a **plugin marketplace**, so on Claude Code you can instead install via the
+plugin (the `burpwn` binary must already be on `PATH`):
 
 ```sh
 # in Claude Code:
 /plugin marketplace add own2pwn-fr/burpwn
 /plugin install burpwn@burpwn
 ```
+</details>
 
-For other agents, copy the skill dir into your agent's skills folder, e.g.
-`cp -r skills/burpwn ~/.claude/skills/`.
+<details>
+<summary><b>Cursor</b> — rules file</summary>
+
+```sh
+burpwn skill install --agent cursor   # → .cursor/rules/burpwn.mdc
+```
+
+Project only — Cursor has no file-based global rules.
+</details>
+
+<details>
+<summary><b>Cline / Roo</b> — rules file</summary>
+
+```sh
+burpwn skill install --agent cline   # → .clinerules/burpwn.md
+```
+
+Project only.
+</details>
+
+<details>
+<summary><b>Gemini CLI</b> — AGENTS.md-style append (GEMINI.md)</summary>
+
+```sh
+burpwn skill install --agent gemini            # → GEMINI.md
+burpwn skill install --agent gemini --global   # → ~/.gemini/GEMINI.md
+```
+</details>
+
+<details>
+<summary><b>Codex</b> — AGENTS.md append + MCP</summary>
+
+```sh
+burpwn skill install --agent codex            # → AGENTS.md
+burpwn skill install --agent codex --global   # → ~/.codex/AGENTS.md
+burpwn mcp register --agent codex             # → ~/.codex/config.toml  ([mcp_servers.burpwn])
+```
+
+⚠️ **Codex network caveat:** the default `workspace-write` sandbox blocks outbound network, so
+burpwn's target traffic is blocked. Enable it in `~/.codex/config.toml`:
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+```
+
+(or run Codex with full access). Without this, wrapped commands can't reach the target.
+</details>
+
+<details>
+<summary><b>GitHub Copilot CLI</b> — instructions append + MCP</summary>
+
+```sh
+burpwn skill install --agent copilot   # → .github/copilot-instructions.md  (project only)
+burpwn mcp register --agent copilot    # → ~/.copilot/mcp-config.json
+```
+</details>
+
+<details>
+<summary><b>Antigravity</b> — AGENTS.md append + MCP</summary>
+
+```sh
+burpwn skill install --agent antigravity   # → AGENTS.md  (project only)
+burpwn mcp register --agent antigravity    # → ~/.gemini/config/mcp_config.json
+```
+</details>
+
+<details>
+<summary><b>Strix</b> — skill dir (no stdio MCP)</summary>
+
+```sh
+burpwn skill install --agent strix   # → .strix/skills/burpwn/SKILL.md  (project only)
+```
+
+Strix has no stdio MCP (it runs tools via a Docker sandbox shell), so the path is the skill plus
+shelling out to `burpwn exec`. Note: the skills-dir path is best-effort — confirm Strix's skills
+directory for your version.
+</details>
+
+<details>
+<summary><b>Any other agent (generic)</b> — AGENTS.md</summary>
+
+```sh
+burpwn skill install --agent agents   # → AGENTS.md  (any AGENTS.md-aware agent)
+burpwn mcp register --agent <slug>    # if the agent speaks stdio MCP
+```
+
+For an agent with neither native skills nor stdio MCP, install the generic skill and have it shell
+out to `burpwn exec` (or the `burpwn-shell` wrapper) for target-facing commands.
+</details>
 
 ### Hook (opt-in: enforced auto-capture)
 

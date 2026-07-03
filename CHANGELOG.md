@@ -11,6 +11,23 @@ comparison, encode/decode, session auth handling — plus the engine fixes those
 need (streaming bodies, structured WebSocket capture, TLS metadata) and the first
 executable evaluation harness for the trained model.
 
+### Added — one-command skill install
+- **`burpwn skill install`** (`burpwn-cli`): installs the portable agent skill into each
+  framework's **native** format — a skill directory (`SKILL.md`) for Claude Code / Strix, a
+  rules file for Cursor (`.cursor/rules/burpwn.mdc`) / Cline (`.clinerules/burpwn.md`), or an
+  append into an instructions file (`AGENTS.md` / `GEMINI.md` / `.github/copilot-instructions.md`)
+  for Gemini CLI / Codex / Copilot / Antigravity / the generic `agents` fallback. Writes to the
+  **project** by default, `--global` for the per-user path, plus `--all`, `--print` and `--force`.
+  Idempotent and anti-clobber: re-runs are safe and it only ever rewrites the block it authored.
+  `burpwn skill list` / `burpwn skill uninstall --agent <slug>` manage installs.
+- **`burpwn mcp register`** (`burpwn-cli`): registers the stdio MCP server in the host's config
+  (relative to `HOME`) for the agents that speak MCP — Codex (`~/.codex/config.toml`
+  `[mcp_servers.burpwn]`), Copilot CLI (`~/.copilot/mcp-config.json`) and Antigravity
+  (`~/.gemini/config/mcp_config.json`); `--global`, `--print`, and `--list` to enumerate hosts.
+  Strix (Docker-sandbox shell, no stdio MCP) and HTTP-only cores use the skill + `burpwn exec`
+  path instead. The enforced `PreToolUse` auto-capture hook (`burpwn init`) remains a **separate
+  opt-in**, not stacked with the skill.
+
 ### Added — offensive loop
 - **Intruder / `fuzz`** (`burpwn-cli` + `burpwn-mcp`): `fuzz run --flow <id>
   [--position start:end | § markers] [--payload <p> | --payloads <file>] --mode
