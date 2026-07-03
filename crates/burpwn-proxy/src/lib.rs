@@ -23,6 +23,7 @@
 pub mod classify;
 pub mod decode;
 pub mod dns;
+pub mod fuzz;
 pub mod http;
 pub mod intercept;
 pub mod matchreplace;
@@ -32,6 +33,7 @@ pub mod rawtcp;
 pub mod replay;
 mod util;
 pub mod wire;
+pub mod ws;
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, RawFd};
@@ -39,7 +41,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -53,6 +54,10 @@ use burpwn_tls::{
 };
 
 pub use crate::classify::{Class, PrefixedStream};
+pub use crate::fuzz::{
+    run_attack, AttackMode, AttackReport, BaselineStats, FuzzConfig, FuzzResult, HttpReplaySender,
+    Position, RequestSender, SentResponse, Template,
+};
 pub use crate::http::{HttpContext, Upstream};
 pub use crate::intercept::{
     InterceptController, InterceptData, InterceptDecision, InterceptKind, InterceptScope,
@@ -202,6 +207,10 @@ impl Proxy {
             upstream: Upstream::Plain {
                 addr: SocketAddr::new(conn.dst_ip, conn.dst_port),
             },
+            // Cleartext: no TLS to describe.
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
         }
     }
 
@@ -277,6 +286,10 @@ impl Proxy {
                         server_name,
                         connector,
                     },
+                    // Negotiated (downstream MITM) TLS metadata for this flow.
+                    tls_version: info.version.clone(),
+                    tls_cipher: info.cipher.clone(),
+                    tls_alpn: info.alpn.clone(),
                 };
                 if info.alpn_h2 {
                     http::serve_h2(*stream, ctx).await?;
@@ -454,7 +467,7 @@ impl Proxy {
         self: Arc<Self>,
         req: Request<Incoming>,
         client_addr: String,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<crate::http::ProxyBody> {
         let (host, port) = match req
             .uri()
             .authority()
@@ -565,17 +578,17 @@ impl Proxy {
     }
 }
 
-fn bad_request(msg: &'static str) -> Response<Full<Bytes>> {
+fn bad_request(msg: &'static str) -> Response<crate::http::ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from_static(msg.as_bytes())))
+        .body(crate::http::full_body(Bytes::from_static(msg.as_bytes())))
         .unwrap()
 }
 
-fn bad_gateway(msg: &'static str) -> Response<Full<Bytes>> {
+fn bad_gateway(msg: &'static str) -> Response<crate::http::ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(Full::new(Bytes::from_static(msg.as_bytes())))
+        .body(crate::http::full_body(Bytes::from_static(msg.as_bytes())))
         .unwrap()
 }
 

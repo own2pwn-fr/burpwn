@@ -78,6 +78,13 @@ fn apply(rules: &[MatchReplaceRule], msg: &mut Message, on_request: bool) -> Cha
     changed
 }
 
+/// Whether a rule's `scope` expression applies to `host`. Exposed so the proxy
+/// can cheaply decide, before reading a body, whether ANY rule could touch this
+/// flow (and therefore whether the body must be buffered vs. streamed).
+pub fn host_in_scope(scope: &str, host: &str) -> bool {
+    scope_matches(scope, host)
+}
+
 /// An empty scope or `"*"` matches everything; otherwise it's a case-insensitive
 /// substring test against the host.
 fn scope_matches(scope: &str, host: &str) -> bool {

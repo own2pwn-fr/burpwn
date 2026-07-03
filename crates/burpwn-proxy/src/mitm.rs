@@ -33,6 +33,12 @@ pub struct TlsInfo {
     pub sni: Option<String>,
     /// Whether ALPN negotiated HTTP/2 (`h2`). Otherwise treat as HTTP/1.1.
     pub alpn_h2: bool,
+    /// Negotiated TLS protocol version, e.g. `TLSv1.3` (from rustls).
+    pub version: Option<String>,
+    /// Negotiated cipher suite, e.g. `TLS13_AES_128_GCM_SHA256`.
+    pub cipher: Option<String>,
+    /// Negotiated ALPN protocol string, e.g. `h2` / `http/1.1`.
+    pub alpn: Option<String>,
 }
 
 /// Outcome of an interception attempt.
@@ -102,14 +108,24 @@ where
 
     match acceptor.accept(replay).await {
         Ok(tls) => {
-            let alpn_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+            let conn = tls.get_ref().1;
+            let alpn = conn.alpn_protocol();
+            let alpn_h2 = alpn == Some(b"h2");
+            let alpn_str = alpn.map(|p| String::from_utf8_lossy(p).into_owned());
+            let version = conn.protocol_version().map(tls_version_str);
+            let cipher = conn
+                .negotiated_cipher_suite()
+                .map(|cs| format!("{:?}", cs.suite()));
             // Prefer the SNI rustls saw post-handshake; fall back to our parse.
-            let negotiated_sni = tls.get_ref().1.server_name().map(|s| s.to_string()).or(sni);
+            let negotiated_sni = conn.server_name().map(|s| s.to_string()).or(sni);
             Ok(MitmOutcome::Mitm {
                 stream: Box::new(tls),
                 info: TlsInfo {
                     sni: negotiated_sni,
                     alpn_h2,
+                    version,
+                    cipher,
+                    alpn: alpn_str,
                 },
             })
         }
@@ -131,6 +147,18 @@ where
                 "client rejected MITM leaf (host pinned for next attempt)",
             ))
         }
+    }
+}
+
+/// Render a rustls [`rustls::ProtocolVersion`] as a friendly string (`TLSv1.3`),
+/// falling back to the debug form for anything unrecognized.
+fn tls_version_str(v: rustls::ProtocolVersion) -> String {
+    match v {
+        rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3".to_string(),
+        rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2".to_string(),
+        rustls::ProtocolVersion::TLSv1_1 => "TLSv1.1".to_string(),
+        rustls::ProtocolVersion::TLSv1_0 => "TLSv1.0".to_string(),
+        other => format!("{other:?}"),
     }
 }
 
