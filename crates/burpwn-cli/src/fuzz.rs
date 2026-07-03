@@ -344,7 +344,7 @@ pub fn fuzz_show(
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         ResultSort::Status => results.sort_by_key(|r| r.status_code.unwrap_or(0)),
-        ResultSort::Len => results.sort_by(|a, b| b.resp_len.cmp(&a.resp_len)),
+        ResultSort::Len => results.sort_by_key(|r| std::cmp::Reverse(r.resp_len)),
     }
     if let Some(n) = limit {
         results.truncate(n);

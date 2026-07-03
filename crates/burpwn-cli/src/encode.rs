@@ -134,7 +134,7 @@ fn hex_encode(data: &[u8]) -> String {
 /// or a non-hex character.
 fn hex_decode(input: &str) -> Result<Vec<u8>> {
     let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         bail!("hex input has an odd number of digits");
     }
     let mut out = Vec::with_capacity(clean.len() / 2);
