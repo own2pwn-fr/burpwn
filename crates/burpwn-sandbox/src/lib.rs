@@ -30,9 +30,11 @@ pub mod rootless;
 pub mod runtime;
 pub mod wire;
 
-pub use nft::redirect_ruleset;
+pub use nft::{redirect_ruleset, redirect_ruleset_with, UdpAction};
 pub use rootless::{
-    doctor, netns_agent_main, Preflight, RootlessRuntime, NETNS_AGENT_ARG, SPEC_ENV,
+    doctor, netns_agent_main, resolve_rlimits, Preflight, RootlessRuntime, SandboxRlimits,
+    DEFAULT_RLIMIT_AS_BYTES, DEFAULT_RLIMIT_CPU_SECONDS, DEFAULT_RLIMIT_NPROC, NETNS_AGENT_ARG,
+    SPEC_ENV,
 };
 pub use runtime::{ExecOutcome, ExecSpec, MockRuntime, SandboxError, SandboxRuntime};
 pub use wire::{PassedConn, WireError, L4};
