@@ -266,6 +266,92 @@ impl BurpwnServer {
             .map_err(to_mcp_err)
             .and_then(ok_json)
     }
+
+    // --- repeater ---------------------------------------------------------
+
+    #[tool(
+        description = "Replay (Repeater) a stored flow, optionally editing method/headers/body, and return the response. Same transport as the CLI `req replay`."
+    )]
+    async fn req_replay(
+        &self,
+        Parameters(params): Parameters<ReqReplayParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::req_replay(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    // --- fuzz (Intruder) --------------------------------------------------
+
+    #[tool(
+        description = "Intruder: run a payload fuzzing attack against a stored flow's request. positions are start:end byte offsets (or § markers); mode is sniper|battering-ram|pitchfork|cluster-bomb. Persists an attack + per-payload results and returns the ranked table."
+    )]
+    async fn fuzz(
+        &self,
+        Parameters(params): Parameters<FuzzParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::fuzz_run(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(description = "List stored Intruder attacks (id, name, base flow, status, #results).")]
+    async fn fuzz_list(
+        &self,
+        Parameters(params): Parameters<FuzzListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::fuzz_list(self.paths(), self.session(), &params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Fetch one attack's per-payload results, sorted by anomaly|status|len (default anomaly), optionally limited."
+    )]
+    async fn fuzz_results(
+        &self,
+        Parameters(params): Parameters<FuzzResultsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::fuzz_results(self.paths(), self.session(), &params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    // --- compare / encode -------------------------------------------------
+
+    #[tool(
+        description = "Structured diff of two flows: status-line delta, header add/remove/change, line-based body diff, and a reflection check (tokens from flow A's request echoed in flow B's response). what = headers|body|all."
+    )]
+    async fn compare(
+        &self,
+        Parameters(params): Parameters<CompareParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::compare(self.paths(), self.session(), &params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Encode a value. scheme = base64|base64url|url|hex. Pure (no network)."
+    )]
+    async fn encode(
+        &self,
+        Parameters(params): Parameters<EncodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::encode(&params).map_err(to_mcp_err).and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Decode a value. scheme = base64|base64url|url|hex|jwt (jwt splits header.payload.signature and decodes to JSON without verifying the signature)."
+    )]
+    async fn decode(
+        &self,
+        Parameters(params): Parameters<EncodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::decode(&params).map_err(to_mcp_err).and_then(ok_json)
+    }
 }
 
 #[tool_handler]
@@ -278,8 +364,10 @@ impl ServerHandler for BurpwnServer {
                  Query captured flows (req_list/req_show/req_search), run commands \
                  through the sandbox (exec), and drive blocking interception \
                  (intercept_enable, await_intercept long-poll, intercept_forward/drop). \
-                 Tools operate on the active session unless the server was started \
-                 with --session."
+                 Offensive tooling: req_replay (Repeater), fuzz/fuzz_list/fuzz_results \
+                 (Intruder), compare (structured flow diff + reflection check), and \
+                 encode/decode (base64/url/hex/jwt). Tools operate on the active \
+                 session unless the server was started with --session."
                     .into(),
             ),
             ..Default::default()

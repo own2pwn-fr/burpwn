@@ -67,6 +67,10 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::Tag { action } => cmd_tag(&out, paths, action).await,
         Command::Note { action } => cmd_note(&out, paths, action).await,
         Command::Export { action } => cmd_export(&out, paths, action),
+        Command::Fuzz { action } => cmd_fuzz(&out, paths, action).await,
+        Command::Compare(args) => cmd_compare(&out, paths, args),
+        Command::Encode { scheme, value } => cmd_encode(&out, &scheme, &value),
+        Command::Decode { scheme, value } => cmd_decode(&out, &scheme, &value),
     }
 }
 
@@ -690,12 +694,6 @@ async fn req_replay(
     args: ReqReplayArgs,
 ) -> Result<i32> {
     let store = open_store(paths, session)?;
-    let Some(detail) = store.reader().get_flow(args.id)? else {
-        bail!("no such flow: {}", args.id);
-    };
-    let Some(base) = detail.request.clone() else {
-        bail!("flow {} has no recorded request to replay", args.id);
-    };
 
     let mut headers = Vec::new();
     for spec in &args.set_header {
@@ -715,8 +713,8 @@ async fn req_replay(
         None => None,
     };
 
-    let req = replay::apply_edits(base, args.method.as_deref(), &headers, body);
-    let result = replay::replay(&detail, &req).await?;
+    let result =
+        replay::replay_flow(&store, args.id, args.method.as_deref(), &headers, body).await?;
 
     if out.json {
         println!(
@@ -1078,6 +1076,208 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
             Ok(1)
         }
     }
+}
+
+// --- fuzz (Intruder) --------------------------------------------------------
+
+async fn cmd_fuzz(out: &Output, paths: &Paths, action: FuzzAction) -> Result<i32> {
+    let session = paths.active_session();
+    match action {
+        FuzzAction::Run(args) => cmd_fuzz_run(out, paths, &session, args).await,
+        FuzzAction::List { workspace } => {
+            let v = crate::fuzz::fuzz_list(paths, &session, workspace.as_deref())?;
+            if out.json {
+                println!("{}", Envelope::ok(v).to_json_line());
+            } else {
+                let empty = Vec::new();
+                let rows = v["attacks"].as_array().unwrap_or(&empty);
+                if rows.is_empty() {
+                    println!("(no attacks)");
+                }
+                for a in rows {
+                    println!(
+                        "{:>4} [{}] {} (flow {}, {} results)",
+                        a["id"].as_i64().unwrap_or(0),
+                        a["status"].as_str().unwrap_or("-"),
+                        a["name"].as_str().unwrap_or("-"),
+                        a["base_flow_id"],
+                        a["results"].as_i64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(0)
+        }
+        FuzzAction::Show {
+            attack_id,
+            sort,
+            limit,
+        } => {
+            let sort = crate::fuzz::ResultSort::from_str_opt(&sort)
+                .ok_or_else(|| anyhow!("--sort must be anomaly|status|len, got {sort:?}"))?;
+            let v = crate::fuzz::fuzz_show(paths, &session, attack_id, sort, limit)?;
+            if out.json {
+                println!("{}", Envelope::ok(v).to_json_line());
+            } else {
+                let empty = Vec::new();
+                let rows = v["results"].as_array().unwrap_or(&empty);
+                if rows.is_empty() {
+                    println!("(no results)");
+                }
+                for r in rows {
+                    println!(
+                        "{:>4}  {:>3}  len {:>6}  {:>5}ms  anomaly {:.3}  {}",
+                        r["id"].as_i64().unwrap_or(0),
+                        r["status_code"],
+                        r["resp_len"],
+                        r["latency_ms"],
+                        r["anomaly_score"].as_f64().unwrap_or(0.0),
+                        r["payload"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+async fn cmd_fuzz_run(
+    out: &Output,
+    paths: &Paths,
+    session: &str,
+    args: FuzzRunArgs,
+) -> Result<i32> {
+    use burpwn_proxy::AttackMode;
+    use tokio_util::sync::CancellationToken;
+
+    let mode = AttackMode::from_str_opt(&args.mode)
+        .ok_or_else(|| anyhow!("--mode must be sniper|battering-ram|pitchfork|cluster-bomb"))?;
+
+    // Positions.
+    let mut positions = Vec::new();
+    for spec in &args.position {
+        positions.push(crate::fuzz::parse_position(spec)?);
+    }
+
+    // Payloads: inline --payload plus --payloads file (one per line).
+    let mut payloads: Vec<Vec<u8>> = args.payload.iter().map(|p| p.clone().into_bytes()).collect();
+    if let Some(file) = &args.payloads {
+        let data = std::fs::read_to_string(file)
+            .map_err(|e| anyhow!("reading --payloads file failed: {}", e.kind()))?;
+        for line in data.lines() {
+            payloads.push(line.as_bytes().to_vec());
+        }
+    }
+
+    let request_bytes = match &args.request {
+        Some(file) => Some(
+            std::fs::read(file)
+                .map_err(|e| anyhow!("reading --request file failed: {}", e.kind()))?,
+        ),
+        None => None,
+    };
+
+    let spec = crate::fuzz::FuzzSpec {
+        flow_id: args.flow,
+        request_bytes,
+        positions,
+        marker: args.marker.map(|m| m.into_bytes()),
+        payloads,
+        mode,
+        concurrency: args.concurrency,
+        delay_ms: args.delay,
+        name: args.name,
+    };
+
+    // Cancel the run on Ctrl-C.
+    let cancel = CancellationToken::new();
+    let cancel_bg = cancel.clone();
+    let sig = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_bg.cancel();
+        }
+    });
+
+    let result = crate::fuzz::fuzz_run(paths, session, spec, cancel).await;
+    sig.abort();
+    let v = result?;
+
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else {
+        println!(
+            "attack {} ({}): {} results, status {}",
+            v["attack_id"].as_i64().unwrap_or(0),
+            v["mode"].as_str().unwrap_or("-"),
+            v["results"].as_array().map(|a| a.len()).unwrap_or(0),
+            v["status"].as_str().unwrap_or("-"),
+        );
+        if let Some(b) = v["baseline"].as_object() {
+            println!(
+                "  baseline: status {} len {}",
+                b["status"], b["resp_len"]
+            );
+        }
+        let empty = Vec::new();
+        for r in v["results"].as_array().unwrap_or(&empty) {
+            println!(
+                "  {:>4}  {:>3}  len {:>6}  {:>5}ms  anomaly {:.3}  {}",
+                r["index"].as_i64().unwrap_or(0),
+                r["status"],
+                r["resp_len"],
+                r["latency_ms"],
+                r["anomaly"].as_f64().unwrap_or(0.0),
+                r["payloads"],
+            );
+        }
+    }
+    Ok(0)
+}
+
+// --- compare ----------------------------------------------------------------
+
+fn cmd_compare(out: &Output, paths: &Paths, args: CompareArgs) -> Result<i32> {
+    let session = paths.active_session();
+    let store = open_store(paths, &session)?;
+    let reader = store.reader();
+    let Some(a) = reader.get_flow(args.flow_a)? else {
+        bail!("no such flow: {}", args.flow_a);
+    };
+    let Some(b) = reader.get_flow(args.flow_b)? else {
+        bail!("no such flow: {}", args.flow_b);
+    };
+    let what = crate::compare::CompareWhat::from_str_opt(&args.what)
+        .ok_or_else(|| anyhow!("--what must be headers|body|all, got {:?}", args.what))?;
+    let v = crate::compare::diff_flows(&a, &b, what);
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    }
+    Ok(0)
+}
+
+// --- encode / decode --------------------------------------------------------
+
+fn cmd_encode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
+    let v = crate::encode::encode(scheme, value)?;
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else {
+        println!("{}", v["encoded"].as_str().unwrap_or(""));
+    }
+    Ok(0)
+}
+
+fn cmd_decode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
+    let v = crate::encode::decode(scheme, value)?;
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else if scheme.eq_ignore_ascii_case("jwt") {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("{}", v["decoded"].as_str().unwrap_or(""));
+    }
+    Ok(0)
 }
 
 // --- helpers ---------------------------------------------------------------

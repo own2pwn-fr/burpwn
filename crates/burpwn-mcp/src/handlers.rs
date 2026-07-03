@@ -346,6 +346,124 @@ pub async fn intercept_drop(
     control_value(c.intercept_drop(params.id).await?)
 }
 
+// --- req_replay (Repeater) --------------------------------------------------
+
+/// `req_replay` — replay a stored flow with optional edits, mirroring the CLI
+/// `req replay`. Shares [`burpwn_cli::replay::replay_flow`] so both take exactly
+/// the same transport path.
+pub async fn req_replay(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::ReqReplayParams,
+) -> Result<Value> {
+    use burpwn_cli::replay::{parse_header_spec, replay_flow};
+    let store = open_store(paths, session)?;
+    // Validate + normalise the header edits through the same CRLF-injection guard
+    // the CLI uses (parse_header_spec on a `Name: value` string).
+    let mut headers = Vec::new();
+    for h in &params.set_headers {
+        headers.push(parse_header_spec(&format!("{}: {}", h.name, h.value))?);
+    }
+    let body = params.set_body.clone().map(|b| b.into_bytes());
+    let result = replay_flow(&store, params.id, params.method.as_deref(), &headers, body).await?;
+    Ok(json!({
+        "status": result.status,
+        "response": String::from_utf8_lossy(&result.raw_response),
+    }))
+}
+
+// --- fuzz (Intruder) --------------------------------------------------------
+
+/// `fuzz` — run an Intruder attack against a stored flow and persist it.
+pub async fn fuzz_run(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::FuzzParams,
+) -> Result<Value> {
+    use burpwn_proxy::AttackMode;
+    use tokio_util::sync::CancellationToken;
+
+    let mode = AttackMode::from_str_opt(&params.mode)
+        .ok_or_else(|| anyhow!("mode must be sniper|battering-ram|pitchfork|cluster-bomb"))?;
+    let mut positions = Vec::new();
+    for spec in &params.positions {
+        positions.push(burpwn_cli::fuzz::parse_position(spec)?);
+    }
+    let payloads: Vec<Vec<u8>> = params.payloads.iter().map(|p| p.clone().into_bytes()).collect();
+
+    let spec = burpwn_cli::fuzz::FuzzSpec {
+        flow_id: params.flow,
+        request_bytes: None,
+        positions,
+        marker: params.marker.clone().map(|m| m.into_bytes()),
+        payloads,
+        mode,
+        concurrency: params.concurrency,
+        delay_ms: params.delay_ms,
+        name: params.name.clone(),
+    };
+    burpwn_cli::fuzz::fuzz_run(paths, session, spec, CancellationToken::new()).await
+}
+
+/// `fuzz_list` — list stored attacks.
+pub fn fuzz_list(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::FuzzListParams,
+) -> Result<Value> {
+    burpwn_cli::fuzz::fuzz_list(paths, session, params.workspace.as_deref())
+}
+
+/// `fuzz_results` — one attack's per-payload results.
+pub fn fuzz_results(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::FuzzResultsParams,
+) -> Result<Value> {
+    let sort = match &params.sort {
+        Some(s) => burpwn_cli::fuzz::ResultSort::from_str_opt(s)
+            .ok_or_else(|| anyhow!("sort must be anomaly|status|len, got {s:?}"))?,
+        None => burpwn_cli::fuzz::ResultSort::Anomaly,
+    };
+    burpwn_cli::fuzz::fuzz_show(paths, session, params.attack_id, sort, params.limit)
+}
+
+// --- compare ----------------------------------------------------------------
+
+/// `compare` — structured diff of two flows.
+pub fn compare(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::CompareParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let a = reader
+        .get_flow(params.flow_a)?
+        .ok_or_else(|| anyhow!("no such flow: {}", params.flow_a))?;
+    let b = reader
+        .get_flow(params.flow_b)?
+        .ok_or_else(|| anyhow!("no such flow: {}", params.flow_b))?;
+    let what = match &params.what {
+        Some(w) => burpwn_cli::compare::CompareWhat::from_str_opt(w)
+            .ok_or_else(|| anyhow!("what must be headers|body|all, got {w:?}"))?,
+        None => burpwn_cli::compare::CompareWhat::All,
+    };
+    Ok(burpwn_cli::compare::diff_flows(&a, &b, what))
+}
+
+// --- encode / decode --------------------------------------------------------
+
+/// `encode` — byte transform.
+pub fn encode(params: &crate::params::EncodeParams) -> Result<Value> {
+    burpwn_cli::encode::encode(&params.scheme, &params.value)
+}
+
+/// `decode` — reverse byte transform (plus `jwt`).
+pub fn decode(params: &crate::params::EncodeParams) -> Result<Value> {
+    burpwn_cli::encode::decode(&params.scheme, &params.value)
+}
+
 // --- exec ------------------------------------------------------------------
 
 /// `exec` — run a command in the sandbox by shelling out to the burpwn binary.

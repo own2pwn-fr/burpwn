@@ -11,6 +11,7 @@ description = "burpwn CLI: clap subcommand tree, JSON envelope output, orchestra
 [dependencies]
 clap.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

@@ -106,6 +106,104 @@ pub enum Command {
         #[command(subcommand)]
         action: ExportAction,
     },
+
+    /// Intruder: run/inspect payload fuzzing attacks against a flow.
+    Fuzz {
+        /// Fuzz subcommand.
+        #[command(subcommand)]
+        action: FuzzAction,
+    },
+
+    /// Structured diff of two captured flows.
+    Compare(CompareArgs),
+
+    /// Encode a value (`base64`, `base64url`, `url`, `hex`).
+    Encode {
+        /// Scheme: `base64`, `base64url`, `url`, or `hex`.
+        scheme: String,
+        /// The value to encode.
+        value: String,
+    },
+
+    /// Decode a value (`base64`, `base64url`, `url`, `hex`, `jwt`).
+    Decode {
+        /// Scheme: `base64`, `base64url`, `url`, `hex`, or `jwt`.
+        scheme: String,
+        /// The value to decode.
+        value: String,
+    },
+}
+
+/// `fuzz` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum FuzzAction {
+    /// Run an attack against a stored flow's request.
+    Run(FuzzRunArgs),
+    /// List stored attacks.
+    List {
+        /// Restrict to a workspace by NAME.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Show one attack's per-payload results.
+    Show {
+        /// Attack id.
+        attack_id: i64,
+        /// Sort key: `anomaly` (default), `status`, or `len`.
+        #[arg(long, default_value = "anomaly")]
+        sort: String,
+        /// Max rows.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+/// `fuzz run` arguments.
+#[derive(Debug, Args)]
+pub struct FuzzRunArgs {
+    /// Stored flow supplying the base request + transport target.
+    #[arg(long)]
+    pub flow: i64,
+    /// Read the base request bytes from a file (overrides the flow's request as
+    /// the template; the flow still supplies the destination).
+    #[arg(long)]
+    pub request: Option<String>,
+    /// Injection position as `start:end` byte offsets into the request. Repeatable.
+    #[arg(long = "position", value_name = "START:END")]
+    pub position: Vec<String>,
+    /// A single inline payload. Repeatable.
+    #[arg(long = "payload")]
+    pub payload: Vec<String>,
+    /// Load payloads from a file (one per line).
+    #[arg(long)]
+    pub payloads: Option<String>,
+    /// Attack mode: `sniper`, `battering-ram`, `pitchfork`, `cluster-bomb`.
+    #[arg(long, default_value = "sniper")]
+    pub mode: String,
+    /// Max in-flight requests.
+    #[arg(long)]
+    pub concurrency: Option<usize>,
+    /// Pacing delay between launches, in milliseconds.
+    #[arg(long)]
+    pub delay: Option<u64>,
+    /// Custom position marker (defaults to `§`).
+    #[arg(long)]
+    pub marker: Option<String>,
+    /// Attack name.
+    #[arg(long)]
+    pub name: Option<String>,
+}
+
+/// `compare` arguments.
+#[derive(Debug, Args)]
+pub struct CompareArgs {
+    /// First flow id.
+    pub flow_a: i64,
+    /// Second flow id.
+    pub flow_b: i64,
+    /// What to diff: `headers`, `body`, or `all` (default).
+    #[arg(long, default_value = "all")]
+    pub what: String,
 }
 
 /// `init` arguments.

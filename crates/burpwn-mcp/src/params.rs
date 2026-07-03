@@ -153,6 +153,98 @@ pub struct ExecParams {
     pub timeout_secs: Option<u64>,
 }
 
+/// `req_replay` — replay (Repeater) a stored flow, optionally edited.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReqReplayParams {
+    /// Flow id to replay.
+    pub id: i64,
+    /// Headers to set/append before sending (`Name`/`value` pairs).
+    #[serde(default)]
+    pub set_headers: Vec<HeaderEditParam>,
+    /// Replacement request body (UTF-8); omit to keep the original.
+    #[serde(default)]
+    pub set_body: Option<String>,
+    /// Override the request method (e.g. `POST`).
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+/// `fuzz` — run an Intruder attack against a stored flow.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FuzzParams {
+    /// Stored flow supplying the base request + transport target.
+    pub flow: i64,
+    /// Injection positions as `start:end` byte offsets into the request. When
+    /// empty, `§…§` markers in the request bytes delimit the positions.
+    #[serde(default)]
+    pub positions: Vec<String>,
+    /// The payload set (shared across positions per the engine).
+    #[serde(default)]
+    pub payloads: Vec<String>,
+    /// Attack mode: `sniper`, `battering-ram`, `pitchfork`, or `cluster-bomb`.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Max in-flight requests (default 8).
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// Pacing delay between launches, in milliseconds.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+    /// Custom position marker (defaults to `§`).
+    #[serde(default)]
+    pub marker: Option<String>,
+    /// Attack name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn default_mode() -> String {
+    "sniper".to_string()
+}
+
+/// `fuzz_results` — fetch one attack's per-payload results.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FuzzResultsParams {
+    /// Attack id (from `fuzz` / `fuzz_list`).
+    pub attack_id: i64,
+    /// Sort key: `anomaly` (default), `status`, or `len`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Max rows to return.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `fuzz_list` — list stored attacks.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct FuzzListParams {
+    /// Restrict to a workspace by NAME.
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// `compare` — structured diff of two flows.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CompareParams {
+    /// First flow id.
+    pub flow_a: i64,
+    /// Second flow id.
+    pub flow_b: i64,
+    /// What to diff: `headers`, `body`, or `all` (default).
+    #[serde(default)]
+    pub what: Option<String>,
+}
+
+/// `encode` / `decode` — byte transforms.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EncodeParams {
+    /// Scheme: `base64`, `base64url`, `url`, `hex` (encode+decode) or `jwt`
+    /// (decode only).
+    pub scheme: String,
+    /// The value to transform.
+    pub value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +302,32 @@ mod tests {
             serde_json::from_str(r#"{"argv":["curl","https://x"],"timeout_secs":9}"#).unwrap();
         assert_eq!(p.argv, vec!["curl", "https://x"]);
         assert_eq!(p.timeout_secs, Some(9));
+    }
+
+    #[test]
+    fn fuzz_params_defaults_mode() {
+        let p: FuzzParams = serde_json::from_str(r#"{"flow":7}"#).unwrap();
+        assert_eq!(p.flow, 7);
+        assert_eq!(p.mode, "sniper");
+        assert!(p.payloads.is_empty());
+        let p: FuzzParams = serde_json::from_str(
+            r#"{"flow":1,"positions":["3:4"],"payloads":["a","b"],"mode":"cluster-bomb"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.mode, "cluster-bomb");
+        assert_eq!(p.positions, vec!["3:4"]);
+    }
+
+    #[test]
+    fn req_replay_and_encode_params_decode() {
+        let p: ReqReplayParams = serde_json::from_str(
+            r#"{"id":3,"set_headers":[{"name":"X-A","value":"1"}],"method":"POST"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.id, 3);
+        assert_eq!(p.method.as_deref(), Some("POST"));
+        let p: EncodeParams = serde_json::from_str(r#"{"scheme":"base64","value":"hi"}"#).unwrap();
+        assert_eq!(p.scheme, "base64");
+        assert_eq!(p.value, "hi");
     }
 }
