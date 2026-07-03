@@ -499,6 +499,90 @@ pub struct NewAttackResult {
     pub ts: i64,
 }
 
+/// A persisted session-auth profile (schema v4): the login command + token
+/// extraction regex + header-injection template for one host scope, plus the
+/// last-minted token and the id of the match/replace rule that injects it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProfile {
+    /// Profile id.
+    pub id: i64,
+    /// Host scope (case-insensitive substring; empty = all hosts).
+    pub host: String,
+    /// Shell command whose stdout carries a fresh token.
+    pub login_cmd: String,
+    /// Regex (one capture group) applied to the login command's output to pull
+    /// the token.
+    pub extract_regex: String,
+    /// Header injection template, e.g. `Authorization: Bearer {}` (the `{}` is
+    /// substituted with the token).
+    pub header_template: String,
+    /// Last-minted token, if a refresh has run (masked when displayed).
+    pub token: Option<String>,
+    /// Id of the match/replace rule that injects this header (so refresh updates
+    /// it in place rather than stacking a new rule each time).
+    pub rule_id: Option<i64>,
+    /// Last update timestamp (unix millis).
+    pub updated_at: i64,
+}
+
+/// Parameters to upsert an [`AuthProfile`] (token/rule_id are managed by refresh).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewAuthProfile {
+    /// Host scope (empty = all).
+    pub host: String,
+    /// Login command.
+    pub login_cmd: String,
+    /// Token extraction regex.
+    pub extract_regex: String,
+    /// Header injection template.
+    pub header_template: String,
+}
+
+/// A capture-completeness telemetry row (schema v4): one per `burpwn exec`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecRecord {
+    /// Row id.
+    pub id: i64,
+    /// The exec correlation id stamped on this run's captured flows.
+    pub exec_id: String,
+    /// The command line (best-effort, for display).
+    pub cmd: String,
+    /// Whether the command was classified as clearly network-facing.
+    pub network_facing: bool,
+    /// Number of flows captured during this exec.
+    pub flow_count: i64,
+    /// Creation timestamp (unix millis).
+    pub created_at: i64,
+}
+
+/// Parameters to insert an [`ExecRecord`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewExecRecord {
+    /// Exec correlation id.
+    pub exec_id: String,
+    /// Command line.
+    pub cmd: String,
+    /// Network-facing classification.
+    pub network_facing: bool,
+    /// Captured flow count.
+    pub flow_count: i64,
+    /// Creation timestamp.
+    pub created_at: i64,
+}
+
+/// Aggregate capture-completeness stats over a session's execs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecStats {
+    /// Total recorded execs.
+    pub total_execs: i64,
+    /// Total flows captured across all execs.
+    pub total_flows: i64,
+    /// Execs classified as network-facing.
+    pub network_execs: i64,
+    /// Network-facing execs that captured ZERO flows (likely-escaped traffic).
+    pub network_zero_flow_execs: i64,
+}
+
 /// `serde_bytes`-style helper for `Vec<u8>` so JSON output is reasonable and
 /// binary survives round-trips (encoded as an array of byte ints by serde_json,
 /// but kept compact in bincode-like formats). Kept local to avoid a new dep.

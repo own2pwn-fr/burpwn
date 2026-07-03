@@ -116,6 +116,8 @@ pub struct HttpContext {
     pub writer: WriteHandle,
     /// Intercept primitive.
     pub intercept: InterceptController,
+    /// Session-auth auto-refresh trigger (inert unless the daemon armed it).
+    pub auth: crate::auth::AuthWatcher,
     /// Match/replace rules, snapshotted for the life of the connection.
     pub rules: Arc<Vec<burpwn_store::model::MatchReplaceRule>>,
     /// Default workspace id.
@@ -335,6 +337,13 @@ async fn handle_inner(
     // turns into a 502. The BODY is not collected yet — that is decided below.
     let (resp_parts, resp_body, up_guard, origin_cert_fp) =
         forward_streaming(&ctx.upstream, upstream_req).await?;
+
+    // Best-effort session-auth AUTO-refresh hook: signal the (debounced) host on
+    // a 401/403 so the daemon can re-mint an expired token. Inert (cheap no-op)
+    // unless the daemon armed the watcher via `AuthWatcher::activate`. Covers
+    // both the streaming and buffered response paths since the status is known
+    // here, before either branch. See [`crate::auth`] for the recursion guard.
+    ctx.auth.observe(&msg.host, resp_parts.status.as_u16());
 
     // --- TLS/connection metadata (best-effort) ---
     // Negotiated version/cipher/alpn come from the downstream MITM handshake

@@ -851,6 +851,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_profile_upsert_token_and_scope_lookup() {
+        use crate::model::NewAuthProfile;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let id = w
+            .upsert_auth_profile(NewAuthProfile {
+                host: "api.example.com".into(),
+                login_cmd: "printf tok123".into(),
+                extract_regex: "(tok[0-9]+)".into(),
+                header_template: "Authorization: Bearer {}".into(),
+            })
+            .await
+            .unwrap();
+        assert!(id > 0);
+
+        // A re-upsert of the same host updates config in place (no duplicate).
+        let id2 = w
+            .upsert_auth_profile(NewAuthProfile {
+                host: "api.example.com".into(),
+                login_cmd: "printf tok999".into(),
+                extract_regex: "(tok[0-9]+)".into(),
+                header_template: "Authorization: Bearer {}".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(reader.auth_profiles().unwrap().len(), 1);
+
+        // Setting a token + rule id is reflected; a re-upsert does NOT clobber it.
+        w.set_auth_token("api.example.com", Some("tok999".into()), Some(42), 7)
+            .await
+            .unwrap();
+        let _ = w
+            .upsert_auth_profile(NewAuthProfile {
+                host: "api.example.com".into(),
+                login_cmd: "printf again".into(),
+                extract_regex: "(x)".into(),
+                header_template: "Authorization: Bearer {}".into(),
+            })
+            .await
+            .unwrap();
+        let p = reader.auth_profiles().unwrap().pop().unwrap();
+        assert_eq!(p.token.as_deref(), Some("tok999"));
+        assert_eq!(p.rule_id, Some(42));
+        assert_eq!(p.login_cmd, "printf again");
+
+        // Scope lookup: substring match wins; a non-matching host resolves None.
+        assert!(reader
+            .auth_profile_for_host("api.example.com")
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .auth_profile_for_host("other.test")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_records_and_stats_aggregate_zero_flow_execs() {
+        use crate::model::NewExecRecord;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        // A network-facing exec that captured flows.
+        w.insert_exec(NewExecRecord {
+            exec_id: "e1".into(),
+            cmd: "curl https://x".into(),
+            network_facing: true,
+            flow_count: 3,
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+        // A network-facing exec that captured NOTHING (traffic escaped).
+        w.insert_exec(NewExecRecord {
+            exec_id: "e2".into(),
+            cmd: "curl https://y".into(),
+            network_facing: true,
+            flow_count: 0,
+            created_at: 2,
+        })
+        .await
+        .unwrap();
+        // A non-network exec with zero flows must NOT count as escaped.
+        w.insert_exec(NewExecRecord {
+            exec_id: "e3".into(),
+            cmd: "ls".into(),
+            network_facing: false,
+            flow_count: 0,
+            created_at: 3,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(reader.exec_records().unwrap().len(), 3);
+        let stats = reader.exec_stats().unwrap();
+        assert_eq!(stats.total_execs, 3);
+        assert_eq!(stats.total_flows, 3);
+        assert_eq!(stats.network_execs, 2);
+        assert_eq!(stats.network_zero_flow_execs, 1);
+    }
+
+    #[tokio::test]
     async fn set_flow_tls_meta_persists() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("session.db")).unwrap();

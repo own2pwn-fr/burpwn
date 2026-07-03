@@ -43,6 +43,7 @@
 //! The binary crate calls [`run`]; it parses argv, sets up tracing, dispatches,
 //! and returns a process exit code.
 
+pub mod auth;
 pub mod cli;
 pub mod commands;
 pub mod compare;
@@ -53,6 +54,7 @@ pub mod envelope;
 pub mod exec;
 pub mod fuzz;
 pub mod har;
+pub mod initcheck;
 pub mod paths;
 pub mod replay;
 pub mod wrap_hook;

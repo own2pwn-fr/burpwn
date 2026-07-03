@@ -13,15 +13,19 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
 
 type MigrationStep = fn(&Connection) -> Result<()>;
 
-const MIGRATIONS: &[(i64, MigrationStep)] =
-    &[(1, migrate_v1), (2, migrate_v2), (3, migrate_v3)];
+const MIGRATIONS: &[(i64, MigrationStep)] = &[
+    (1, migrate_v1),
+    (2, migrate_v2),
+    (3, migrate_v3),
+    (4, migrate_v4),
+];
 
 /// Apply pending migrations, stamp the version, and ensure the default
 /// workspace exists. Refuses to open a file stamped with a newer schema.
@@ -290,6 +294,41 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v4: session-robustness storage. Adds `auth_profiles` (persisted session-auth
+/// login command + token-extraction regex + header-injection template, so
+/// `session auth refresh` can re-mint a token and update ONE injection rule) and
+/// `execs` (capture-completeness telemetry: one row per `burpwn exec` recording
+/// whether it was network-facing and how many flows it captured). Both use
+/// `IF NOT EXISTS`, so the step is idempotent on the fresh-create replay and the
+/// in-place v3→v4 upgrade alike.
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS auth_profiles (
+            id              INTEGER PRIMARY KEY,
+            host            TEXT NOT NULL DEFAULT '' UNIQUE,
+            login_cmd       TEXT NOT NULL,
+            extract_regex   TEXT NOT NULL,
+            header_template TEXT NOT NULL,
+            token           TEXT,
+            rule_id         INTEGER,
+            updated_at      INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS execs (
+            id             INTEGER PRIMARY KEY,
+            exec_id        TEXT NOT NULL UNIQUE,
+            cmd            TEXT NOT NULL DEFAULT '',
+            network_facing INTEGER NOT NULL DEFAULT 0,
+            flow_count     INTEGER NOT NULL DEFAULT 0,
+            created_at     INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_execs_exec_id ON execs(exec_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -356,6 +395,8 @@ mod tests {
             "ws_messages",
             "attacks",
             "attack_results",
+            "auth_profiles",
+            "execs",
         ] {
             assert!(table_exists(&conn, t), "missing table {t}");
         }
@@ -514,6 +555,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn migrates_v3_to_v4_adds_auth_and_exec_tables() {
+        // A file stamped at schema v3 (has flows + v3 tables but none of the v4
+        // additions) must gain `auth_profiles` + `execs` in place on upgrade.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        assert!(!table_exists(&conn, "auth_profiles"));
+        assert!(!table_exists(&conn, "execs"));
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "auth_profiles"));
+        assert!(table_exists(&conn, "execs"));
+
+        // Idempotent second init is a no-op.
+        init(&conn).unwrap();
     }
 
     #[test]

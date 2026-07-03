@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::blob::BlobStore;
 use crate::error::{Result, StoreError};
 use crate::model::{
-    FlowStart, InterceptState, NewAttack, NewAttackResult, NewMatchReplaceRule, RequestData,
-    ResponseData, WsDirection,
+    FlowStart, InterceptState, NewAttack, NewAttackResult, NewAuthProfile, NewExecRecord,
+    NewMatchReplaceRule, RequestData, ResponseData, WsDirection,
 };
 
 /// Default bound for the writer channel. Large enough to absorb bursts without
@@ -272,6 +272,36 @@ pub enum WriteOp {
         status: String,
         /// Optional completion ack.
         reply: Option<AckReply>,
+    },
+    /// Insert-or-update a session-auth profile keyed by host; replies with its id.
+    /// Only the config columns are touched — the token/rule_id are managed by
+    /// [`WriteOp::SetAuthToken`] so a re-`set` never clobbers a live token.
+    UpsertAuthProfile {
+        /// Profile definition.
+        profile: NewAuthProfile,
+        /// Reply with the profile id.
+        reply: IdReply,
+    },
+    /// Set the current token + injection rule id on an auth profile (by host).
+    SetAuthToken {
+        /// Host scope key.
+        host: String,
+        /// The freshly-minted token (or `None` to clear).
+        token: Option<String>,
+        /// The match/replace rule injecting the header (or `None`).
+        rule_id: Option<i64>,
+        /// Update timestamp.
+        updated_at: i64,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
+    },
+    /// Record (or update) a capture-completeness telemetry row for an exec;
+    /// replies with the row id.
+    InsertExec {
+        /// Telemetry row.
+        record: NewExecRecord,
+        /// Reply with the row id.
+        reply: IdReply,
     },
 }
 
@@ -555,6 +585,41 @@ impl WriteHandle {
         .await?;
         recv_ack(rx).await
     }
+
+    /// Insert-or-update a session-auth profile (by host), awaiting its id.
+    pub async fn upsert_auth_profile(&self, profile: NewAuthProfile) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::UpsertAuthProfile { profile, reply })
+            .await?;
+        recv_id(rx).await
+    }
+
+    /// Set an auth profile's current token + injection rule id, awaiting ack.
+    pub async fn set_auth_token(
+        &self,
+        host: impl Into<String>,
+        token: Option<String>,
+        rule_id: Option<i64>,
+        updated_at: i64,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::SetAuthToken {
+            host: host.into(),
+            token,
+            rule_id,
+            updated_at,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
+    /// Record a capture-completeness telemetry row for an exec, awaiting its id.
+    pub async fn insert_exec(&self, record: NewExecRecord) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::InsertExec { record, reply }).await?;
+        recv_id(rx).await
+    }
 }
 
 async fn recv_id(rx: oneshot::Receiver<Result<i64>>) -> Result<i64> {
@@ -765,6 +830,27 @@ fn handle_op(conn: &Connection, op: WriteOp) {
             .map(|_| ())
             .map_err(Into::into),
         ),
+        WriteOp::UpsertAuthProfile { profile, reply } => {
+            let _ = reply.send(do_upsert_auth_profile(conn, &profile));
+        }
+        WriteOp::SetAuthToken {
+            host,
+            token,
+            rule_id,
+            updated_at,
+            reply,
+        } => ack(
+            reply,
+            conn.execute(
+                "UPDATE auth_profiles SET token = ?1, rule_id = ?2, updated_at = ?3 WHERE host = ?4",
+                rusqlite::params![token, rule_id, updated_at, host],
+            )
+            .map(|_| ())
+            .map_err(Into::into),
+        ),
+        WriteOp::InsertExec { record, reply } => {
+            let _ = reply.send(do_insert_exec(conn, &record));
+        }
     }
 }
 
@@ -1004,6 +1090,51 @@ fn do_insert_attack_result(conn: &Connection, r: &NewAttackResult) -> Result<i64
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+fn do_upsert_auth_profile(conn: &Connection, p: &NewAuthProfile) -> Result<i64> {
+    // Upsert by host. On conflict we update ONLY the config columns, leaving the
+    // token + rule_id untouched so a re-`set` of an existing profile never blanks
+    // a live token / detaches its injection rule.
+    conn.execute(
+        "INSERT INTO auth_profiles(host, login_cmd, extract_regex, header_template, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 0)
+         ON CONFLICT(host) DO UPDATE SET
+            login_cmd = excluded.login_cmd,
+            extract_regex = excluded.extract_regex,
+            header_template = excluded.header_template",
+        rusqlite::params![p.host, p.login_cmd, p.extract_regex, p.header_template],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM auth_profiles WHERE host = ?1",
+        [&p.host],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+fn do_insert_exec(conn: &Connection, r: &NewExecRecord) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO execs(exec_id, cmd, network_facing, flow_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(exec_id) DO UPDATE SET
+            cmd = excluded.cmd,
+            network_facing = excluded.network_facing,
+            flow_count = excluded.flow_count",
+        rusqlite::params![
+            r.exec_id,
+            r.cmd,
+            r.network_facing as i64,
+            r.flow_count,
+            r.created_at,
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM execs WHERE exec_id = ?1",
+        [&r.exec_id],
+        |row| row.get(0),
+    )?;
+    Ok(id)
 }
 
 fn do_enqueue_intercept(conn: &Connection, flow_id: i64, created_at: i64) -> Result<i64> {

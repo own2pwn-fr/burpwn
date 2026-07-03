@@ -216,6 +216,13 @@ pub struct InitArgs {
     /// Install the hook for a specific agent (e.g. `claude`, `cursor`).
     #[arg(long)]
     pub agent: Option<String>,
+
+    /// Verify (don't install): drive a synthetic network command through each
+    /// agent's `wrap-hook` path and assert the command is actually rewritten to
+    /// route through `burpwn exec`. Reports per-agent PASS/FAIL/ADVISORY and
+    /// exits non-zero if any agent that should rewrite doesn't.
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// `proxy` (hidden daemon) arguments.
@@ -256,6 +263,68 @@ pub enum SessionAction {
         /// Session name.
         name: String,
     },
+    /// Capture-completeness stats for a session (execs vs captured flows; flags
+    /// network-facing execs that captured ZERO flows — traffic likely escaped).
+    Stats {
+        /// Session to report on (defaults to the active session).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Session auth handling: persist a login command + token-injection rule and
+    /// refresh the token when the target starts returning 401s.
+    Auth {
+        /// Auth subcommand.
+        #[command(subcommand)]
+        action: SessionAuthAction,
+    },
+}
+
+/// `session auth` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SessionAuthAction {
+    /// Persist (or update) an auth profile for the session.
+    Set(SessionAuthSetArgs),
+    /// Run the stored login command, extract the token, and (re)install the
+    /// match/replace rule that injects the auth header into in-scope requests.
+    Refresh {
+        /// Restrict to the profile for this host scope (defaults to all profiles).
+        #[arg(long)]
+        host: Option<String>,
+        /// Session to operate on (defaults to the active session).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show the stored auth profile(s) and whether a token is currently set
+    /// (the token value is masked).
+    Status {
+        /// Session to operate on (defaults to the active session).
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+/// `session auth set` arguments.
+#[derive(Debug, Args)]
+pub struct SessionAuthSetArgs {
+    /// The login command whose output carries a fresh token, e.g.
+    /// `curl -s https://api/login -d user=…`.
+    #[arg(long)]
+    pub login: String,
+    /// A regex with ONE capture group applied to the login command's output to
+    /// pull the token, e.g. `"token":"([^"]+)"`.
+    #[arg(long)]
+    pub extract: String,
+    /// The header to inject, with `{}` where the token goes, e.g.
+    /// `Authorization: Bearer {}`.
+    #[arg(long)]
+    pub header: String,
+    /// Host scope the injection applies to (case-insensitive substring; omit for
+    /// all hosts).
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Session to operate on (defaults to the active session).
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 /// `exec` arguments.
@@ -379,6 +448,23 @@ pub enum InterceptAction {
     Drop {
         /// Parked id.
         id: u64,
+    },
+    /// Narrow blocking interception to a host/path (so not every flow parks), or
+    /// clear the scope with `--clear`.
+    Scope {
+        /// Host substring the flow must contain to be intercepted. Omit with
+        /// `--clear` to widen back to every flow.
+        #[arg(required_unless_present = "clear")]
+        pattern: Option<String>,
+        /// Also require this path substring.
+        #[arg(long)]
+        path: Option<String>,
+        /// Also require this exact request method (case-insensitive).
+        #[arg(long)]
+        method: Option<String>,
+        /// Clear the scope (intercept every flow again).
+        #[arg(long, conflicts_with_all = ["pattern", "path", "method"])]
+        clear: bool,
     },
 }
 

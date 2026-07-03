@@ -26,6 +26,9 @@ burpwn-proxy.workspace = true
 burpwn-sandbox.workspace = true
 burpwn-wrap.workspace = true
 libc.workspace = true
+# Already in the workspace lock (a burpwn-proxy dep); used by `session auth`
+# token extraction + injection-rule building.
+regex = "1.10"
 
 [dev-dependencies]
 tempfile = "3"

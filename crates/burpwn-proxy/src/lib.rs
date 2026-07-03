@@ -20,6 +20,7 @@
 //! - [`InterceptController`] (re-exported) — the blocking-intercept primitive
 //!   M6/M7 wire CLI + MCP onto.
 
+pub mod auth;
 pub mod classify;
 pub mod decode;
 pub mod dns;
@@ -53,6 +54,7 @@ use burpwn_tls::{
     upstream_connector, upstream_connector_alpn, CertAuthority, LeafGenerator, PinnedHosts,
 };
 
+pub use crate::auth::AuthWatcher;
 pub use crate::classify::{Class, PrefixedStream};
 pub use crate::fuzz::{
     run_attack, AttackMode, AttackReport, BaselineStats, FuzzConfig, FuzzResult, HttpReplaySender,
@@ -99,6 +101,7 @@ pub struct Proxy {
     reader: burpwn_store::Reader,
     pinned: PinnedHosts,
     intercept: InterceptController,
+    auth: AuthWatcher,
     workspace_id: i64,
     exec_id: Option<String>,
 }
@@ -119,6 +122,7 @@ impl Proxy {
             reader,
             pinned: PinnedHosts::new(),
             intercept: InterceptController::new(),
+            auth: AuthWatcher::new(),
             workspace_id: cfg.workspace_id,
             exec_id: cfg.exec_id,
         })
@@ -127,6 +131,13 @@ impl Proxy {
     /// The intercept primitive, for CLI/MCP wiring (M6/M7).
     pub fn intercept(&self) -> InterceptController {
         self.intercept.clone()
+    }
+
+    /// The session-auth auto-refresh trigger. The daemon calls
+    /// [`AuthWatcher::activate`] on this to arm best-effort auto-refresh (the
+    /// proxy then signals 401/403 hosts for the daemon to refresh).
+    pub fn auth(&self) -> AuthWatcher {
+        self.auth.clone()
     }
 
     /// The set of hosts that rejected MITM (spliced through).
@@ -196,6 +207,7 @@ impl Proxy {
         HttpContext {
             writer: self.writer.clone(),
             intercept: self.intercept.clone(),
+            auth: self.auth.clone(),
             rules: self.rules(),
             workspace_id,
             exec_id,
@@ -273,6 +285,7 @@ impl Proxy {
                 let ctx = HttpContext {
                     writer: self.writer.clone(),
                     intercept: self.intercept.clone(),
+                    auth: self.auth.clone(),
                     rules: self.rules(),
                     workspace_id,
                     exec_id,

@@ -129,6 +129,55 @@ pub struct InterceptForwardParams {
     /// Replacement body (UTF-8); omit to keep the original.
     #[serde(default)]
     pub set_body: Option<String>,
+    /// Replacement request method (e.g. `POST`); omit to keep the original.
+    /// (Requires an `await_intercept`-parked request — a still-queued intercept
+    /// can only be forwarded unchanged.)
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Replacement request path/target; omit to keep the original.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// `intercept_scope` — narrow (or clear) blocking interception.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct InterceptScopeParams {
+    /// Host substring a flow must contain to be intercepted (omit = any).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Path substring a flow must contain (omit = any).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Exact request method, case-insensitive (omit = any).
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Clear the scope so every flow is intercepted again (ignores the other
+    /// fields).
+    #[serde(default)]
+    pub clear: bool,
+}
+
+/// `session_auth_set` — persist a session-auth profile.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SessionAuthSetParams {
+    /// Login command whose output carries a fresh token.
+    pub login: String,
+    /// Regex with ONE capture group applied to the login output to pull the token.
+    pub extract: String,
+    /// Header to inject with `{}` where the token goes, e.g. `Authorization: Bearer {}`.
+    pub header: String,
+    /// Host scope the injection applies to (case-insensitive substring; omit =
+    /// all hosts).
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// `session_auth_refresh` — re-mint the token + update the injection rule.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SessionAuthRefreshParams {
+    /// Restrict to the profile for this exact host scope (omit = all profiles).
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// `intercept_drop` — drop a parked intercept by id.

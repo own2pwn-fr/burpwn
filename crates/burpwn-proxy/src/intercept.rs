@@ -82,7 +82,7 @@ pub struct PendingSummary {
 
 /// Scope filter: simple case-insensitive substring matches. An empty field
 /// matches everything on that dimension.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InterceptScope {
     /// Substring the host must contain (empty = any).
     pub host_contains: String,
@@ -161,6 +161,11 @@ impl InterceptController {
     /// Replace the scope filter.
     pub fn set_scope(&self, scope: InterceptScope) {
         *self.inner.scope.lock() = scope;
+    }
+
+    /// Snapshot the current scope filter (for `Status` / round-trip tests).
+    pub fn scope(&self) -> InterceptScope {
+        self.inner.scope.lock().clone()
     }
 
     /// Override the park timeout (after which a parked flow auto-forwards).

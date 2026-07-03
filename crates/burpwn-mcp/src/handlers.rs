@@ -330,10 +330,33 @@ pub async fn intercept_forward(
             })
             .collect(),
         body: params.set_body.clone(),
-        method: None,
-        path: None,
+        // MCP forward now reaches CLI parity: it can also change the method/path
+        // of an `await_intercept`-parked request (previously CLI-only).
+        method: params.method.clone(),
+        path: params.path.clone(),
     };
     control_value(c.intercept_forward(params.id, edits).await?)
+}
+
+/// `intercept_scope` — narrow (or clear) blocking interception to a host/path/
+/// method so not every flow parks. `clear` (or all-empty fields) widens back to
+/// every flow.
+pub async fn intercept_scope(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::InterceptScopeParams,
+) -> Result<Value> {
+    let mut c = connect_control(paths, session).await?;
+    let (host, path, method) = if params.clear {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            params.host.clone().unwrap_or_default(),
+            params.path.clone().unwrap_or_default(),
+            params.method.clone().unwrap_or_default(),
+        )
+    };
+    control_value(c.intercept_set_scope(host, path, method).await?)
 }
 
 /// `intercept_drop`.
@@ -462,6 +485,123 @@ pub fn encode(params: &crate::params::EncodeParams) -> Result<Value> {
 /// `decode` — reverse byte transform (plus `jwt`).
 pub fn decode(params: &crate::params::EncodeParams) -> Result<Value> {
     burpwn_cli::encode::decode(&params.scheme, &params.value)
+}
+
+// --- session stats + auth --------------------------------------------------
+
+/// `session_stats` — capture-completeness telemetry: execs vs captured flows,
+/// and the network-facing execs that captured ZERO flows (traffic likely
+/// escaped capture, e.g. an agent hook silently no-op'd).
+pub fn session_stats(paths: &Paths, session: &str) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let stats = reader.exec_stats()?;
+    let escaped: Vec<Value> = reader
+        .exec_records()?
+        .into_iter()
+        .filter(|e| e.network_facing && e.flow_count == 0)
+        .map(|e| json!({ "exec_id": e.exec_id, "cmd": e.cmd }))
+        .collect();
+    Ok(json!({
+        "session": session,
+        "total_execs": stats.total_execs,
+        "total_flows": stats.total_flows,
+        "network_execs": stats.network_execs,
+        "network_zero_flow_execs": stats.network_zero_flow_execs,
+        "escaped_execs": escaped,
+    }))
+}
+
+/// `session_auth_set` — persist (or update) a session-auth profile. Store-only
+/// (no sandbox), so it runs in-process.
+pub async fn session_auth_set(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::SessionAuthSetParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let host = params.host.clone().unwrap_or_default();
+    let id =
+        burpwn_cli::auth::auth_set(&store, &host, &params.login, &params.extract, &params.header)
+            .await?;
+    Ok(json!({ "id": id, "host": host }))
+}
+
+/// `session_auth_status` — the stored profiles with the token value MASKED.
+pub fn session_auth_status(paths: &Paths, session: &str) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let profiles: Vec<Value> = store
+        .reader()
+        .auth_profiles()?
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "host": p.host,
+                "login_cmd": p.login_cmd,
+                "header_template": p.header_template,
+                "token_set": p.token.is_some(),
+                "token": p.token.as_deref().map(burpwn_cli::auth::mask_token),
+                "rule_id": p.rule_id,
+            })
+        })
+        .collect();
+    Ok(json!({ "profiles": profiles }))
+}
+
+/// `session_auth_refresh` — re-mint the token(s) + update the injection rule(s).
+/// This runs the login command in the sandbox, so it reuses the FULL CLI path
+/// (daemon-ensure + sandbox) by shelling out to `burpwn session auth refresh`
+/// (same rationale as [`run_exec`] shelling out for the sandbox).
+pub async fn session_auth_refresh(
+    session: &str,
+    params: &crate::params::SessionAuthRefreshParams,
+) -> Result<Value> {
+    let mut args = vec![
+        "--json".to_string(),
+        "session".to_string(),
+        "auth".to_string(),
+        "refresh".to_string(),
+        "--session".to_string(),
+        session.to_string(),
+    ];
+    if let Some(h) = &params.host {
+        args.push("--host".to_string());
+        args.push(h.clone());
+    }
+    run_burpwn_json(&args).await
+}
+
+/// Run `burpwn <args>` (which include `--json`) capturing stdout, and return the
+/// `data` of its `{ok,data,error}` envelope (or an error on `ok:false`). Used by
+/// the auth-refresh tool to reuse the CLI's daemon-ensure + sandbox path.
+async fn run_burpwn_json(args: &[String]) -> Result<Value> {
+    let exe = std::env::current_exe().context("locating the burpwn executable")?;
+    let output = tokio::process::Command::new(&exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawning burpwn")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let env: Option<Value> = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|l| serde_json::from_str(l).ok());
+    match env {
+        Some(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+            Ok(v.get("data").cloned().unwrap_or_else(|| json!({})))
+        }
+        Some(v) => Err(anyhow!(
+            "burpwn command failed: {}",
+            v.get("error").and_then(Value::as_str).unwrap_or("unknown")
+        )),
+        None => Err(anyhow!(
+            "burpwn produced no JSON envelope (exit {:?})",
+            output.status.code()
+        )),
+    }
 }
 
 // --- exec ------------------------------------------------------------------

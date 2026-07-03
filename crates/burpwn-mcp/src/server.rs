@@ -84,6 +84,52 @@ impl BurpwnServer {
             .and_then(ok_json)
     }
 
+    #[tool(
+        description = "Capture-completeness telemetry for the session: total execs vs captured flows, and network-facing execs that captured ZERO flows (traffic likely escaped capture — the agent hook may not be routing through `burpwn exec`)."
+    )]
+    async fn session_stats(&self) -> Result<CallToolResult, McpError> {
+        handlers::session_stats(self.paths(), self.session())
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    // --- session auth -----------------------------------------------------
+
+    #[tool(
+        description = "Persist a session-auth profile: a login command, a token-extraction regex (one capture group), and a header-injection template (e.g. 'Authorization: Bearer {}'), optionally scoped to a host. Use session_auth_refresh to mint the token."
+    )]
+    async fn session_auth_set(
+        &self,
+        Parameters(params): Parameters<SessionAuthSetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::session_auth_set(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Run the stored login command in the sandbox, extract a fresh token, and install/UPDATE the match/replace rule that injects the auth header into in-scope requests (idempotent). Use when a target starts returning 401s."
+    )]
+    async fn session_auth_refresh(
+        &self,
+        Parameters(params): Parameters<SessionAuthRefreshParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::session_auth_refresh(self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Show the stored session-auth profile(s) and whether a token is currently set (the token value is masked)."
+    )]
+    async fn session_auth_status(&self) -> Result<CallToolResult, McpError> {
+        handlers::session_auth_status(self.paths(), self.session())
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
     // --- query ------------------------------------------------------------
 
     #[tool(
@@ -229,13 +275,26 @@ impl BurpwnServer {
     }
 
     #[tool(
-        description = "Forward (release) a parked intercept by id, optionally setting headers and/or replacing the body."
+        description = "Forward (release) a parked intercept by id, optionally setting headers, replacing the body, or (for an await_intercept-parked request) changing the method/path."
     )]
     async fn intercept_forward(
         &self,
         Parameters(params): Parameters<InterceptForwardParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::intercept_forward(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Narrow blocking interception to a host/path/method so not every flow parks (set clear=true to widen back to every flow). Wires the proxy's scope filter."
+    )]
+    async fn intercept_scope(
+        &self,
+        Parameters(params): Parameters<InterceptScopeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::intercept_scope(self.paths(), self.session(), &params)
             .await
             .map_err(to_mcp_err)
             .and_then(ok_json)

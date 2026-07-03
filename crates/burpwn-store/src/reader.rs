@@ -11,9 +11,9 @@ use rusqlite::Connection;
 use crate::blob::get_blob;
 use crate::error::Result;
 use crate::model::{
-    Attack, AttackResult, FlowDetail, FlowFilter, FlowRow, Group, Intercept, InterceptState,
-    MatchKind, MatchReplaceRule, Note, Protocol, RequestData, ResponseData, Tag, Workspace,
-    WsDirection, WsMessage,
+    Attack, AttackResult, AuthProfile, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow,
+    Group, Intercept, InterceptState, MatchKind, MatchReplaceRule, Note, Protocol, RequestData,
+    ResponseData, Tag, Workspace, WsDirection, WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -574,6 +574,99 @@ impl Reader {
     pub fn pending_intercepts(&self) -> Result<Vec<Intercept>> {
         self.list_intercepts(Some(InterceptState::Pending))
     }
+
+    // ---- session-auth profiles (schema v4) ----
+
+    /// List every persisted session-auth profile (ascending id).
+    pub fn auth_profiles(&self) -> Result<Vec<AuthProfile>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, host, login_cmd, extract_regex, header_template, token, rule_id, updated_at
+             FROM auth_profiles ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], row_to_auth_profile)?;
+        collect(rows)
+    }
+
+    /// The auth profile whose host scope matches `host` (case-insensitive
+    /// substring; an empty scope matches every host). The most specific
+    /// (longest, non-empty) scope wins; `None` when no profile applies.
+    pub fn auth_profile_for_host(&self, host: &str) -> Result<Option<AuthProfile>> {
+        let host_l = host.to_ascii_lowercase();
+        let mut best: Option<AuthProfile> = None;
+        for p in self.auth_profiles()? {
+            let scope = p.host.trim().to_ascii_lowercase();
+            let matches = scope.is_empty() || host_l.contains(&scope);
+            if !matches {
+                continue;
+            }
+            match &best {
+                Some(b) if b.host.trim().len() >= p.host.trim().len() => {}
+                _ => best = Some(p),
+            }
+        }
+        Ok(best)
+    }
+
+    // ---- capture-completeness telemetry (schema v4) ----
+
+    /// Every recorded exec row (ascending id).
+    pub fn exec_records(&self) -> Result<Vec<ExecRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, exec_id, cmd, network_facing, flow_count, created_at
+             FROM execs ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ExecRecord {
+                id: r.get(0)?,
+                exec_id: r.get(1)?,
+                cmd: r.get(2)?,
+                network_facing: r.get::<_, i64>(3)? != 0,
+                flow_count: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    /// Aggregate capture-completeness stats: total execs / flows and how many
+    /// network-facing execs captured ZERO flows (traffic likely escaped capture).
+    pub fn exec_stats(&self) -> Result<ExecStats> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(flow_count), 0),
+                COALESCE(SUM(network_facing), 0),
+                COALESCE(SUM(CASE WHEN network_facing = 1 AND flow_count = 0 THEN 1 ELSE 0 END), 0)
+             FROM execs",
+            [],
+            |r| {
+                Ok(ExecStats {
+                    total_execs: r.get(0)?,
+                    total_flows: r.get(1)?,
+                    network_execs: r.get(2)?,
+                    network_zero_flow_execs: r.get(3)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// Map an `auth_profiles` row into an [`AuthProfile`].
+fn row_to_auth_profile(r: &rusqlite::Row) -> rusqlite::Result<AuthProfile> {
+    Ok(AuthProfile {
+        id: r.get(0)?,
+        host: r.get(1)?,
+        login_cmd: r.get(2)?,
+        extract_regex: r.get(3)?,
+        header_template: r.get(4)?,
+        token: r.get(5)?,
+        rule_id: r.get(6)?,
+        updated_at: r.get(7)?,
+    })
 }
 
 /// Map a flows-join row (15+ columns; first 14 are the [`FlowRow`] shape) into a
