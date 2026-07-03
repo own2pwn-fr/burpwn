@@ -71,7 +71,243 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::Compare(args) => cmd_compare(&out, paths, args),
         Command::Encode { scheme, value } => cmd_encode(&out, &scheme, &value),
         Command::Decode { scheme, value } => cmd_decode(&out, &scheme, &value),
+        Command::Skill { action } => cmd_skill(&out, action),
+        Command::Mcp { action } => cmd_mcp(&out, action),
     }
+}
+
+// --- skill (portable skill installer) --------------------------------------
+
+fn cmd_skill(out: &Output, action: SkillAction) -> Result<i32> {
+    use crate::skill::{self, Scope};
+    match action {
+        SkillAction::List => {
+            let rows: Vec<Value> = skill::targets()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "agent": t.slug,
+                        "name": t.name,
+                        "format": t.format.label(),
+                        "project_path": t.project_rel,
+                        "global_path": t.global_rel,
+                        "note": t.note,
+                    })
+                })
+                .collect();
+            if out.json {
+                println!(
+                    "{}",
+                    Envelope::ok(json!({ "targets": rows })).to_json_line()
+                );
+            } else {
+                println!("Supported skill targets:");
+                for t in skill::targets() {
+                    let global = t.global_rel.unwrap_or("(project only)");
+                    println!(
+                        "  {:<12} {:<18} project={}  global={}",
+                        t.slug,
+                        t.format.label(),
+                        t.project_rel,
+                        global
+                    );
+                    if !t.note.is_empty() {
+                        println!("               note: {}", t.note);
+                    }
+                }
+            }
+            Ok(0)
+        }
+        SkillAction::Install(args) => cmd_skill_install(out, args),
+        SkillAction::Uninstall(args) => {
+            let scope = if args.global {
+                Scope::Global
+            } else {
+                Scope::Project
+            };
+            let root = scope_root(scope)?;
+            let target = skill::target_by_slug(&args.agent).ok_or_else(|| {
+                anyhow!(
+                    "unknown framework: {:?} (try `burpwn skill list`)",
+                    args.agent
+                )
+            })?;
+            let rep = skill::uninstall(target, &root, scope).map_err(|e| anyhow!("{e}"))?;
+            out.ok(
+                format!(
+                    "{}: {} ({})",
+                    rep.slug,
+                    rep.action.as_str(),
+                    rep.path.display()
+                ),
+                json!({ "removed": [{
+                    "agent": rep.slug,
+                    "path": rep.path,
+                    "action": rep.action.as_str(),
+                }] }),
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn cmd_skill_install(out: &Output, args: SkillInstallArgs) -> Result<i32> {
+    use crate::skill::{self, Scope};
+
+    let scope = if args.global {
+        Scope::Global
+    } else {
+        Scope::Project
+    };
+
+    // Resolve the set of targets: --all, or a single --agent.
+    let selected: Vec<&'static skill::SkillTarget> = if args.all {
+        skill::targets().iter().collect()
+    } else {
+        let slug = args
+            .agent
+            .as_deref()
+            .ok_or_else(|| anyhow!("pass --agent <slug> or --all (see `burpwn skill list`)"))?;
+        let t = skill::target_by_slug(slug)
+            .ok_or_else(|| anyhow!("unknown framework: {slug:?} (try `burpwn skill list`)"))?;
+        vec![t]
+    };
+
+    let root = scope_root(scope)?;
+    let mut reports = Vec::new();
+    for target in selected {
+        // With --all + --global, skip frameworks that don't support global
+        // rather than erroring the whole run; a single explicit --agent surfaces
+        // the error.
+        match skill::install(target, &root, scope, args.print, args.force) {
+            Ok(rep) => {
+                if args.print {
+                    // Print the resolved path + content; write nothing.
+                    println!("# {} -> {}", rep.slug, rep.path.display());
+                    println!("{}", rep.content);
+                }
+                reports.push(json!({
+                    "agent": rep.slug,
+                    "path": rep.path,
+                    "action": rep.action.as_str(),
+                }));
+            }
+            Err(e @ skill::SkillError::ScopeUnsupported { .. }) if args.all => {
+                reports.push(json!({
+                    "agent": target.slug,
+                    "path": Value::Null,
+                    "action": "Skipped",
+                    "reason": e.to_string(),
+                }));
+            }
+            Err(e) => return Err(anyhow!("{e}")),
+        }
+    }
+
+    let human = format!("processed {} skill target(s)", reports.len());
+    out.ok(human, json!({ "installed": reports }));
+    Ok(0)
+}
+
+/// The root directory a scope resolves against: cwd for project, HOME for global.
+fn scope_root(scope: crate::skill::Scope) -> Result<std::path::PathBuf> {
+    match scope {
+        crate::skill::Scope::Project => {
+            std::env::current_dir().context("resolving current directory")
+        }
+        crate::skill::Scope::Global => dirs_home(),
+    }
+}
+
+// --- mcp register (complementary MCP host registration) --------------------
+
+fn cmd_mcp(out: &Output, action: McpAction) -> Result<i32> {
+    match action {
+        McpAction::Register(args) => cmd_mcp_register(out, args),
+    }
+}
+
+fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
+    use crate::mcpreg;
+
+    if args.list {
+        let rows: Vec<Value> = mcpreg::hosts()
+            .iter()
+            .map(|h| {
+                json!({
+                    "agent": h.slug,
+                    "name": h.name,
+                    "config": h.config_rel,
+                    "format": match h.kind {
+                        mcpreg::McpKind::Toml => "toml",
+                        mcpreg::McpKind::Json => "json",
+                    },
+                })
+            })
+            .collect();
+        if out.json {
+            println!("{}", Envelope::ok(json!({ "hosts": rows })).to_json_line());
+        } else {
+            println!("Supported MCP hosts (config relative to HOME):");
+            for h in mcpreg::hosts() {
+                println!(
+                    "  {:<12} {:<5} {}",
+                    h.slug,
+                    match h.kind {
+                        mcpreg::McpKind::Toml => "toml",
+                        mcpreg::McpKind::Json => "json",
+                    },
+                    h.config_rel
+                );
+            }
+        }
+        return Ok(0);
+    }
+
+    let slug = args
+        .agent
+        .as_deref()
+        .ok_or_else(|| anyhow!("pass --agent <host> or --list (see `mcp register --list`)"))?;
+
+    // Frameworks with no stdio MCP host: clear message, not a guessed path.
+    if let Some(name) = mcpreg::unsupported_slug(slug) {
+        let msg = format!("{name} has no stdio MCP host to register into; see its docs");
+        if out.json {
+            println!("{}", Envelope::err(&msg).to_json_line());
+        } else {
+            eprintln!("error: {msg}");
+        }
+        return Ok(1);
+    }
+
+    let host = mcpreg::host_by_slug(slug)
+        .ok_or_else(|| anyhow!("unknown MCP host: {slug:?} (try `mcp register --list`)"))?;
+
+    // MCP host configs are user-level; `--global` is accepted for symmetry.
+    let _ = args.global;
+    let home = dirs_home()?;
+    let rep = mcpreg::register(host, &home, args.print).map_err(|e| anyhow!("{e}"))?;
+
+    if args.print {
+        println!("# {} -> {}", rep.slug, rep.path.display());
+        print!("{}", rep.content);
+        return Ok(0);
+    }
+
+    out.ok(
+        format!(
+            "{}: {} ({})",
+            rep.slug,
+            rep.action.as_str(),
+            rep.path.display()
+        ),
+        json!({ "registered": [{
+            "agent": rep.slug,
+            "path": rep.path,
+            "action": rep.action.as_str(),
+        }] }),
+    );
+    Ok(0)
 }
 
 // --- doctor ---------------------------------------------------------------

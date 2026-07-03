@@ -55,8 +55,10 @@ pub mod exec;
 pub mod fuzz;
 pub mod har;
 pub mod initcheck;
+pub mod mcpreg;
 pub mod paths;
 pub mod replay;
+pub mod skill;
 pub mod wrap_hook;
 
 use anyhow::Result;
@@ -174,5 +176,114 @@ mod tests {
         assert!(matches!(cli.command, cli::Command::Proxy(_)));
         let cli = Cli::parse_from(["burpwn", "wrap-hook"]);
         assert!(matches!(cli.command, cli::Command::WrapHook { .. }));
+    }
+
+    #[test]
+    fn skill_install_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "burpwn", "skill", "install", "--agent", "cursor", "--global", "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            cli::Command::Skill {
+                action: cli::SkillAction::Install(args),
+            } => {
+                assert_eq!(args.agent.as_deref(), Some("cursor"));
+                assert!(args.global);
+                assert!(args.force);
+                assert!(!args.print);
+                assert!(!args.all);
+            }
+            other => panic!("expected skill install, got {other:?}"),
+        }
+
+        // --all + --print, project default.
+        let cli = Cli::try_parse_from(["burpwn", "skill", "install", "--all", "--print"]).unwrap();
+        match cli.command {
+            cli::Command::Skill {
+                action: cli::SkillAction::Install(args),
+            } => {
+                assert!(args.all);
+                assert!(args.print);
+            }
+            other => panic!("expected skill install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_list_and_uninstall_parse() {
+        let cli = Cli::try_parse_from(["burpwn", "skill", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            cli::Command::Skill {
+                action: cli::SkillAction::List
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "burpwn",
+            "skill",
+            "uninstall",
+            "--agent",
+            "codex",
+            "--global",
+        ])
+        .unwrap();
+        match cli.command {
+            cli::Command::Skill {
+                action: cli::SkillAction::Uninstall(args),
+            } => {
+                assert_eq!(args.agent, "codex");
+                assert!(args.global);
+            }
+            other => panic!("expected skill uninstall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_install_bad_combos_rejected() {
+        // --project + --global conflict.
+        assert!(Cli::try_parse_from([
+            "burpwn",
+            "skill",
+            "install",
+            "--agent",
+            "cursor",
+            "--project",
+            "--global",
+        ])
+        .is_err());
+        // --agent + --all conflict.
+        assert!(
+            Cli::try_parse_from(["burpwn", "skill", "install", "--agent", "cursor", "--all",])
+                .is_err()
+        );
+        // uninstall requires --agent.
+        assert!(Cli::try_parse_from(["burpwn", "skill", "uninstall"]).is_err());
+    }
+
+    #[test]
+    fn mcp_register_flags_parse() {
+        let cli = Cli::try_parse_from(["burpwn", "mcp", "register", "--agent", "codex", "--print"])
+            .unwrap();
+        match cli.command {
+            cli::Command::Mcp {
+                action: cli::McpAction::Register(args),
+            } => {
+                assert_eq!(args.agent.as_deref(), Some("codex"));
+                assert!(args.print);
+                assert!(!args.list);
+            }
+            other => panic!("expected mcp register, got {other:?}"),
+        }
+
+        // --list without --agent parses.
+        let cli = Cli::try_parse_from(["burpwn", "mcp", "register", "--list"]).unwrap();
+        match cli.command {
+            cli::Command::Mcp {
+                action: cli::McpAction::Register(args),
+            } => assert!(args.list),
+            other => panic!("expected mcp register, got {other:?}"),
+        }
     }
 }

@@ -132,6 +132,102 @@ pub enum Command {
         /// The value to decode.
         value: String,
     },
+
+    /// Install the burpwn skill (agent-workflow instructions) into a framework's
+    /// native format/location. Separate from the `init` command-rewrite hook.
+    Skill {
+        /// Skill subcommand.
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+
+    /// Register the burpwn stdio MCP server into a framework's MCP config.
+    ///
+    /// Note: bare `burpwn mcp` (no subcommand) starts the MCP server itself and
+    /// is routed before this clap tree; `burpwn mcp register …` lands here.
+    Mcp {
+        /// MCP subcommand.
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+/// `skill` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SkillAction {
+    /// Install the skill into one framework (`--agent`) or all (`--all`).
+    Install(SkillInstallArgs),
+    /// List the supported frameworks, their destination path and format.
+    List,
+    /// Remove the burpwn skill from a framework (strips only our content).
+    Uninstall(SkillUninstallArgs),
+}
+
+/// `skill install` arguments.
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Framework slug to install into (e.g. `claude-code`, `cursor`, `codex`).
+    #[arg(long, conflicts_with = "all")]
+    pub agent: Option<String>,
+
+    /// Install into every supported framework.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Install at project scope (cwd-relative). This is the default.
+    #[arg(long, conflicts_with = "global")]
+    pub project: bool,
+
+    /// Install at global scope (HOME-relative), where the framework supports it.
+    #[arg(long)]
+    pub global: bool,
+
+    /// Print the resolved destination path + content to stdout; write nothing.
+    #[arg(long)]
+    pub print: bool,
+
+    /// Overwrite/replace even a file/section burpwn does not own.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `skill uninstall` arguments.
+#[derive(Debug, Args)]
+pub struct SkillUninstallArgs {
+    /// Framework slug to uninstall from.
+    #[arg(long)]
+    pub agent: String,
+
+    /// Operate on the global (HOME-relative) install instead of the project one.
+    #[arg(long)]
+    pub global: bool,
+}
+
+/// `mcp` subcommands (only `register`; bare `mcp` starts the server upstream).
+#[derive(Debug, Subcommand)]
+pub enum McpAction {
+    /// Register the burpwn MCP server into a framework's MCP config.
+    Register(McpRegisterArgs),
+}
+
+/// `mcp register` arguments.
+#[derive(Debug, Args)]
+pub struct McpRegisterArgs {
+    /// MCP host slug to register into (`codex`, `copilot`, `antigravity`).
+    #[arg(long)]
+    pub agent: Option<String>,
+
+    /// Accepted for symmetry; MCP host configs are user-level (HOME) already.
+    #[arg(long)]
+    pub global: bool,
+
+    /// Print the resolved config path + content to stdout; write nothing.
+    #[arg(long)]
+    pub print: bool,
+
+    /// List the supported MCP hosts + their config path and format.
+    #[arg(long)]
+    pub list: bool,
 }
 
 /// `fuzz` subcommands.

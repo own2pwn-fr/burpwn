@@ -29,9 +29,13 @@ fn main() {
         }
     };
 
-    // The `mcp` subcommand is routed directly here (not through burpwn-cli's
-    // clap tree) so burpwn-mcp can depend on burpwn-cli without a cycle.
-    let result = if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("mcp")) {
+    // The bare `mcp` subcommand starts the MCP server directly here (not through
+    // burpwn-cli's clap tree) so burpwn-mcp can depend on burpwn-cli without a
+    // cycle. But `mcp register …` is a real CLI command (skill/MCP config
+    // installer) and must fall through to the clap dispatch, NOT the server.
+    let is_mcp_server = std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("mcp"))
+        && std::env::args_os().nth(2).as_deref() != Some(std::ffi::OsStr::new("register"));
+    let result = if is_mcp_server {
         // Print help instead of starting the server when asked.
         if std::env::args().skip(2).any(|a| a == "--help" || a == "-h") {
             println!(
