@@ -37,6 +37,18 @@ In any security-audit / pentest session that performs **remote operations**
 If `burpwn doctor` fails (missing namespaces/`bwrap`/`nft`), fix that before
 starting remote work rather than silently falling back to un-captured commands.
 
+**Confirm capture is actually working** (traffic silently escaping the sandbox is
+the worst failure — you think you have evidence and you don't):
+
+```sh
+burpwn init --check            # verify each agent's hook really rewrites to `burpwn exec`
+burpwn session stats           # execs vs captured flows; flags network execs that captured ZERO
+```
+
+Run `init --check` after installing a hook (it exits non-zero if an agent that
+should rewrite doesn't), and glance at `session stats` during an engagement — a
+network-facing exec with zero captured flows means the traffic bypassed burpwn.
+
 ## Setup (once)
 
 ```sh
@@ -80,6 +92,27 @@ burpwn req show <id> --raw                        # verbatim request/response by
 burpwn req search 'csrf_token'                    # full-text search bodies
 ```
 
+## The offensive loop (prefer burpwn-native tools)
+
+For the inner probe/exploit loop, prefer burpwn's built-ins over shelling out —
+they operate on captured flows, keep everything in one session, and rank results.
+Typical loop against a captured request:
+
+1. **Capture** a real request through `exec` (see above).
+2. **Probe** it: `req replay` for a single hand-edited request (Repeater), or
+   `fuzz run` to sweep payloads across positions (Intruder).
+3. **Compare** a suspicious response against a baseline with `compare` (structured
+   header/body diff + reflection check).
+4. **Decode/encode** any tokens you find with `decode`/`encode` (base64, url, hex,
+   jwt) to understand or tamper with them.
+5. **Stay authenticated** with `session auth` so 401/403s auto-refresh the token.
+6. **Narrow interception** with `intercept scope` when you want to hand-edit only
+   one host/path in flight instead of parking every flow.
+
+Reach for external tools via `exec` (ffuf, sqlmap, nuclei) for heavy scanning, but
+use the native `fuzz`/`compare`/`req replay`/`encode` for the tight iterate loop —
+no leaving the session, and results come back ranked by anomaly.
+
 ## Repeater — replay with edits
 
 ```sh
@@ -90,7 +123,67 @@ burpwn req replay <id> --set-body @/tmp/payload.json
 ```
 
 `--set-header` accepts `Name: value` or `Name=value` and is repeatable.
-`--set-body` takes a literal string or `@file`.
+`--set-body` takes a literal string or `@file`. (Over MCP this is `req_replay`.)
+
+## Fuzz — native Intruder
+
+Sweep payloads across one or more injection positions in a captured request. The
+flow supplies the destination + base request; positions are `start:end` byte
+offsets (repeatable), or mark them inline with `§` (or a custom `--marker`).
+Results are ranked by an anomaly score.
+
+```sh
+burpwn fuzz run --flow <id> --position 40:47 --payloads /usr/share/wordlists/x.txt \
+  --mode sniper --concurrency 20 --delay 50 --name login-user
+burpwn fuzz run --flow <id> --payload admin --payload root --mode battering-ram
+burpwn fuzz run --flow <id> --request /tmp/base.raw --position 10:14 --payloads pl.txt
+burpwn fuzz list                     # stored attacks (also --workspace W)
+burpwn fuzz show <attack_id>         # per-payload results, --sort anomaly|status|len --limit N
+```
+
+Modes: `sniper` (one position at a time), `battering-ram` (same payload in all
+positions), `pitchfork` (payload sets in lockstep), `cluster-bomb` (all
+combinations).
+
+## Compare — diff two responses
+
+```sh
+burpwn compare <flow_a> <flow_b>                 # structured diff + reflection check
+burpwn compare <flow_a> <flow_b> --what headers  # or `body`, `all` (default)
+```
+
+Use it to spot what changed between a baseline and a payloaded response (length,
+status, reflected input, added/removed headers).
+
+## Encode / decode tokens
+
+```sh
+burpwn decode jwt <token>            # jwt is decode-only; header+claims
+burpwn decode base64 <value>         # also base64url, url, hex
+burpwn encode base64url <value>      # also base64, url, hex
+```
+
+Handy for reading/tampering cookies, JWTs, and encoded parameters mid-loop.
+
+## Stay authenticated — session auth (login macro)
+
+Persist a login command + a token-extraction regex + a header-injection template.
+`refresh` runs the login, extracts the token, and installs a match/replace rule
+that injects the header into in-scope requests; the token is auto-refreshed when
+the target starts returning 401/403.
+
+```sh
+burpwn session auth set \
+  --login 'curl -s https://target.example/login -d user=a -d pass=b' \
+  --extract '"token":"([^"]+)"' \
+  --header 'Authorization: Bearer {}' \
+  --host target.example
+burpwn session auth refresh          # mint the token now + install the injection rule
+burpwn session auth status           # show profiles; token value is masked
+```
+
+`--extract` needs exactly one capture group; `--header` uses `{}` as the token
+slot; `--host` scopes the injection (substring; omit for all hosts).
 
 ## Live interception
 
@@ -105,6 +198,14 @@ burpwn intercept disable
 
 Typical flow: `enable` → trigger traffic via `exec` → `await` to grab the parked
 id → `forward` (optionally edited) or `drop`.
+
+**Scope it** so not every flow parks — narrow to a host (and optionally a path /
+method), then widen back with `--clear`:
+
+```sh
+burpwn intercept scope target.example --path /admin --method POST
+burpwn intercept scope --clear
+```
 
 ## Match/replace rules (auto-rewrite)
 
@@ -135,13 +236,17 @@ pass `--workspace` on `exec`/`req` to actually scope.
 ## CLI vs MCP
 
 - **CLI / hook (default):** use the commands above, or rely on the `init` hook.
-- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 19 tools
-  over stdio (`session_list`, `session_current`, `req_list`, `req_show`,
+- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 31 tools
+  over stdio — the full loop is usable MCP-only, no shell needed. Session/query:
+  `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
   `req_search`, `workspace_list`, `workspace_new`, `tag_list`, `tag_add`,
-  `note_add`, `match_replace_list`, `match_replace_add`, `intercept_enable`,
+  `note_add`, `match_replace_list`, `match_replace_add`, `exec`. Repeater/Intruder:
+  `req_replay` (Repeater parity — replay/edit stored flows), `fuzz`, `fuzz_list`,
+  `fuzz_results`. Analysis: `compare`, `encode`, `decode`. Auth: `session_auth_set`,
+  `session_auth_refresh`, `session_auth_status`. Interception: `intercept_enable`,
   `intercept_disable`, `intercept_list`, `await_intercept` (long-poll),
-  `intercept_forward`, `intercept_drop`, `exec`). Use MCP when connected;
-  otherwise use the CLI. Start with `burpwn mcp [--session <n>]`.
+  `intercept_forward` (takes `method`/`path`), `intercept_scope`, `intercept_drop`.
+  Use MCP when connected; otherwise use the CLI. Start with `burpwn mcp [--session <n>]`.
 
 ## Gotchas
 

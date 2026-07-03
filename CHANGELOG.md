@@ -30,8 +30,9 @@ executable evaluation harness for the trained model.
 - **`encode` / `decode`** (CLI + MCP): pure byte transforms — `base64`,
   `base64url`, `url`, `hex`, and `jwt` (decode-only; splits header.payload.
   signature and decodes to JSON without verifying the signature).
-- **MCP server** now exposes **26 tools** (was 19): +`req_replay`, `fuzz`,
-  `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.
+- **MCP server** gains 7 offensive tools here — `req_replay`, `fuzz`,
+  `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode` — and 5 more from
+  the session-robustness work below, for **31 tools** total (was 19).
 
 ### Added — session robustness / integration hardening
 - **Intercept scope** (CLI `intercept scope <pattern> [--path P] [--method M]` /
