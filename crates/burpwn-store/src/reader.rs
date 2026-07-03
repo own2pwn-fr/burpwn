@@ -11,8 +11,9 @@ use rusqlite::Connection;
 use crate::blob::get_blob;
 use crate::error::Result;
 use crate::model::{
-    FlowDetail, FlowFilter, FlowRow, Group, Intercept, InterceptState, MatchKind, MatchReplaceRule,
-    Note, Protocol, RequestData, ResponseData, Tag, Workspace,
+    Attack, AttackResult, FlowDetail, FlowFilter, FlowRow, Group, Intercept, InterceptState,
+    MatchKind, MatchReplaceRule, Note, Protocol, RequestData, ResponseData, Tag, Workspace,
+    WsDirection, WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -48,6 +49,9 @@ impl Reader {
     /// List flows matching `filter`, newest first.
     pub fn list_flows(&self, filter: &FlowFilter) -> Result<Vec<FlowRow>> {
         let conn = self.conn()?;
+        // The extra blob joins back the request/response header blobs and the
+        // response body blob so `header_contains` (substring over decoded headers)
+        // and `min/max_resp_len` (response body size) can filter at the SQL layer.
         let mut sql = String::from(
             "SELECT f.id, f.workspace_id, f.ts_start, f.ts_end, f.protocol, f.scheme,
                     f.dst_ip, f.dst_port, f.sni, f.intercepted,
@@ -55,6 +59,9 @@ impl Reader {
              FROM flows f
              LEFT JOIN requests r ON r.flow_id = f.id
              LEFT JOIN responses resp ON resp.flow_id = f.id
+             LEFT JOIN blobs reqh ON reqh.id = r.headers_blob_id
+             LEFT JOIN blobs resph ON resph.id = resp.headers_blob_id
+             LEFT JOIN blobs respb ON respb.id = resp.body_blob_id
              WHERE 1=1",
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -86,6 +93,34 @@ impl Reader {
         if let Some(port) = filter.port {
             sql.push_str(" AND f.dst_port = ?");
             params.push(Box::new(port as i64));
+        }
+        if let Some(from) = filter.ts_from {
+            sql.push_str(" AND f.ts_start >= ?");
+            params.push(Box::new(from));
+        }
+        if let Some(to) = filter.ts_to {
+            sql.push_str(" AND f.ts_start <= ?");
+            params.push(Box::new(to));
+        }
+        if let Some(min) = filter.min_resp_len {
+            sql.push_str(" AND COALESCE(respb.size, 0) >= ?");
+            params.push(Box::new(min));
+        }
+        if let Some(max) = filter.max_resp_len {
+            sql.push_str(" AND COALESCE(respb.size, 0) <= ?");
+            params.push(Box::new(max));
+        }
+        if let Some(ref needle) = filter.header_contains {
+            // Substring over decoded request + response headers. Headers are
+            // almost always uncompressed (well under COMPRESS_THRESHOLD); a
+            // compressed header blob is not substring-matchable here.
+            sql.push_str(
+                " AND ((reqh.compressed = 0 AND CAST(reqh.data AS TEXT) LIKE ?)
+                    OR (resph.compressed = 0 AND CAST(resph.data AS TEXT) LIKE ?))",
+            );
+            let like = format!("%{needle}%");
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like));
         }
 
         sql.push_str(" ORDER BY f.id DESC LIMIT ? OFFSET ?");
@@ -249,6 +284,133 @@ impl Reader {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Full-text search passing `query` straight to FTS5 — allows the full FTS5
+    /// query grammar (boolean `AND`/`OR`/`NOT`, `col:` filters, prefix `token*`,
+    /// phrase `"…"`). Unlike [`Reader::search`], which wraps the input as a safe
+    /// literal phrase, this exposes raw syntax; a malformed query surfaces as a
+    /// SQLite error. Returns matching flow ids (deduplicated, newest first).
+    pub fn search_raw(&self, query: &str) -> Result<Vec<i64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT flow_id FROM flows_fts WHERE flows_fts MATCH ?1 ORDER BY flow_id DESC",
+        )?;
+        let rows = stmt.query_map([query], |r| r.get::<_, i64>(0))?;
+        collect(rows)
+    }
+
+    /// Structured websocket frames for a flow (oldest first), payloads decoded
+    /// from the content-addressed blob store.
+    pub fn ws_messages_for_flow(&self, flow_id: i64) -> Result<Vec<WsMessage>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, flow_id, direction, opcode, fin, payload_blob, ts
+             FROM ws_messages WHERE flow_id = ?1 ORDER BY id",
+        )?;
+        // Column tuple: (id, flow_id, direction, opcode, fin, payload_blob, ts).
+        type WsRow = (
+            i64,
+            i64,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        );
+        let rows: Vec<WsRow> = stmt
+            .query_map([flow_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, fid, direction, opcode, fin, payload_blob, ts) in rows {
+            // `payload_blob` is the blob row id stored as text; resolve + decode.
+            let payload = match payload_blob.and_then(|s| s.parse::<i64>().ok()) {
+                Some(bid) => get_blob(&conn, bid)?.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            out.push(WsMessage {
+                id,
+                flow_id: fid,
+                direction: WsDirection::from_db(&direction),
+                opcode,
+                fin: fin.map(|f| f != 0),
+                payload,
+                ts,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch an attack by id, or `None`.
+    pub fn attack_get(&self, id: i64) -> Result<Option<Attack>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, workspace, name, base_flow_id, positions, config, status, created_ts
+                 FROM attacks WHERE id = ?1",
+                [id],
+                row_to_attack,
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// List attacks, optionally filtered by workspace name. Newest first.
+    pub fn list_attacks(&self, workspace: Option<&str>) -> Result<Vec<Attack>> {
+        let conn = self.conn()?;
+        match workspace {
+            Some(ws) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, workspace, name, base_flow_id, positions, config, status, created_ts
+                     FROM attacks WHERE workspace = ?1 ORDER BY id DESC",
+                )?;
+                let rows = stmt.query_map([ws], row_to_attack)?;
+                collect(rows)
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, workspace, name, base_flow_id, positions, config, status, created_ts
+                     FROM attacks ORDER BY id DESC",
+                )?;
+                let rows = stmt.query_map([], row_to_attack)?;
+                collect(rows)
+            }
+        }
+    }
+
+    /// Per-payload results for an attack (oldest first).
+    pub fn attack_results(&self, attack_id: i64) -> Result<Vec<AttackResult>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, attack_id, payload, flow_id, status_code, resp_len, latency_ms,
+                    anomaly_score, ts
+             FROM attack_results WHERE attack_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([attack_id], |r| {
+            Ok(AttackResult {
+                id: r.get(0)?,
+                attack_id: r.get(1)?,
+                payload: r.get(2)?,
+                flow_id: r.get(3)?,
+                status_code: r.get(4)?,
+                resp_len: r.get(5)?,
+                latency_ms: r.get(6)?,
+                anomaly_score: r.get(7)?,
+                ts: r.get(8)?,
+            })
+        })?;
+        collect(rows)
     }
 
     // ---- workspace / tag / group / note CRUD reads ----
@@ -436,6 +598,20 @@ fn row_to_flow(row: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
         authority: row.get(11)?,
         path: row.get(12)?,
         status: status.map(|s| u16::try_from(s).unwrap_or(0)),
+    })
+}
+
+/// Map an `attacks` row (8 columns in declared order) into an [`Attack`].
+fn row_to_attack(r: &rusqlite::Row) -> rusqlite::Result<Attack> {
+    Ok(Attack {
+        id: r.get(0)?,
+        workspace: r.get(1)?,
+        name: r.get(2)?,
+        base_flow_id: r.get(3)?,
+        positions: r.get(4)?,
+        config: r.get(5)?,
+        status: r.get(6)?,
+        created_ts: r.get(7)?,
     })
 }
 

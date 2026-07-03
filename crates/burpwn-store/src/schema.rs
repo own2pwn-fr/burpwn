@@ -13,14 +13,15 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
 
 type MigrationStep = fn(&Connection) -> Result<()>;
 
-const MIGRATIONS: &[(i64, MigrationStep)] = &[(1, migrate_v1), (2, migrate_v2)];
+const MIGRATIONS: &[(i64, MigrationStep)] =
+    &[(1, migrate_v1), (2, migrate_v2), (3, migrate_v3)];
 
 /// Apply pending migrations, stamp the version, and ensure the default
 /// workspace exists. Refuses to open a file stamped with a newer schema.
@@ -102,7 +103,14 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
             sni         TEXT,
             scheme      TEXT NOT NULL,
             protocol    TEXT NOT NULL,
-            intercepted INTEGER NOT NULL DEFAULT 0
+            intercepted INTEGER NOT NULL DEFAULT 0,
+            -- Negotiated TLS metadata (schema v3, nullable). On a fresh create
+            -- these ship in the baseline DDL; migrate_v3 adds them to pre-v3 files
+            -- via a guarded ALTER (skipped here because they already exist).
+            tls_version    TEXT,
+            tls_cipher     TEXT,
+            tls_alpn       TEXT,
+            origin_cert_fp TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_flows_workspace ON flows(workspace_id);
@@ -218,6 +226,94 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v3: capture negotiated TLS metadata on flows, index `exec_id` (previously a
+/// full scan for `flow_ids_for_exec` / `attribute_flows`), add STRUCTURED
+/// websocket capture (`ws_messages`) and the fuzzer/Intruder tables (`attacks`,
+/// `attack_results`). Every step is idempotent: the TLS columns are added via a
+/// guarded ALTER (fresh DBs already carry them from the v1 baseline), and the
+/// index/tables use `IF NOT EXISTS`. This step runs on BOTH the fresh-create path
+/// (current=0 replays v1..v3) and the in-place v2→v3 upgrade.
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    for (col, ty) in [
+        ("tls_version", "TEXT"),
+        ("tls_cipher", "TEXT"),
+        ("tls_alpn", "TEXT"),
+        ("origin_cert_fp", "TEXT"),
+    ] {
+        add_column_if_missing(conn, "flows", col, ty)?;
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_flows_exec_id ON flows(exec_id);
+
+        -- Structured websocket frame capture, replacing the in-band `ws-c2s:`
+        -- marker hack. `payload_blob` holds a content-addressed blob reference
+        -- (the blob row id, stored as text) into the shared `blobs` store.
+        CREATE TABLE IF NOT EXISTS ws_messages (
+            id           INTEGER PRIMARY KEY,
+            flow_id      INTEGER REFERENCES flows(id) ON DELETE CASCADE,
+            direction    TEXT CHECK(direction IN ('c2s','s2c')),
+            opcode       INTEGER,
+            fin          INTEGER,
+            payload_blob TEXT,
+            ts           INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_ws_messages_flow ON ws_messages(flow_id);
+
+        -- Fuzzer / Intruder attack definitions and their per-payload results.
+        CREATE TABLE IF NOT EXISTS attacks (
+            id           INTEGER PRIMARY KEY,
+            workspace    TEXT,
+            name         TEXT,
+            base_flow_id INTEGER,
+            positions    TEXT,
+            config       TEXT,
+            status       TEXT,
+            created_ts   INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS attack_results (
+            id            INTEGER PRIMARY KEY,
+            attack_id     INTEGER REFERENCES attacks(id) ON DELETE CASCADE,
+            payload       TEXT,
+            flow_id       INTEGER,
+            status_code   INTEGER,
+            resp_len      INTEGER,
+            latency_ms    INTEGER,
+            anomaly_score REAL,
+            ts            INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_attack_results_attack ON attack_results(attack_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Whether `table` already has a column named `column`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut found = false;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for r in rows {
+        if r? == column {
+            found = true;
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// `ALTER TABLE ADD COLUMN` guarded by an existence check, since SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`. Keeps the v3 migration idempotent and safe on the
+/// fresh-create path where the v1 baseline already ships the column.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty};"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,8 +353,16 @@ mod tests {
             "match_replace_rules",
             "intercepts",
             "flows_fts",
+            "ws_messages",
+            "attacks",
+            "attack_results",
         ] {
             assert!(table_exists(&conn, t), "missing table {t}");
+        }
+
+        // v3 TLS columns present on a fresh create.
+        for c in ["tls_version", "tls_cipher", "tls_alpn", "origin_cert_fp"] {
+            assert!(column_exists(&conn, "flows", c), "missing flows.{c}");
         }
 
         let name: String = conn
@@ -345,6 +449,69 @@ mod tests {
                 [],
                 |r| r.get(0),
             )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_adds_columns_tables_and_preserves_data() {
+        // Emulate a file stamped at schema v2: the pre-v3 `flows` shape (no TLS
+        // columns) with an existing row, and none of the v3 tables. The upgrade
+        // must add the columns/tables in place without touching existing data.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL
+            );
+            INSERT INTO workspaces(id, name, created_at) VALUES (1, 'default', 0);
+            CREATE TABLE flows (
+                id INTEGER PRIMARY KEY,
+                workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+                ts_start INTEGER NOT NULL, ts_end INTEGER, exec_id TEXT,
+                client_addr TEXT NOT NULL, dst_ip TEXT NOT NULL, dst_port INTEGER NOT NULL,
+                sni TEXT, scheme TEXT NOT NULL, protocol TEXT NOT NULL,
+                intercepted INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO flows(id, workspace_id, ts_start, client_addr, dst_ip, dst_port, scheme, protocol)
+                VALUES (7, 1, 111, '127.0.0.1:1', '10.0.0.1', 443, 'https', 'h1');
+            "#,
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+
+        // Pre-conditions: none of the v3 additions exist yet.
+        assert!(!column_exists(&conn, "flows", "tls_version"));
+        assert!(!table_exists(&conn, "ws_messages"));
+        assert!(!table_exists(&conn, "attacks"));
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        for c in ["tls_version", "tls_cipher", "tls_alpn", "origin_cert_fp"] {
+            assert!(column_exists(&conn, "flows", c), "missing flows.{c}");
+        }
+        for t in ["ws_messages", "attacks", "attack_results"] {
+            assert!(table_exists(&conn, t), "missing table {t}");
+        }
+        // Existing data preserved (row 7 still there, TLS columns default NULL).
+        let (ts, tls): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT ts_start, tls_version FROM flows WHERE id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ts, 111);
+        assert_eq!(tls, None);
+
+        // Idempotent: a second init() is a no-op and does not double-add anything.
+        init(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
     }

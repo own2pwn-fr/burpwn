@@ -71,6 +71,7 @@ pub fn req_list(
         port: params.port,
         limit: params.limit,
         offset: params.offset,
+        ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
     Ok(json!({ "flows": rows, "count": rows.len() }))

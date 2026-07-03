@@ -20,7 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::blob::BlobStore;
 use crate::error::{Result, StoreError};
-use crate::model::{FlowStart, InterceptState, NewMatchReplaceRule, RequestData, ResponseData};
+use crate::model::{
+    FlowStart, InterceptState, NewAttack, NewAttackResult, NewMatchReplaceRule, RequestData,
+    ResponseData, WsDirection,
+};
 
 /// Default bound for the writer channel. Large enough to absorb bursts without
 /// unbounded memory growth; senders `.await` when full (back-pressure).
@@ -211,6 +214,62 @@ pub enum WriteOp {
         state: InterceptState,
         /// Resolution timestamp.
         resolved_at: i64,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
+    },
+    /// Record a structured websocket frame (payload stored in the blob store);
+    /// replies with the new message id.
+    InsertWsMessage {
+        /// Owning flow.
+        flow_id: i64,
+        /// Frame direction.
+        direction: WsDirection,
+        /// Websocket opcode, if known.
+        opcode: Option<i64>,
+        /// FIN bit, if known.
+        fin: Option<bool>,
+        /// Decoded frame payload.
+        payload: Vec<u8>,
+        /// Capture timestamp.
+        ts: i64,
+        /// Reply with the message id.
+        reply: IdReply,
+    },
+    /// Set the negotiated TLS metadata on a flow.
+    SetFlowTlsMeta {
+        /// Target flow.
+        flow_id: i64,
+        /// TLS protocol version (e.g. `TLSv1.3`).
+        version: Option<String>,
+        /// Negotiated cipher suite.
+        cipher: Option<String>,
+        /// Negotiated ALPN protocol.
+        alpn: Option<String>,
+        /// Origin certificate fingerprint.
+        cert_fp: Option<String>,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
+    },
+    /// Create an Intruder/fuzzer attack; replies with the new attack id.
+    CreateAttack {
+        /// Attack definition.
+        attack: NewAttack,
+        /// Reply with the attack id.
+        reply: IdReply,
+    },
+    /// Insert a per-payload attack result; replies with the new result id.
+    InsertAttackResult {
+        /// Result row.
+        result: NewAttackResult,
+        /// Reply with the result id.
+        reply: IdReply,
+    },
+    /// Update an attack's lifecycle status.
+    UpdateAttackStatus {
+        /// Attack id.
+        id: i64,
+        /// New status.
+        status: String,
         /// Optional completion ack.
         reply: Option<AckReply>,
     },
@@ -421,6 +480,81 @@ impl WriteHandle {
         .await?;
         recv_ack(rx).await
     }
+
+    /// Record a structured websocket frame, awaiting the new message id. The
+    /// payload is stored in the content-addressed blob store.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_ws_message(
+        &self,
+        flow_id: i64,
+        direction: WsDirection,
+        opcode: Option<i64>,
+        fin: Option<bool>,
+        payload: Vec<u8>,
+        ts: i64,
+    ) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::InsertWsMessage {
+            flow_id,
+            direction,
+            opcode,
+            fin,
+            payload,
+            ts,
+            reply,
+        })
+        .await?;
+        recv_id(rx).await
+    }
+
+    /// Set the negotiated TLS metadata on a flow, awaiting ack.
+    pub async fn set_flow_tls_meta(
+        &self,
+        flow_id: i64,
+        version: Option<String>,
+        cipher: Option<String>,
+        alpn: Option<String>,
+        cert_fp: Option<String>,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::SetFlowTlsMeta {
+            flow_id,
+            version,
+            cipher,
+            alpn,
+            cert_fp,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
+    /// Create an Intruder/fuzzer attack, awaiting its id.
+    pub async fn create_attack(&self, attack: NewAttack) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::CreateAttack { attack, reply }).await?;
+        recv_id(rx).await
+    }
+
+    /// Insert a per-payload attack result, awaiting its id.
+    pub async fn insert_attack_result(&self, result: NewAttackResult) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::InsertAttackResult { result, reply })
+            .await?;
+        recv_id(rx).await
+    }
+
+    /// Update an attack's lifecycle status, awaiting ack.
+    pub async fn update_attack_status(&self, id: i64, status: impl Into<String>) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::UpdateAttackStatus {
+            id,
+            status: status.into(),
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
 }
 
 async fn recv_id(rx: oneshot::Receiver<Result<i64>>) -> Result<i64> {
@@ -586,6 +720,51 @@ fn handle_op(conn: &Connection, op: WriteOp) {
             .map(|_| ())
             .map_err(Into::into),
         ),
+        WriteOp::InsertWsMessage {
+            flow_id,
+            direction,
+            opcode,
+            fin,
+            payload,
+            ts,
+            reply,
+        } => {
+            let _ = reply.send(do_insert_ws_message(
+                conn, flow_id, direction, opcode, fin, &payload, ts,
+            ));
+        }
+        WriteOp::SetFlowTlsMeta {
+            flow_id,
+            version,
+            cipher,
+            alpn,
+            cert_fp,
+            reply,
+        } => ack(
+            reply,
+            conn.execute(
+                "UPDATE flows SET tls_version = ?1, tls_cipher = ?2, tls_alpn = ?3,
+                    origin_cert_fp = ?4 WHERE id = ?5",
+                rusqlite::params![version, cipher, alpn, cert_fp, flow_id],
+            )
+            .map(|_| ())
+            .map_err(Into::into),
+        ),
+        WriteOp::CreateAttack { attack, reply } => {
+            let _ = reply.send(do_create_attack(conn, &attack));
+        }
+        WriteOp::InsertAttackResult { result, reply } => {
+            let _ = reply.send(do_insert_attack_result(conn, &result));
+        }
+        WriteOp::UpdateAttackStatus { id, status, reply } => ack(
+            reply,
+            conn.execute(
+                "UPDATE attacks SET status = ?1 WHERE id = ?2",
+                rusqlite::params![status, id],
+            )
+            .map(|_| ())
+            .map_err(Into::into),
+        ),
     }
 }
 
@@ -643,8 +822,12 @@ fn do_request(conn: &Connection, flow_id: i64, d: &RequestData) -> Result<()> {
             body_id,
         ],
     )?;
-    // Feed FTS with url + host + decoded (capped) body text.
+    // Feed FTS with url + host + decoded request headers + decoded (capped) body
+    // text. Indexing the headers lets an agent full-text search a request header
+    // value (a bearer token, a custom `X-` header), mirroring the response side.
     let mut text = format!("{} {}\n{}\n", d.method, d.path, d.authority);
+    text.push_str(&String::from_utf8_lossy(&d.headers));
+    text.push('\n');
     text.push_str(&String::from_utf8_lossy(body));
     index_fts(conn, flow_id, FtsKind::Request, &text)?;
     Ok(())
@@ -750,6 +933,74 @@ fn do_add_match_replace(conn: &Connection, r: &NewMatchReplaceRule) -> Result<i6
             r.pattern,
             r.replacement,
             r.on_request as i64,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn do_insert_ws_message(
+    conn: &Connection,
+    flow_id: i64,
+    direction: WsDirection,
+    opcode: Option<i64>,
+    fin: Option<bool>,
+    payload: &[u8],
+    ts: i64,
+) -> Result<i64> {
+    // Cap and content-address the payload in the shared blob store; store the
+    // blob row id as text in `payload_blob` (the spec's sha-ref column).
+    let payload = cap_body(payload);
+    let blob_ref = if payload.is_empty() {
+        None
+    } else {
+        Some(BlobStore::put(conn, payload)?.to_string())
+    };
+    conn.execute(
+        "INSERT INTO ws_messages(flow_id, direction, opcode, fin, payload_blob, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            flow_id,
+            direction.as_str(),
+            opcode,
+            fin.map(|b| b as i64),
+            blob_ref,
+            ts,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn do_create_attack(conn: &Connection, a: &NewAttack) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO attacks(workspace, name, base_flow_id, positions, config, status, created_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            a.workspace,
+            a.name,
+            a.base_flow_id,
+            a.positions,
+            a.config,
+            a.status,
+            a.created_ts,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn do_insert_attack_result(conn: &Connection, r: &NewAttackResult) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO attack_results(attack_id, payload, flow_id, status_code, resp_len,
+            latency_ms, anomaly_score, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            r.attack_id,
+            r.payload,
+            r.flow_id,
+            r.status_code,
+            r.resp_len,
+            r.latency_ms,
+            r.anomaly_score,
+            r.ts,
         ],
     )?;
     Ok(conn.last_insert_rowid())

@@ -537,6 +537,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
         port: args.port,
         limit: args.limit,
         offset: args.offset,
+        ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
     if out.json {
