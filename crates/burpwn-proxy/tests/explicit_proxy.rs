@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use futures::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
@@ -149,4 +150,110 @@ async fn multiple_methods_recorded() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(count >= 2, "both flows recorded, got {count}");
+}
+
+/// An origin that streams a Server-Sent-Events response: it emits the first
+/// chunk immediately, then sleeps 500ms before the second and closing. This lets
+/// a test distinguish incremental forwarding (first chunk arrives fast) from
+/// buffering (nothing until the whole body is done ~500ms later).
+async fn spawn_sse_origin() -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(sock);
+                let svc = service_fn(|_req: Request<Incoming>| async move {
+                    let (mut tx, rx) = futures::channel::mpsc::channel::<Bytes>(4);
+                    tokio::spawn(async move {
+                        let _ = tx.send(Bytes::from_static(b"data: 1\n\n")).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let _ = tx.send(Bytes::from_static(b"data: 2\n\n")).await;
+                        // Dropping `tx` ends the stream.
+                    });
+                    let body = StreamBody::new(
+                        rx.map(|b| Ok::<_, Infallible>(Frame::data(b))),
+                    );
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+// Streaming-bodies regression: an SSE / chunked response must be forwarded
+// INCREMENTALLY (first chunk reaches the client before the origin finishes),
+// not withheld until EOF. Before the hybrid streaming path, the proxy buffered
+// the whole body, so SSE/long-poll stalled until the origin closed (or the 120s
+// upstream timeout). Here the origin sleeps 500ms between chunks; the first
+// chunk must arrive within a much shorter window.
+#[tokio::test]
+async fn sse_response_is_streamed_incrementally_not_withheld() {
+    let origin = spawn_sse_origin().await;
+    let (proxy, store, _dir) = spawn_proxy().await;
+
+    let tcp = TcpStream::connect(proxy).await.unwrap();
+    let io = TokioIo::new(tcp);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let uri = format!("http://{origin}/sse");
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", origin.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+
+    // The FIRST chunk must arrive well before the origin's 500ms inter-chunk
+    // sleep — proof the body was streamed, not buffered to EOF.
+    let first = tokio::time::timeout(Duration::from_millis(250), body.frame())
+        .await
+        .expect("first SSE chunk must arrive before the stream completes")
+        .expect("body must yield a frame")
+        .unwrap();
+    assert_eq!(first.into_data().unwrap().as_ref(), b"data: 1\n\n");
+
+    // Drain the remainder (the second chunk after the origin's sleep).
+    let mut rest = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            rest.extend_from_slice(&data);
+        }
+    }
+    assert_eq!(rest.as_slice(), b"data: 2\n\n");
+
+    // The streamed flow is still recorded (response row written at stream end).
+    let reader = store.reader();
+    let mut recorded = false;
+    for _ in 0..50 {
+        if reader
+            .list_flows(&FlowFilter::default())
+            .unwrap()
+            .iter()
+            .any(|r| r.status == Some(200))
+        {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(recorded, "streamed flow recorded with status 200");
 }

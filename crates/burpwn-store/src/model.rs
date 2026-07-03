@@ -345,10 +345,242 @@ pub struct FlowFilter {
     pub protocol: Option<Protocol>,
     /// Exact destination port.
     pub port: Option<u16>,
+    /// Lower bound (inclusive) on `ts_start`.
+    pub ts_from: Option<i64>,
+    /// Upper bound (inclusive) on `ts_start`.
+    pub ts_to: Option<i64>,
+    /// Minimum response body size in bytes (inclusive).
+    pub min_resp_len: Option<i64>,
+    /// Maximum response body size in bytes (inclusive).
+    pub max_resp_len: Option<i64>,
+    /// Substring match over the decoded request + response header bytes.
+    ///
+    /// Matched at the SQL layer against uncompressed header blobs (headers are
+    /// almost always well under [`crate::blob::COMPRESS_THRESHOLD`], so they are
+    /// stored uncompressed); a compressed header blob is not substring-searchable
+    /// here and will not match.
+    pub header_contains: Option<String>,
     /// Max rows to return (default 100 if `None`).
     pub limit: Option<i64>,
     /// Row offset for pagination.
     pub offset: Option<i64>,
+}
+
+/// Direction of a captured websocket frame relative to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WsDirection {
+    /// Client → server.
+    C2s,
+    /// Server → client.
+    S2c,
+}
+
+impl WsDirection {
+    /// DB string (`c2s` / `s2c`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WsDirection::C2s => "c2s",
+            WsDirection::S2c => "s2c",
+        }
+    }
+
+    /// Parse from the DB string; unknown values map to `C2s`.
+    pub fn from_db(s: &str) -> WsDirection {
+        match s {
+            "s2c" => WsDirection::S2c,
+            _ => WsDirection::C2s,
+        }
+    }
+}
+
+/// A structured websocket frame captured for a flow. The payload is decoded from
+/// the content-addressed blob store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsMessage {
+    /// Message id.
+    pub id: i64,
+    /// Owning flow.
+    pub flow_id: i64,
+    /// Frame direction.
+    pub direction: WsDirection,
+    /// Websocket opcode (1=text, 2=binary, …), if recorded.
+    pub opcode: Option<i64>,
+    /// FIN bit, if recorded.
+    pub fin: Option<bool>,
+    /// Decoded frame payload bytes.
+    #[serde(with = "serde_bytes_vec")]
+    pub payload: Vec<u8>,
+    /// Capture timestamp, if recorded.
+    pub ts: Option<i64>,
+}
+
+/// An Intruder/fuzzer attack definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attack {
+    /// Attack id.
+    pub id: i64,
+    /// Owning workspace name.
+    pub workspace: Option<String>,
+    /// Human-readable name.
+    pub name: Option<String>,
+    /// Base flow the attack is templated from.
+    pub base_flow_id: Option<i64>,
+    /// JSON-encoded payload positions.
+    pub positions: Option<String>,
+    /// JSON-encoded config (mode, payload sets, concurrency).
+    pub config: Option<String>,
+    /// Lifecycle status (e.g. `pending`, `running`, `done`).
+    pub status: Option<String>,
+    /// Creation timestamp.
+    pub created_ts: Option<i64>,
+}
+
+/// Parameters to create an [`Attack`] (id is generated).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewAttack {
+    /// Owning workspace name.
+    pub workspace: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Base flow the attack is templated from.
+    pub base_flow_id: Option<i64>,
+    /// JSON-encoded payload positions.
+    pub positions: String,
+    /// JSON-encoded config.
+    pub config: String,
+    /// Initial lifecycle status.
+    pub status: String,
+    /// Creation timestamp.
+    pub created_ts: i64,
+}
+
+/// A single per-payload result row for an attack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttackResult {
+    /// Result id.
+    pub id: i64,
+    /// Owning attack.
+    pub attack_id: i64,
+    /// JSON-encoded payload that produced this result.
+    pub payload: Option<String>,
+    /// Captured flow for this request, if recorded.
+    pub flow_id: Option<i64>,
+    /// Response status code.
+    pub status_code: Option<i64>,
+    /// Response length in bytes.
+    pub resp_len: Option<i64>,
+    /// Request latency in milliseconds.
+    pub latency_ms: Option<i64>,
+    /// Heuristic anomaly score.
+    pub anomaly_score: Option<f64>,
+    /// Timestamp.
+    pub ts: Option<i64>,
+}
+
+/// Parameters to insert an [`AttackResult`] (id is generated).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewAttackResult {
+    /// Owning attack.
+    pub attack_id: i64,
+    /// JSON-encoded payload.
+    pub payload: String,
+    /// Captured flow for this request, if any.
+    pub flow_id: Option<i64>,
+    /// Response status code.
+    pub status_code: Option<i64>,
+    /// Response length in bytes.
+    pub resp_len: Option<i64>,
+    /// Request latency in milliseconds.
+    pub latency_ms: Option<i64>,
+    /// Heuristic anomaly score.
+    pub anomaly_score: Option<f64>,
+    /// Timestamp.
+    pub ts: i64,
+}
+
+/// A persisted session-auth profile (schema v4): the login command + token
+/// extraction regex + header-injection template for one host scope, plus the
+/// last-minted token and the id of the match/replace rule that injects it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProfile {
+    /// Profile id.
+    pub id: i64,
+    /// Host scope (case-insensitive substring; empty = all hosts).
+    pub host: String,
+    /// Shell command whose stdout carries a fresh token.
+    pub login_cmd: String,
+    /// Regex (one capture group) applied to the login command's output to pull
+    /// the token.
+    pub extract_regex: String,
+    /// Header injection template, e.g. `Authorization: Bearer {}` (the `{}` is
+    /// substituted with the token).
+    pub header_template: String,
+    /// Last-minted token, if a refresh has run (masked when displayed).
+    pub token: Option<String>,
+    /// Id of the match/replace rule that injects this header (so refresh updates
+    /// it in place rather than stacking a new rule each time).
+    pub rule_id: Option<i64>,
+    /// Last update timestamp (unix millis).
+    pub updated_at: i64,
+}
+
+/// Parameters to upsert an [`AuthProfile`] (token/rule_id are managed by refresh).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewAuthProfile {
+    /// Host scope (empty = all).
+    pub host: String,
+    /// Login command.
+    pub login_cmd: String,
+    /// Token extraction regex.
+    pub extract_regex: String,
+    /// Header injection template.
+    pub header_template: String,
+}
+
+/// A capture-completeness telemetry row (schema v4): one per `burpwn exec`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecRecord {
+    /// Row id.
+    pub id: i64,
+    /// The exec correlation id stamped on this run's captured flows.
+    pub exec_id: String,
+    /// The command line (best-effort, for display).
+    pub cmd: String,
+    /// Whether the command was classified as clearly network-facing.
+    pub network_facing: bool,
+    /// Number of flows captured during this exec.
+    pub flow_count: i64,
+    /// Creation timestamp (unix millis).
+    pub created_at: i64,
+}
+
+/// Parameters to insert an [`ExecRecord`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewExecRecord {
+    /// Exec correlation id.
+    pub exec_id: String,
+    /// Command line.
+    pub cmd: String,
+    /// Network-facing classification.
+    pub network_facing: bool,
+    /// Captured flow count.
+    pub flow_count: i64,
+    /// Creation timestamp.
+    pub created_at: i64,
+}
+
+/// Aggregate capture-completeness stats over a session's execs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecStats {
+    /// Total recorded execs.
+    pub total_execs: i64,
+    /// Total flows captured across all execs.
+    pub total_flows: i64,
+    /// Execs classified as network-facing.
+    pub network_execs: i64,
+    /// Network-facing execs that captured ZERO flows (likely-escaped traffic).
+    pub network_zero_flow_execs: i64,
 }
 
 /// `serde_bytes`-style helper for `Vec<u8>` so JSON output is reasonable and

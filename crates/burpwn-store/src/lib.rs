@@ -162,8 +162,8 @@ impl r2d2::CustomizeConnection<Connection, rusqlite::Error> for ReadOnlyCustomiz
 mod tests {
     use super::*;
     use crate::model::{
-        FlowFilter, FlowStart, InterceptState, MatchKind, NewMatchReplaceRule, Protocol,
-        RequestData, ResponseData,
+        FlowFilter, FlowStart, InterceptState, MatchKind, NewAttack, NewAttackResult,
+        NewMatchReplaceRule, Protocol, RequestData, ResponseData, WsDirection,
     };
     use tempfile::TempDir;
 
@@ -680,6 +680,434 @@ mod tests {
                 "write through a read-pool connection must be refused, got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn request_headers_are_full_text_searchable() {
+        // v3 FTS fix: request headers (bearer token, custom X- headers) must be
+        // indexed and searchable, not just method/path/authority/body.
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+
+        let flow_id = w.flow_start(sample_flow()).await.unwrap();
+        w.request(
+            flow_id,
+            RequestData {
+                method: "GET".into(),
+                authority: "example.com".into(),
+                path: "/".into(),
+                http_version: "HTTP/1.1".into(),
+                headers: b"Authorization: Bearer sekrit_bearer_jwt\r\nX-Custom: findme_hdr\r\n"
+                    .to_vec(),
+                body: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let reader = store.reader();
+        assert!(
+            reader.search("sekrit_bearer_jwt").unwrap().contains(&flow_id),
+            "request bearer token must be searchable"
+        );
+        assert!(
+            reader.search("findme_hdr").unwrap().contains(&flow_id),
+            "custom request header value must be searchable"
+        );
+        // The raw-syntax variant supports FTS5 prefix queries.
+        assert!(reader
+            .search_raw("findme_*")
+            .unwrap()
+            .contains(&flow_id));
+    }
+
+    #[tokio::test]
+    async fn ws_messages_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+
+        let flow_id = w.flow_start(sample_flow()).await.unwrap();
+        let m1 = w
+            .insert_ws_message(
+                flow_id,
+                WsDirection::C2s,
+                Some(1),
+                Some(true),
+                b"hello ws".to_vec(),
+                10,
+            )
+            .await
+            .unwrap();
+        let m2 = w
+            .insert_ws_message(
+                flow_id,
+                WsDirection::S2c,
+                Some(2),
+                Some(false),
+                Vec::new(),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_ne!(m1, m2);
+
+        let msgs = store.reader().ws_messages_for_flow(flow_id).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].id, m1);
+        assert_eq!(msgs[0].direction, WsDirection::C2s);
+        assert_eq!(msgs[0].opcode, Some(1));
+        assert_eq!(msgs[0].fin, Some(true));
+        assert_eq!(msgs[0].payload, b"hello ws");
+        assert_eq!(msgs[0].ts, Some(10));
+        // Empty payload round-trips as an empty vec.
+        assert_eq!(msgs[1].direction, WsDirection::S2c);
+        assert_eq!(msgs[1].fin, Some(false));
+        assert!(msgs[1].payload.is_empty());
+
+        // A flow with no ws frames returns an empty list.
+        let other = w.flow_start(sample_flow()).await.unwrap();
+        assert!(store.reader().ws_messages_for_flow(other).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attack_and_results_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let base = w.flow_start(sample_flow()).await.unwrap();
+        let attack_id = w
+            .create_attack(NewAttack {
+                workspace: "default".into(),
+                name: "sniper-1".into(),
+                base_flow_id: Some(base),
+                positions: r#"[{"start":10,"end":20}]"#.into(),
+                config: r#"{"mode":"sniper","concurrency":8}"#.into(),
+                status: "pending".into(),
+                created_ts: 100,
+            })
+            .await
+            .unwrap();
+
+        let got = reader.attack_get(attack_id).unwrap().unwrap();
+        assert_eq!(got.id, attack_id);
+        assert_eq!(got.name.as_deref(), Some("sniper-1"));
+        assert_eq!(got.base_flow_id, Some(base));
+        assert_eq!(got.status.as_deref(), Some("pending"));
+
+        // Status update is reflected.
+        w.update_attack_status(attack_id, "running").await.unwrap();
+        assert_eq!(
+            reader.attack_get(attack_id).unwrap().unwrap().status.as_deref(),
+            Some("running")
+        );
+
+        // Results round-trip, ordered by insertion.
+        let r1 = w
+            .insert_attack_result(NewAttackResult {
+                attack_id,
+                payload: r#"{"p":"admin"}"#.into(),
+                flow_id: Some(base),
+                status_code: Some(200),
+                resp_len: Some(1234),
+                latency_ms: Some(42),
+                anomaly_score: Some(0.5),
+                ts: 101,
+            })
+            .await
+            .unwrap();
+        let r2 = w
+            .insert_attack_result(NewAttackResult {
+                attack_id,
+                payload: r#"{"p":"guest"}"#.into(),
+                flow_id: None,
+                status_code: Some(403),
+                resp_len: Some(10),
+                latency_ms: Some(5),
+                anomaly_score: None,
+                ts: 102,
+            })
+            .await
+            .unwrap();
+        assert_ne!(r1, r2);
+
+        let results = reader.attack_results(attack_id).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, r1);
+        assert_eq!(results[0].status_code, Some(200));
+        assert_eq!(results[0].resp_len, Some(1234));
+        assert_eq!(results[0].anomaly_score, Some(0.5));
+        assert_eq!(results[1].status_code, Some(403));
+        assert_eq!(results[1].anomaly_score, None);
+
+        // list_attacks by workspace and unfiltered.
+        assert_eq!(reader.list_attacks(Some("default")).unwrap().len(), 1);
+        assert!(reader.list_attacks(Some("nope")).unwrap().is_empty());
+        assert_eq!(reader.list_attacks(None).unwrap().len(), 1);
+        assert!(reader.attack_get(9999).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_profile_upsert_token_and_scope_lookup() {
+        use crate::model::NewAuthProfile;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let id = w
+            .upsert_auth_profile(NewAuthProfile {
+                host: "api.example.com".into(),
+                login_cmd: "printf tok123".into(),
+                extract_regex: "(tok[0-9]+)".into(),
+                header_template: "Authorization: Bearer {}".into(),
+            })
+            .await
+            .unwrap();
+        assert!(id > 0);
+
+        // A re-upsert of the same host updates config in place (no duplicate).
+        let id2 = w
+            .upsert_auth_profile(NewAuthProfile {
+                host: "api.example.com".into(),
+                login_cmd: "printf tok999".into(),
+                extract_regex: "(tok[0-9]+)".into(),
+                header_template: "Authorization: Bearer {}".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(reader.auth_profiles().unwrap().len(), 1);
+
+        // Setting a token + rule id is reflected; a re-upsert does NOT clobber it.
+        w.set_auth_token("api.example.com", Some("tok999".into()), Some(42), 7)
+            .await
+            .unwrap();
+        let _ = w
+            .upsert_auth_profile(NewAuthProfile {
+                host: "api.example.com".into(),
+                login_cmd: "printf again".into(),
+                extract_regex: "(x)".into(),
+                header_template: "Authorization: Bearer {}".into(),
+            })
+            .await
+            .unwrap();
+        let p = reader.auth_profiles().unwrap().pop().unwrap();
+        assert_eq!(p.token.as_deref(), Some("tok999"));
+        assert_eq!(p.rule_id, Some(42));
+        assert_eq!(p.login_cmd, "printf again");
+
+        // Scope lookup: substring match wins; a non-matching host resolves None.
+        assert!(reader
+            .auth_profile_for_host("api.example.com")
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .auth_profile_for_host("other.test")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_records_and_stats_aggregate_zero_flow_execs() {
+        use crate::model::NewExecRecord;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        // A network-facing exec that captured flows.
+        w.insert_exec(NewExecRecord {
+            exec_id: "e1".into(),
+            cmd: "curl https://x".into(),
+            network_facing: true,
+            flow_count: 3,
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+        // A network-facing exec that captured NOTHING (traffic escaped).
+        w.insert_exec(NewExecRecord {
+            exec_id: "e2".into(),
+            cmd: "curl https://y".into(),
+            network_facing: true,
+            flow_count: 0,
+            created_at: 2,
+        })
+        .await
+        .unwrap();
+        // A non-network exec with zero flows must NOT count as escaped.
+        w.insert_exec(NewExecRecord {
+            exec_id: "e3".into(),
+            cmd: "ls".into(),
+            network_facing: false,
+            flow_count: 0,
+            created_at: 3,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(reader.exec_records().unwrap().len(), 3);
+        let stats = reader.exec_stats().unwrap();
+        assert_eq!(stats.total_execs, 3);
+        assert_eq!(stats.total_flows, 3);
+        assert_eq!(stats.network_execs, 2);
+        assert_eq!(stats.network_zero_flow_execs, 1);
+    }
+
+    #[tokio::test]
+    async fn set_flow_tls_meta_persists() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+
+        let flow_id = w.flow_start(sample_flow()).await.unwrap();
+        w.set_flow_tls_meta(
+            flow_id,
+            Some("TLSv1.3".into()),
+            Some("TLS_AES_128_GCM_SHA256".into()),
+            Some("h2".into()),
+            Some("aa:bb:cc".into()),
+        )
+        .await
+        .unwrap();
+
+        // Read the columns back directly through a pooled connection.
+        let reader = store.reader();
+        let conn = reader.pool_conn_for_test();
+        let (v, c, a, fp): (String, String, String, String) = conn
+            .query_row(
+                "SELECT tls_version, tls_cipher, tls_alpn, origin_cert_fp FROM flows WHERE id = ?1",
+                [flow_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(v, "TLSv1.3");
+        assert_eq!(c, "TLS_AES_128_GCM_SHA256");
+        assert_eq!(a, "h2");
+        assert_eq!(fp, "aa:bb:cc");
+    }
+
+    #[tokio::test]
+    async fn new_flow_filters_ts_size_and_header() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        // Flow A: ts=1000, small response, request carries a custom header.
+        let mut fa = sample_flow();
+        fa.ts_start = 1000;
+        let a = w.flow_start(fa).await.unwrap();
+        w.request(
+            a,
+            RequestData {
+                method: "GET".into(),
+                authority: "example.com".into(),
+                path: "/a".into(),
+                http_version: "HTTP/1.1".into(),
+                headers: b"X-Trace: alpha-marker\r\n".to_vec(),
+                body: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        w.response(
+            a,
+            ResponseData {
+                status: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: Vec::new(),
+                body: vec![b'x'; 50],
+                timing_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Flow B: ts=5000, large response, response carries a header.
+        let mut fb = sample_flow();
+        fb.ts_start = 5000;
+        let b = w.flow_start(fb).await.unwrap();
+        w.request(
+            b,
+            RequestData {
+                method: "GET".into(),
+                authority: "example.com".into(),
+                path: "/b".into(),
+                http_version: "HTTP/1.1".into(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        w.response(
+            b,
+            ResponseData {
+                status: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: b"X-Resp: beta-marker\r\n".to_vec(),
+                body: vec![b'y'; 2000],
+                timing_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // ts range: only A falls in [500, 2000].
+        let by_ts = reader
+            .list_flows(&FlowFilter {
+                ts_from: Some(500),
+                ts_to: Some(2000),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_ts.len(), 1);
+        assert_eq!(by_ts[0].id, a);
+
+        // response size: only B has a body >= 1000 bytes.
+        let by_min = reader
+            .list_flows(&FlowFilter {
+                min_resp_len: Some(1000),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_min.len(), 1);
+        assert_eq!(by_min[0].id, b);
+
+        // max size: only A has a body <= 100 bytes.
+        let by_max = reader
+            .list_flows(&FlowFilter {
+                max_resp_len: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_max.len(), 1);
+        assert_eq!(by_max[0].id, a);
+
+        // header_contains matches the request header on A...
+        let by_req_hdr = reader
+            .list_flows(&FlowFilter {
+                header_contains: Some("alpha-marker".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_req_hdr.len(), 1);
+        assert_eq!(by_req_hdr[0].id, a);
+
+        // ...and the response header on B.
+        let by_resp_hdr = reader
+            .list_flows(&FlowFilter {
+                header_contains: Some("beta-marker".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_resp_hdr.len(), 1);
+        assert_eq!(by_resp_hdr[0].id, b);
     }
 
     #[tokio::test]

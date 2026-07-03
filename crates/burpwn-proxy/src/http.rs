@@ -19,27 +19,48 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
-use hyper::header::{HeaderName, HeaderValue, CONTENT_ENCODING, HOST};
+use hyper::body::{Body, Frame, Incoming};
+use hyper::header::{HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use sha2::Digest;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use burpwn_store::model::{FlowStart, Protocol, RequestData, ResponseData};
+use burpwn_store::model::{FlowStart, Protocol, RequestData, ResponseData, WsDirection};
 use burpwn_store::{WriteHandle, WriteOp};
 
 use crate::decode::decode_body;
 use crate::intercept::{InterceptController, InterceptData, InterceptDecision, InterceptKind};
-use crate::matchreplace::{apply_request, apply_response, Message};
+use crate::matchreplace::{apply_request, apply_response, host_in_scope, Message};
 use crate::util::now_millis;
+use crate::ws;
+
+/// The boxed error type carried by [`ProxyBody`].
+type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// The response body type the proxy hands hyper: either a fully-buffered body
+/// (rewritten / intercepted responses) or a streaming tee of the upstream body
+/// (SSE / chunked / long-poll passthrough). Boxing unifies both so `handle` has
+/// a single return type.
+pub type ProxyBody = BoxBody<Bytes, BoxErr>;
+
+/// Wrap fully-buffered `bytes` as a [`ProxyBody`].
+pub fn full_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
 
 /// Cap applied to the STORED copy of a body (via [`cap_for_store`]). Bodies are
 /// always FORWARDED in full — only the copy persisted to the session DB is
@@ -95,6 +116,8 @@ pub struct HttpContext {
     pub writer: WriteHandle,
     /// Intercept primitive.
     pub intercept: InterceptController,
+    /// Session-auth auto-refresh trigger (inert unless the daemon armed it).
+    pub auth: crate::auth::AuthWatcher,
     /// Match/replace rules, snapshotted for the life of the connection.
     pub rules: Arc<Vec<burpwn_store::model::MatchReplaceRule>>,
     /// Default workspace id.
@@ -113,6 +136,12 @@ pub struct HttpContext {
     pub scheme: String,
     /// How to reach the origin.
     pub upstream: Upstream,
+    /// Negotiated (downstream MITM) TLS protocol version, e.g. `TLSv1.3`.
+    pub tls_version: Option<String>,
+    /// Negotiated (downstream MITM) cipher suite.
+    pub tls_cipher: Option<String>,
+    /// Negotiated (downstream MITM) ALPN protocol, e.g. `h2`.
+    pub tls_alpn: Option<String>,
 }
 
 /// Serve a downstream connection that negotiated HTTP/1.1 (or cleartext H1).
@@ -151,19 +180,19 @@ where
 
 /// Public entry for the explicit-proxy cleartext path: handle one request whose
 /// upstream is already resolved in `ctx`. Mirrors the in-line service handler.
-pub async fn handle_explicit(req: Request<Incoming>, ctx: HttpContext) -> Response<Full<Bytes>> {
+pub async fn handle_explicit(req: Request<Incoming>, ctx: HttpContext) -> Response<ProxyBody> {
     handle(req, ctx).await
 }
 
 /// The per-request handler shared by H1 and H2.
-async fn handle(req: Request<Incoming>, ctx: HttpContext) -> Response<Full<Bytes>> {
+async fn handle(req: Request<Incoming>, ctx: HttpContext) -> Response<ProxyBody> {
     match handle_inner(req, ctx).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(error = %e, "proxy request failed");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(Bytes::from_static(b"burpwn: upstream error")))
+                .body(full_body(Bytes::from_static(b"burpwn: upstream error")))
                 .unwrap()
         }
     }
@@ -172,7 +201,7 @@ async fn handle(req: Request<Incoming>, ctx: HttpContext) -> Response<Full<Bytes
 async fn handle_inner(
     mut req: Request<Incoming>,
     ctx: HttpContext,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> anyhow::Result<Response<ProxyBody>> {
     let started = Instant::now();
     let version = req.version();
     let is_ws = is_websocket_upgrade(req.headers());
@@ -205,7 +234,7 @@ async fn handle_inner(
             );
             return Ok(Response::builder()
                 .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(Full::new(Bytes::from_static(
+                .body(full_body(Bytes::from_static(
                     b"burpwn: request body too large",
                 )))
                 .unwrap());
@@ -246,7 +275,7 @@ async fn handle_inner(
         InterceptDecision::Drop => {
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
-                .body(Full::new(Bytes::from_static(
+                .body(full_body(Bytes::from_static(
                     b"burpwn: dropped by intercept",
                 )))
                 .unwrap());
@@ -273,6 +302,10 @@ async fn handle_inner(
             intercepted,
         })
         .await?;
+    // gRPC request bodies are length-prefixed frames; deframe the STORED copy so
+    // the capture isn't opaque (best-effort; non-gRPC bodies pass through).
+    let req_content_type = header_str(&parts.headers, CONTENT_TYPE);
+    let req_store_body = maybe_degrpc(req_content_type.as_deref(), &msg.body);
     let _ = ctx
         .writer
         .request(
@@ -283,7 +316,7 @@ async fn handle_inner(
                 path: msg.url.clone(),
                 http_version: version_str(version).into(),
                 headers: msg.headers.clone(),
-                body: cap_for_store(&msg.body),
+                body: cap_for_store(req_store_body.as_deref().unwrap_or(&msg.body)),
             },
         )
         .await;
@@ -299,10 +332,61 @@ async fn handle_inner(
         return websocket_forward(upstream_req, ctx, flow_id, downstream_upgrade).await;
     }
 
-    // --- forward + capture the response ---
-    // An over-cap upstream body (or connect/exchange timeout) surfaces here as an
-    // `Err`, which `handle` turns into a 502; flow_end runs below only on success.
-    let (resp_parts, resp_body_bytes) = forward(&ctx.upstream, upstream_req).await?;
+    // --- forward: open upstream + read the response HEADERS (streaming body) ---
+    // A connect/handshake/header timeout surfaces here as an `Err`, which `handle`
+    // turns into a 502. The BODY is not collected yet — that is decided below.
+    let (resp_parts, resp_body, up_guard, origin_cert_fp) =
+        forward_streaming(&ctx.upstream, upstream_req).await?;
+
+    // Best-effort session-auth AUTO-refresh hook: signal the (debounced) host on
+    // a 401/403 so the daemon can re-mint an expired token. Inert (cheap no-op)
+    // unless the daemon armed the watcher via `AuthWatcher::activate`. Covers
+    // both the streaming and buffered response paths since the status is known
+    // here, before either branch. See [`crate::auth`] for the recursion guard.
+    ctx.auth.observe(&msg.host, resp_parts.status.as_u16());
+
+    // --- TLS/connection metadata (best-effort) ---
+    // Negotiated version/cipher/alpn come from the downstream MITM handshake
+    // (carried on `ctx`); the origin leaf cert fingerprint from the upstream leg.
+    if ctx.tls_version.is_some()
+        || ctx.tls_cipher.is_some()
+        || ctx.tls_alpn.is_some()
+        || origin_cert_fp.is_some()
+    {
+        let _ = ctx
+            .writer
+            .set_flow_tls_meta(
+                flow_id,
+                ctx.tls_version.clone(),
+                ctx.tls_cipher.clone(),
+                ctx.tls_alpn.clone(),
+                origin_cert_fp,
+            )
+            .await;
+    }
+
+    // --- HYBRID streaming decision ---
+    // When NO match/replace rule targets this host AND intercept is disabled, we
+    // never need the full body: stream it through chunk-by-chunk (fixing SSE /
+    // chunked / long-poll, which otherwise stall until EOF or the upstream
+    // timeout) while tee-ing a size-capped copy to the store. Otherwise we must
+    // buffer the whole body to rewrite / hold it.
+    if should_stream(&ctx, &msg.host) {
+        return Ok(stream_response(
+            resp_parts,
+            resp_body,
+            up_guard,
+            &ctx,
+            flow_id,
+            started,
+            version,
+        ));
+    }
+
+    // --- buffer path: collect the full body (bounded) then rewrite/intercept ---
+    let resp_body_bytes = with_timeout(UPSTREAM_TIMEOUT, "upstream body", collect_incoming(resp_body))
+        .await??;
+    drop(up_guard);
     let raw_resp_headers = serialize_headers(&resp_parts.headers);
 
     // Decode a COPY for storage; never alter forwarded bytes.
@@ -310,7 +394,13 @@ async fn handle_inner(
         .headers
         .get(CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok());
-    let decoded_for_store = decode_body(content_encoding, &resp_body_bytes);
+    let resp_content_type = header_str(&resp_parts.headers, CONTENT_TYPE);
+    // gRPC bodies are length-prefixed frames; deframe the STORED copy so it isn't
+    // opaque. Falls back to the decoded bytes when it isn't gRPC / can't deframe.
+    let decoded_for_store = {
+        let decoded = decode_body(content_encoding, &resp_body_bytes);
+        maybe_degrpc(resp_content_type.as_deref(), &decoded).unwrap_or(decoded)
+    };
 
     // --- response-side match/replace (operates on decoded body view) ---
     let mut resp_msg = Message {
@@ -360,7 +450,7 @@ async fn handle_inner(
             let _ = ctx.writer.flow_end(flow_id, now_millis()).await;
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
-                .body(Full::new(Bytes::from_static(b"burpwn: response dropped")))
+                .body(full_body(Bytes::from_static(b"burpwn: response dropped")))
                 .unwrap());
         }
     }
@@ -382,32 +472,235 @@ async fn handle_inner(
         .await;
     let _ = ctx.writer.flow_end(flow_id, now_millis()).await;
 
-    // --- stream the response back downstream ---
+    // --- return the buffered response downstream ---
     let mut builder = Response::builder().status(status);
     {
         let hdrs = builder.headers_mut().unwrap();
         *hdrs = forward_headers;
-        // Hyper sets the length from the Full body; drop a stale framing header.
-        hdrs.remove(hyper::header::CONTENT_LENGTH);
-        hdrs.remove(hyper::header::TRANSFER_ENCODING);
-        // Connection-specific headers are illegal when the downstream is HTTP/2
-        // (e.g. an h1 origin response relayed to an h2 client).
-        hdrs.remove(hyper::header::CONNECTION);
-        hdrs.remove(hyper::header::UPGRADE);
-        hdrs.remove("keep-alive");
-        hdrs.remove("proxy-connection");
+        sanitize_downstream_headers(hdrs);
     }
-    Ok(builder.body(Full::new(forward_body))?)
+    Ok(builder.body(full_body(forward_body))?)
 }
 
-/// Open the upstream connection, send the request, and collect the response.
-/// The connect (and TLS handshake) is bounded by [`CONNECT_TIMEOUT`] and the
-/// whole request/response exchange by [`UPSTREAM_TIMEOUT`], so a slow or silent
-/// origin cannot pin a downstream connection (and its buffers) forever.
-async fn forward(
+/// Strip framing + connection-specific + h3-advertising headers before relaying
+/// a response downstream:
+/// - `Content-Length` / `Transfer-Encoding`: hyper recomputes framing.
+/// - `Connection` / `Upgrade` / `keep-alive` / `proxy-connection`: illegal when
+///   the downstream is HTTP/2 (an h1 origin response relayed to an h2 client).
+/// - `Alt-Svc`: advertises HTTP/3 over QUIC/UDP-443, which the sandbox
+///   blackholes — clients that try h3 then hang. Removing it deterministically
+///   keeps clients on h2/h1.
+fn sanitize_downstream_headers(hdrs: &mut hyper::HeaderMap) {
+    hdrs.remove(hyper::header::CONTENT_LENGTH);
+    hdrs.remove(hyper::header::TRANSFER_ENCODING);
+    hdrs.remove(hyper::header::CONNECTION);
+    hdrs.remove(hyper::header::UPGRADE);
+    hdrs.remove("keep-alive");
+    hdrs.remove("proxy-connection");
+    hdrs.remove("alt-svc");
+}
+
+/// Whether the response body for this flow can be streamed straight through
+/// (tee-ing a capped copy) rather than buffered: true when interception is off
+/// AND no enabled match/replace rule targets this host, so we never need the full
+/// body to rewrite or hold it.
+fn should_stream(ctx: &HttpContext, host: &str) -> bool {
+    if ctx.intercept.is_enabled() {
+        return false;
+    }
+    !ctx.rules
+        .iter()
+        .any(|r| r.enabled && host_in_scope(&r.scope, host))
+}
+
+/// gRPC message framing: `application/grpc*` bodies are a sequence of
+/// `flag(1) | length(4, big-endian) | message` frames. Deframe them into the
+/// concatenated message payloads (newline-separated) for the STORED/searchable
+/// copy so the capture isn't opaque. Returns `None` when it isn't gRPC or the
+/// framing doesn't parse cleanly (caller keeps the original bytes). Minimal by
+/// design — no protobuf decoding.
+fn maybe_degrpc(content_type: Option<&str>, body: &[u8]) -> Option<Vec<u8>> {
+    let ct = content_type?;
+    if !ct.trim_start().to_ascii_lowercase().starts_with("application/grpc") {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0usize;
+    let mut frames = 0usize;
+    while i + 5 <= body.len() {
+        let len = u32::from_be_bytes([body[i + 1], body[i + 2], body[i + 3], body[i + 4]]) as usize;
+        let start = i + 5;
+        let end = start.checked_add(len)?;
+        if end > body.len() {
+            // Truncated final frame (or not really gRPC): bail cleanly.
+            break;
+        }
+        if frames > 0 {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(&body[start..end]);
+        i = end;
+        frames += 1;
+    }
+    // Only claim success if we actually consumed at least one whole frame and the
+    // stream ended on a frame boundary (garbage would leave a partial remainder).
+    if frames == 0 || i != body.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Fetch a header value as an owned UTF-8 string, if present + valid.
+fn header_str(headers: &hyper::HeaderMap, name: HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Build a downstream response that STREAMS the upstream body through verbatim
+/// while tee-ing a [`BODY_CAP`]-bounded copy to the store. The response row +
+/// `flow_end` are written when the stream completes (or the body is dropped).
+fn stream_response(
+    parts: http::response::Parts,
+    body: Incoming,
+    guard: AbortOnDrop,
+    ctx: &HttpContext,
+    flow_id: i64,
+    started: Instant,
+    version: Version,
+) -> Response<ProxyBody> {
+    let status = parts.status;
+    let stored_headers = serialize_headers(&parts.headers);
+    let mut forward_headers = parts.headers.clone();
+    sanitize_downstream_headers(&mut forward_headers);
+
+    let tee = TeeBody {
+        inner: body,
+        _guard: guard,
+        state: Some(TeeState {
+            writer: ctx.writer.clone(),
+            flow_id,
+            status: status.as_u16(),
+            http_version: version_str(version).into(),
+            headers: stored_headers,
+            captured: Vec::new(),
+            started,
+        }),
+    };
+
+    let mut builder = Response::builder().status(status);
+    if let Some(hdrs) = builder.headers_mut() {
+        *hdrs = forward_headers;
+    }
+    builder
+        .body(tee.boxed())
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Per-stream capture state persisted once the streamed body ends.
+struct TeeState {
+    writer: WriteHandle,
+    flow_id: i64,
+    status: u16,
+    http_version: String,
+    headers: Vec<u8>,
+    captured: Vec<u8>,
+    started: Instant,
+}
+
+/// A response body that forwards the upstream [`Incoming`] frames verbatim while
+/// tee-ing a size-capped copy to the store. When the stream terminates (EOF,
+/// error, or drop) it records the response row + `flow_end`. Holds the upstream
+/// connection guard so the driver task lives exactly as long as the body.
+struct TeeBody {
+    inner: Incoming,
+    _guard: AbortOnDrop,
+    state: Option<TeeState>,
+}
+
+impl TeeBody {
+    /// Persist the captured response exactly once (idempotent).
+    fn finish(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let timing = state.started.elapsed().as_millis() as i64;
+            let _ = state
+                .writer
+                .response(
+                    state.flow_id,
+                    ResponseData {
+                        status: state.status,
+                        http_version: state.http_version,
+                        headers: state.headers,
+                        body: state.captured,
+                        timing_ms: Some(timing),
+                    },
+                )
+                .await;
+            let _ = state.writer.flow_end(state.flow_id, now_millis()).await;
+        });
+    }
+}
+
+impl Body for TeeBody {
+    type Data = Bytes;
+    type Error = BoxErr;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxErr>>> {
+        // TeeBody is Unpin (Incoming / Option / AbortOnDrop are all Unpin).
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if let Some(state) = this.state.as_mut() {
+                        let remaining = BODY_CAP.saturating_sub(state.captured.len());
+                        if remaining > 0 {
+                            let take = data.len().min(remaining);
+                            state.captured.extend_from_slice(&data[..take]);
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.finish();
+                Poll::Ready(Some(Err(Box::new(e))))
+            }
+            Poll::Ready(None) => {
+                this.finish();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for TeeBody {
+    fn drop(&mut self) {
+        // A downstream disconnect can drop the body without a terminal poll;
+        // still persist whatever we captured so the flow isn't lost.
+        self.finish();
+    }
+}
+
+/// Open the upstream connection and read the response HEADERS, returning the
+/// still-unread streaming body plus a guard that keeps the connection driver
+/// alive while the body is consumed, and (for TLS) the origin leaf cert
+/// fingerprint. The connect/handshake is bounded by [`CONNECT_TIMEOUT`] and
+/// reading the response headers by [`UPSTREAM_TIMEOUT`]; the BODY read is
+/// deliberately NOT time-bounded here so long-lived streams (SSE / long-poll)
+/// are not killed at [`UPSTREAM_TIMEOUT`] — the buffered caller re-imposes a
+/// body timeout when it collects.
+async fn forward_streaming(
     upstream: &Upstream,
     req: Request<Full<Bytes>>,
-) -> anyhow::Result<(http::response::Parts, Bytes)> {
+) -> anyhow::Result<(http::response::Parts, Incoming, AbortOnDrop, Option<String>)> {
     match upstream {
         Upstream::Plain { addr } => {
             let tcp = with_timeout(
@@ -418,8 +711,10 @@ async fn forward(
             .await??;
             // No ALPN on a cleartext upstream: default to HTTP/1.1 (prior-knowledge
             // h2c is rare and not something we negotiated).
-            let exchange = send_over(tcp, req, false, "http");
-            with_timeout(UPSTREAM_TIMEOUT, "upstream exchange", exchange).await?
+            let (parts, body, guard) =
+                with_timeout(UPSTREAM_TIMEOUT, "upstream headers", send_over_streaming(tcp, req, false, "http"))
+                    .await??;
+            Ok((parts, body, guard, None))
         }
         Upstream::Tls {
             addr,
@@ -437,14 +732,40 @@ async fn forward(
                     .map_err(anyhow::Error::from)
             })
             .await??;
+            // Fingerprint the ORIGIN's leaf certificate (SHA-256, hex) before we
+            // move the stream into the sender.
+            let cert_fp = leaf_cert_fp(tls.get_ref().1.peer_certificates());
             // The UPSTREAM leg's protocol is whatever ALPN negotiated — independent
             // of the downstream version (a client may speak h2 to us while the
             // origin only speaks h1, or vice versa).
             let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-            let exchange = send_over(tls, req, is_h2, "https");
-            with_timeout(UPSTREAM_TIMEOUT, "upstream exchange", exchange).await?
+            let (parts, body, guard) = with_timeout(
+                UPSTREAM_TIMEOUT,
+                "upstream headers",
+                send_over_streaming(tls, req, is_h2, "https"),
+            )
+            .await??;
+            Ok((parts, body, guard, cert_fp))
         }
     }
+}
+
+/// SHA-256 (hex) of the first (leaf) certificate in a peer chain, if present.
+fn leaf_cert_fp(chain: Option<&[rustls::pki_types::CertificateDer<'static>]>) -> Option<String> {
+    let leaf = chain?.first()?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(leaf.as_ref());
+    Some(hex_lower(&hasher.finalize()))
+}
+
+/// Lowercase hex-encode bytes (no external hex crate).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
 }
 
 /// Run `fut` under `dur`, mapping an elapsed timeout to a labelled error so the
@@ -459,16 +780,35 @@ where
         .map_err(|_| anyhow::anyhow!("{what} timed out after {dur:?}"))
 }
 
-/// Drive one request/response over an established (plain or TLS) byte stream
-/// using hyper's client connection. `use_h2` is the UPSTREAM-negotiated protocol
-/// (from ALPN), NOT the downstream version. `scheme` is the upstream scheme,
-/// needed to build the absolute URI HTTP/2 requires.
+/// Drive one request over an established (plain or TLS) byte stream using hyper's
+/// client connection and collect the FULL response (bounded). `use_h2` is the
+/// UPSTREAM-negotiated protocol (from ALPN), NOT the downstream version. Thin
+/// wrapper over [`send_over_streaming`] used by the replay path and anywhere a
+/// buffered response is wanted.
 pub(crate) async fn send_over<S>(
+    stream: S,
+    req: Request<Full<Bytes>>,
+    use_h2: bool,
+    scheme: &str,
+) -> anyhow::Result<(http::response::Parts, Bytes)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (parts, body, guard) = send_over_streaming(stream, req, use_h2, scheme).await?;
+    let bytes = collect_incoming(body).await?;
+    drop(guard);
+    Ok((parts, bytes))
+}
+
+/// Drive one request and return the response HEADERS + the still-unread streaming
+/// body + a guard keeping the connection driver alive. `use_h2` selects the
+/// upstream protocol; `scheme` builds the absolute URI HTTP/2 requires.
+pub(crate) async fn send_over_streaming<S>(
     stream: S,
     mut req: Request<Full<Bytes>>,
     use_h2: bool,
     scheme: &str,
-) -> anyhow::Result<(http::response::Parts, Bytes)>
+) -> anyhow::Result<(http::response::Parts, Incoming, AbortOnDrop)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -483,35 +823,37 @@ where
         *req.version_mut() = Version::HTTP_2;
         let (mut sender, conn) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
-        // Abort (not just detach) the conn driver when this future is dropped —
-        // e.g. an enclosing `UPSTREAM_TIMEOUT` fires — so the upstream task and
-        // its fd are not leaked.
-        let _conn = AbortOnDrop(tokio::spawn(async move {
+        // Abort (not just detach) the conn driver when the guard is dropped — e.g.
+        // an enclosing timeout fires, or the streaming body is dropped — so the
+        // upstream task and its fd are not leaked.
+        let guard = AbortOnDrop(tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::debug!(error = %e, "upstream h2 conn closed");
             }
         }));
         let resp = sender.send_request(req).await?;
-        collect_response(resp).await
+        let (parts, body) = resp.into_parts();
+        Ok((parts, body, guard))
     } else {
         // HTTP/1.1: origin-form path + Host header (already set). Pin the version
         // in case the downstream request arrived as h2.
         *req.version_mut() = Version::HTTP_11;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-        let _conn = AbortOnDrop(tokio::spawn(async move {
+        let guard = AbortOnDrop(tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::debug!(error = %e, "upstream h1 conn closed");
             }
         }));
         let resp = sender.send_request(req).await?;
-        collect_response(resp).await
+        let (parts, body) = resp.into_parts();
+        Ok((parts, body, guard))
     }
 }
 
 /// Aborts the wrapped task when dropped, so an upstream connection driver spawned
 /// for one request is not left running (leaking a task + fd) if the request
 /// future is cancelled — e.g. by [`UPSTREAM_TIMEOUT`].
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -547,16 +889,13 @@ fn promote_to_absolute_uri(req: &mut Request<Full<Bytes>>, scheme: &str) {
     }
 }
 
-/// Collect an upstream response, bounding the body at [`FORWARD_BODY_CAP`] so a
+/// Collect an upstream response body, bounding it at [`FORWARD_BODY_CAP`] so a
 /// malicious origin cannot OOM the proxy. An over-cap body fails the flow (the
 /// caller surfaces a 502) rather than buffering without limit.
-async fn collect_response(
-    resp: Response<Incoming>,
-) -> anyhow::Result<(http::response::Parts, Bytes)> {
-    let (parts, body) = resp.into_parts();
+async fn collect_incoming(body: Incoming) -> anyhow::Result<Bytes> {
     let limited = Limited::new(body, FORWARD_BODY_CAP);
     match limited.collect().await {
-        Ok(collected) => Ok((parts, collected.to_bytes())),
+        Ok(collected) => Ok(collected.to_bytes()),
         // `Limited` boxes a `LengthLimitError` on overflow; any other error is a
         // real read failure on the wire.
         Err(e)
@@ -749,15 +1088,15 @@ fn version_str(v: Version) -> &'static str {
 }
 
 /// WebSocket forwarding: open a plain/TLS upstream H1 connection, replay the
-/// upgrade request, and on a `101` splice the two upgraded byte streams, teeing
-/// frame bytes to the store. Minimal but functional: bytes are forwarded
-/// verbatim and tee'd as raw chunks rather than parsing every WS frame.
+/// upgrade request, and on a `101` splice the two upgraded byte streams. The
+/// bytes are forwarded verbatim on the wire; a COPY of each direction is parsed
+/// into structured, complete WebSocket messages and persisted (see [`splice_ws`]).
 async fn websocket_forward(
     req: Request<Full<Bytes>>,
     ctx: HttpContext,
     flow_id: i64,
     downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> anyhow::Result<Response<ProxyBody>> {
     let (up_parts, up_upgrade) = match &ctx.upstream {
         Upstream::Plain { addr } => {
             let tcp = TcpStream::connect(*addr).await?;
@@ -781,7 +1120,7 @@ async fn websocket_forward(
         let _ = ctx.writer.flow_end(flow_id, now_millis()).await;
         let mut builder = Response::builder().status(up_parts.status);
         *builder.headers_mut().unwrap() = up_parts.headers;
-        return Ok(builder.body(Full::new(Bytes::new()))?);
+        return Ok(builder.body(full_body(Bytes::new()))?);
     }
 
     // Build the 101 we return downstream, mirroring the upstream's headers. The
@@ -789,7 +1128,7 @@ async fn websocket_forward(
     // it writes this response, resolving `downstream_upgrade`.
     let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
     *builder.headers_mut().unwrap() = up_parts.headers.clone();
-    let downstream_resp = builder.body(Full::new(Bytes::new()))?;
+    let downstream_resp = builder.body(full_body(Bytes::new()))?;
 
     // Splice both upgraded streams once they're ready.
     let writer = ctx.writer.clone();
@@ -811,74 +1150,69 @@ async fn websocket_forward(
     Ok(downstream_resp)
 }
 
-/// Splice two upgraded WebSocket streams, teeing a capped copy of each direction
-/// to the store as raw chunks (best-effort frame logging).
+/// Splice two upgraded WebSocket streams. Each direction is forwarded verbatim
+/// (the wire is never altered) while a COPY is fed to a [`ws::Scanner`] that
+/// parses frames, unmasks client→server frames, reassembles continuation
+/// fragments, and persists each COMPLETE message via [`WriteOp::InsertWsMessage`]
+/// with the right direction + opcode/fin. Control frames (ping/pong/close) are
+/// recorded with their opcode but never treated as data.
 async fn splice_ws<D, U>(downstream: D, upstream: U, writer: WriteHandle, flow_id: i64)
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    const WS_CAP: usize = 256 * 1024;
-
-    let (mut dr, mut dw) = tokio::io::split(downstream);
-    let (mut ur, mut uw) = tokio::io::split(upstream);
+    let (dr, dw) = tokio::io::split(downstream);
+    let (ur, uw) = tokio::io::split(upstream);
 
     let w1 = writer.clone();
-    let c2s = tokio::spawn(async move {
-        let mut cap = 0usize;
-        let mut buf = vec![0u8; 16 * 1024];
-        while let Ok(n) = dr.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-            if uw.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
-            if cap < WS_CAP {
-                let take = n.min(WS_CAP - cap);
-                cap += take;
-                let mut bytes = b"ws-c2s:".to_vec();
-                bytes.extend_from_slice(&buf[..take]);
-                let _ = w1
-                    .send(WriteOp::RawChunk {
-                        flow_id,
-                        bytes,
-                        reply: None,
-                    })
-                    .await;
-            }
-        }
-        let _ = uw.shutdown().await;
-    });
+    let c2s = tokio::spawn(pump_ws(dr, uw, w1, flow_id, WsDirection::C2s));
     let w2 = writer.clone();
-    let s2c = tokio::spawn(async move {
-        let mut cap = 0usize;
-        let mut buf = vec![0u8; 16 * 1024];
-        while let Ok(n) = ur.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-            if dw.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
-            if cap < WS_CAP {
-                let take = n.min(WS_CAP - cap);
-                cap += take;
-                let mut bytes = b"ws-s2c:".to_vec();
-                bytes.extend_from_slice(&buf[..take]);
-                let _ = w2
-                    .send(WriteOp::RawChunk {
-                        flow_id,
-                        bytes,
-                        reply: None,
-                    })
-                    .await;
-            }
-        }
-        let _ = dw.shutdown().await;
-    });
+    let s2c = tokio::spawn(pump_ws(ur, dw, w2, flow_id, WsDirection::S2c));
     join_half_open(c2s, s2c, SPLICE_DRAIN_GRACE).await;
+}
+
+/// Pump one WebSocket direction: forward every byte to `w` verbatim, and feed a
+/// copy through a frame [`ws::Scanner`], persisting each completed message.
+async fn pump_ws<R, W>(
+    mut r: R,
+    mut w: W,
+    writer: WriteHandle,
+    flow_id: i64,
+    direction: WsDirection,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut scanner = ws::Scanner::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        // Forward verbatim FIRST; capture must never delay or alter the wire.
+        if w.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+        for msg in scanner.push(&buf[..n]) {
+            // Fire-and-forget: enqueue the write but don't block the pump on the
+            // DB ack (the id reply is discarded via a dropped receiver).
+            let (reply, _rx) = tokio::sync::oneshot::channel();
+            let _ = writer
+                .send(WriteOp::InsertWsMessage {
+                    flow_id,
+                    direction,
+                    opcode: Some(msg.opcode as i64),
+                    fin: Some(msg.fin),
+                    payload: msg.payload,
+                    ts: now_millis(),
+                    reply,
+                })
+                .await;
+        }
+    }
+    let _ = w.shutdown().await;
 }
 
 /// Grace period a still-open splice direction is given to drain after its
@@ -1133,6 +1467,58 @@ mod tests {
         });
         join_half_open(a, b, Duration::from_secs(5)).await;
         // Reaching here without hanging is the assertion; a clean close drained.
+    }
+
+    // Bug (h3 downgrade) regression: Alt-Svc advertises HTTP/3 over QUIC/UDP-443,
+    // which the sandbox blackholes; it MUST be stripped from relayed responses so
+    // clients deterministically stay on h2/h1. Connection-specific + framing
+    // headers must go too.
+    #[test]
+    fn sanitize_strips_alt_svc_and_hop_by_hop() {
+        let mut h = hyper::HeaderMap::new();
+        h.append("alt-svc", HeaderValue::from_static("h3=\":443\"; ma=86400"));
+        h.append(hyper::header::CONTENT_LENGTH, HeaderValue::from_static("10"));
+        h.append(
+            hyper::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        h.append(hyper::header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        h.append(hyper::header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        sanitize_downstream_headers(&mut h);
+        assert!(!h.contains_key("alt-svc"), "alt-svc must be stripped");
+        assert!(!h.contains_key(hyper::header::CONTENT_LENGTH));
+        assert!(!h.contains_key(hyper::header::TRANSFER_ENCODING));
+        assert!(!h.contains_key(hyper::header::CONNECTION));
+        // Non-hop-by-hop headers are preserved.
+        assert_eq!(h.get(hyper::header::CONTENT_TYPE).unwrap(), "text/html");
+    }
+
+    // gRPC framing: 1-byte flag + 4-byte big-endian length + message. Deframing
+    // the STORED copy strips the framing so the capture isn't opaque.
+    #[test]
+    fn degrpc_deframes_length_prefixed_messages() {
+        // Two frames: "abc" and "de".
+        let mut body = Vec::new();
+        body.push(0u8); // uncompressed flag
+        body.extend_from_slice(&(3u32).to_be_bytes());
+        body.extend_from_slice(b"abc");
+        body.push(0u8);
+        body.extend_from_slice(&(2u32).to_be_bytes());
+        body.extend_from_slice(b"de");
+        let out = maybe_degrpc(Some("application/grpc+proto"), &body).unwrap();
+        assert_eq!(out, b"abc\nde");
+    }
+
+    #[test]
+    fn degrpc_ignores_non_grpc_and_garbage() {
+        // Not gRPC content-type → None (keep original).
+        assert!(maybe_degrpc(Some("application/json"), b"{}").is_none());
+        assert!(maybe_degrpc(None, b"anything").is_none());
+        // gRPC content-type but the framing doesn't end on a boundary → None.
+        let mut body = vec![0u8];
+        body.extend_from_slice(&(10u32).to_be_bytes());
+        body.extend_from_slice(b"short"); // declares 10, only 5 present
+        assert!(maybe_degrpc(Some("application/grpc"), &body).is_none());
     }
 
     #[test]

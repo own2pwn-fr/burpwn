@@ -12,6 +12,7 @@ description = "burpwn MCP server: tools mapping to the CLI, long-poll await_inte
 rmcp.workspace = true
 schemars.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

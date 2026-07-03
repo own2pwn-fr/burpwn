@@ -1,0 +1,229 @@
+{
+  "cli": {
+    "flags": [
+      "--agent",
+      "--check",
+      "--clear",
+      "--concurrency",
+      "--delay",
+      "--extract",
+      "--flow",
+      "--global",
+      "--header",
+      "--help",
+      "--host",
+      "--json",
+      "--limit",
+      "--login",
+      "--marker",
+      "--method",
+      "--mode",
+      "--name",
+      "--offset",
+      "--on",
+      "--output",
+      "--path",
+      "--payload",
+      "--payloads",
+      "--port",
+      "--position",
+      "--protocol",
+      "--raw",
+      "--request",
+      "--session",
+      "--set-body",
+      "--set-header",
+      "--sort",
+      "--status",
+      "--timeout",
+      "--version",
+      "--what",
+      "--workspace",
+      "-V",
+      "-g",
+      "-h",
+      "-o"
+    ],
+    "provenance": "source:crates/burpwn-cli/src/cli.rs",
+    "subcommands": [
+      "add",
+      "auth",
+      "await",
+      "ca",
+      "compare",
+      "decode",
+      "disable",
+      "doctor",
+      "drop",
+      "enable",
+      "encode",
+      "exec",
+      "export",
+      "forward",
+      "fuzz",
+      "har",
+      "init",
+      "intercept",
+      "list",
+      "match-replace",
+      "new",
+      "note",
+      "pcap",
+      "refresh",
+      "replay",
+      "req",
+      "rm",
+      "run",
+      "scope",
+      "search",
+      "session",
+      "set",
+      "show",
+      "stats",
+      "status",
+      "tag",
+      "use",
+      "workspace"
+    ]
+  },
+  "mcp": {
+    "params": {
+      "await_intercept": [
+        "timeout_secs"
+      ],
+      "compare": [
+        "flow_a",
+        "flow_b",
+        "what"
+      ],
+      "encode": [
+        "scheme",
+        "value"
+      ],
+      "exec": [
+        "argv",
+        "workspace",
+        "timeout_secs"
+      ],
+      "fuzz": [
+        "flow",
+        "positions",
+        "payloads",
+        "mode",
+        "concurrency",
+        "delay_ms",
+        "marker",
+        "name"
+      ],
+      "fuzz_list": [
+        "workspace"
+      ],
+      "fuzz_results": [
+        "attack_id",
+        "sort",
+        "limit"
+      ],
+      "intercept_drop": [
+        "id"
+      ],
+      "intercept_forward": [
+        "id",
+        "set_headers",
+        "set_body",
+        "method",
+        "path"
+      ],
+      "intercept_scope": [
+        "host",
+        "path",
+        "method",
+        "clear"
+      ],
+      "match_replace_add": [
+        "scope",
+        "kind",
+        "pattern",
+        "replacement",
+        "on_request"
+      ],
+      "note_add": [
+        "flow_id",
+        "body"
+      ],
+      "req_list": [
+        "host",
+        "status",
+        "method",
+        "protocol",
+        "port",
+        "workspace",
+        "limit",
+        "offset"
+      ],
+      "req_replay": [
+        "id",
+        "set_headers",
+        "set_body",
+        "method"
+      ],
+      "req_search": [
+        "query"
+      ],
+      "req_show": [
+        "id",
+        "raw"
+      ],
+      "session_auth_refresh": [
+        "host"
+      ],
+      "session_auth_set": [
+        "login",
+        "extract",
+        "header",
+        "host"
+      ],
+      "tag_add": [
+        "flow_id",
+        "name",
+        "color"
+      ],
+      "workspace_new": [
+        "name"
+      ]
+    },
+    "provenance": "source:crates/burpwn-mcp/src/server.rs",
+    "tools": [
+      "session_list",
+      "session_current",
+      "session_stats",
+      "session_auth_set",
+      "session_auth_refresh",
+      "session_auth_status",
+      "req_list",
+      "req_show",
+      "req_search",
+      "workspace_list",
+      "tag_list",
+      "match_replace_list",
+      "match_replace_add",
+      "tag_add",
+      "note_add",
+      "workspace_new",
+      "intercept_enable",
+      "intercept_disable",
+      "intercept_list",
+      "await_intercept",
+      "intercept_forward",
+      "intercept_scope",
+      "intercept_drop",
+      "exec",
+      "req_replay",
+      "fuzz",
+      "fuzz_list",
+      "fuzz_results",
+      "compare",
+      "encode",
+      "decode"
+    ]
+  }
+}

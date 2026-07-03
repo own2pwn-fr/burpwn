@@ -100,6 +100,104 @@ pub struct ExecResult {
     pub captured_request_ids: Vec<i64>,
     /// The sandbox outcome (stdout/stderr present only in capture mode).
     pub outcome: ExecOutcome,
+    /// A capture-completeness warning: set when a clearly network-facing command
+    /// completed but produced ZERO new flows (traffic likely escaped capture,
+    /// e.g. the agent's hook silently no-op'd). `None` otherwise.
+    pub capture_warning: Option<String>,
+}
+
+/// Programs that clearly speak the network (HTTP-y / scanning tools). Used by
+/// [`is_network_facing`] to decide whether a ZERO-capture exec is worth warning
+/// about. Deliberately CONSERVATIVE: only tools whose whole purpose is network
+/// traffic, so an `ls`/`git`/`cat` that legitimately captures nothing never
+/// warns. Matched against a command token's basename (whole word).
+const NETWORK_TOOLS: &[&str] = &[
+    "curl", "wget", "http", "https", "httpie", "httpx", "nc", "ncat", "netcat", "socat", "telnet",
+    "nmap", "masscan", "ffuf", "gobuster", "feroxbuster", "dirb", "dirbuster", "nikto", "sqlmap",
+    "wpscan", "whatweb", "wfuzz", "hydra", "nuclei", "katana", "amass", "subfinder", "arjun",
+    "dalfox",
+];
+
+/// Whether `argv` is a CLEARLY network-facing command. Conservative: it only
+/// considers tokens in **program position** (the start of the command or of a
+/// segment after a shell separator), skipping `VAR=val` prefixes and benign
+/// wrappers (`sudo`/`env`/…). So a network tool that appears merely as an
+/// ARGUMENT (`grep curl notes`, `cat urls | wc -l`) never triggers a false
+/// alarm, while `curl …`, `sudo wget …` and a wrapped `sh -c 'nmap …'` do.
+pub fn is_network_facing(argv: &[String]) -> bool {
+    // Direct form (argv[0] is the program): analyze the joined argv.
+    if script_has_network_program(&argv.join(" ")) {
+        return true;
+    }
+    // Wrapped `sh -c '<script>'` form: analyze the script argument on its own, so
+    // a SINGLE inner command (no separator to re-mark program position in the
+    // joined view) is still caught.
+    argv.windows(2)
+        .any(|w| w[0] == "-c" && script_has_network_program(&w[1]))
+}
+
+/// Whether a shell `script` invokes a [`NETWORK_TOOLS`] program in program
+/// position (command start, or after a `;`/`|`/`&`/`(`/newline separator).
+/// Leading `VAR=val` assignments and benign wrapper prefixes (`sudo`/`env`/
+/// `command`/`nice`/`nohup`/`sh`/`bash`) are skipped so the program token is
+/// found, not the wrapper.
+fn script_has_network_program(script: &str) -> bool {
+    let is_sep = |c: char| matches!(c, ';' | '|' | '&' | '(' | ')' | '\n' | '`' | '{' | '}');
+    let mut at_start = true;
+    let mut token = String::new();
+    for c in script.chars() {
+        if c.is_whitespace() || is_sep(c) {
+            if program_token_is_network(&mut token, &mut at_start) {
+                return true;
+            }
+            if is_sep(c) {
+                at_start = true;
+            }
+        } else {
+            token.push(c);
+        }
+    }
+    program_token_is_network(&mut token, &mut at_start)
+}
+
+/// Classify one finished token in the program-position walk. Consumes `token`.
+/// While `at_start`, an env-assignment or wrapper is skipped (stays at start);
+/// the first real program token flips `at_start` off and is matched against
+/// [`NETWORK_TOOLS`]. Returns whether it matched a network tool.
+fn program_token_is_network(token: &mut String, at_start: &mut bool) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let t = std::mem::take(token);
+    if !*at_start {
+        return false; // an argument, not a program: ignore.
+    }
+    // `VAR=val` prefix or a benign wrapper: consume, remain at program start.
+    if is_env_assignment(&t) || is_wrapper(&t) {
+        return false;
+    }
+    *at_start = false;
+    let base = t.rsplit('/').next().unwrap_or(&t);
+    NETWORK_TOOLS.contains(&base)
+}
+
+/// A `VAR=value` shell assignment prefix (a valid env-var name before `=`).
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((k, _)) => !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        None => false,
+    }
+}
+
+/// A benign wrapper prefix whose following token is the real program (also the
+/// shells the wrap layer uses for `sh -c`, so their name isn't mistaken for the
+/// program).
+fn is_wrapper(tok: &str) -> bool {
+    let base = tok.rsplit('/').next().unwrap_or(tok);
+    matches!(
+        base,
+        "sudo" | "env" | "command" | "nice" | "nohup" | "sh" | "bash" | "dash" | "zsh" | "time"
+    )
 }
 
 /// Environment variables forwarded verbatim into the sandbox.
@@ -204,6 +302,10 @@ pub async fn run_exec(
     inherit_stdio: bool,
 ) -> Result<ExecResult> {
     let exec_id = new_exec_id();
+    // Classify + record the command line BEFORE the argv is moved into the spec,
+    // for capture-completeness telemetry (`session stats`).
+    let network_facing = is_network_facing(&argv);
+    let cmd_line = argv.join(" ");
     let mut spec = build_spec(paths, session, argv, timeout, inherit_stdio);
     // The proxy stamps flows from this run with these, via the wire header.
     spec.exec_id = exec_id.clone();
@@ -223,12 +325,71 @@ pub async fn run_exec(
         .await
         .unwrap_or_default();
 
+    // Capture-completeness telemetry: a clearly network-facing command that
+    // produced ZERO new flows almost certainly had its traffic escape capture
+    // (e.g. the agent's hook silently no-op'd, so the command never actually ran
+    // through `burpwn exec`). Warn — conservatively, only for network tools — so
+    // this failure mode is no longer silent. Record every exec regardless so
+    // `session stats` can surface the exec-vs-capture ratio.
+    let capture_warning = if network_facing && captured_request_ids.is_empty() {
+        let msg = format!(
+            "network-facing command captured ZERO flows; traffic likely escaped \
+             capture (is the agent hook rewriting through `burpwn exec`? run \
+             `burpwn init --check`): {cmd_line}"
+        );
+        tracing::warn!(exec_id = %exec_id, cmd = %cmd_line, "{msg}");
+        Some(msg)
+    } else {
+        None
+    };
+    record_exec_telemetry(
+        paths,
+        session,
+        &exec_id,
+        &cmd_line,
+        network_facing,
+        captured_request_ids.len() as i64,
+    )
+    .await;
+
     Ok(ExecResult {
         exec_id,
         exit_code: outcome.exit_code,
         captured_request_ids,
         outcome,
+        capture_warning,
     })
+}
+
+/// Record one capture-completeness telemetry row (best-effort; a telemetry write
+/// failure must never fail the exec). Opens the session store the same way
+/// [`flows_for_exec`] does.
+async fn record_exec_telemetry(
+    paths: &Paths,
+    session: &str,
+    exec_id: &str,
+    cmd: &str,
+    network_facing: bool,
+    flow_count: i64,
+) {
+    use burpwn_store::model::NewExecRecord;
+    let db = paths.session_db(session);
+    if !db.exists() {
+        return;
+    }
+    let Ok(store) = Store::open(&db) else {
+        return;
+    };
+    let _ = store
+        .writer()
+        .insert_exec(NewExecRecord {
+            exec_id: exec_id.to_string(),
+            cmd: cmd.to_string(),
+            network_facing,
+            flow_count,
+            created_at: now_millis(),
+        })
+        .await;
 }
 
 /// The flow ids stamped with `exec_id` (the proxy attributes at capture time).
@@ -243,13 +404,18 @@ async fn flows_for_exec(paths: &Paths, session: &str, exec_id: &str) -> Result<V
     Ok(ids)
 }
 
-/// Render an [`ExecResult`] to the JSON envelope value.
+/// Render an [`ExecResult`] to the JSON envelope value. A capture-completeness
+/// `warning` is included only when set (network-facing command, zero captures).
 pub fn exec_envelope(result: &ExecResult) -> Envelope {
-    Envelope::ok(json!({
+    let mut data = json!({
         "exit_code": result.exit_code,
         "exec_id": result.exec_id,
         "captured_request_ids": result.captured_request_ids,
-    }))
+    });
+    if let Some(w) = &result.capture_warning {
+        data["warning"] = json!(w);
+    }
+    Envelope::ok(data)
 }
 
 /// Write the JSON envelope to fd 3 if it is open, else to stderr. NEVER stdout:
@@ -286,6 +452,48 @@ mod tests {
     use super::*;
     use burpwn_sandbox::MockRuntime;
     use burpwn_store::model::{FlowStart, Protocol};
+
+    /// The zero-flow heuristic classifier: network tools (curl/wget/…) flag as
+    /// network-facing (→ warn on zero captures); benign commands (ls/git/…) do
+    /// not (→ never a false alarm), including inside a wrapped `sh -c` script.
+    #[test]
+    fn network_facing_classifier_is_conservative() {
+        // Bare network tools.
+        assert!(is_network_facing(&["curl".into(), "https://x".into()]));
+        assert!(is_network_facing(&["wget".into(), "https://x".into()]));
+        // Wrapped `sh -c` compound — the actual exec shape hooks produce.
+        assert!(is_network_facing(&[
+            "sh".into(),
+            "-c".into(),
+            "curl https://a && echo done".into(),
+        ]));
+        assert!(is_network_facing(&[
+            "sh".into(),
+            "-c".into(),
+            "nmap -sV target".into(),
+        ]));
+        // Path-qualified tool and a `sudo` wrapper prefix.
+        assert!(is_network_facing(&["/usr/bin/curl".into(), "x".into()]));
+        assert!(is_network_facing(&[
+            "sh".into(),
+            "-c".into(),
+            "sudo wget https://x".into(),
+        ]));
+
+        // Benign commands must NOT flag (no false alarm on ls / git / cat).
+        assert!(!is_network_facing(&["ls".into(), "-la".into()]));
+        assert!(!is_network_facing(&["git".into(), "status".into()]));
+        assert!(!is_network_facing(&["echo".into(), "hello world".into()]));
+        assert!(!is_network_facing(&["python3".into(), "script.py".into()]));
+        // A network tool as an ARGUMENT (not program position) must NOT flag —
+        // this is the conservative property that avoids false alarms.
+        assert!(!is_network_facing(&[
+            "sh".into(),
+            "-c".into(),
+            "cat notes.txt | grep curl".into(),
+        ]));
+        assert!(!is_network_facing(&["grep".into(), "curl".into(), "f".into()]));
+    }
 
     #[test]
     fn exec_ids_are_unique() {

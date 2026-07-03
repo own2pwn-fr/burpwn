@@ -53,9 +53,9 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     * ``workspace new`` → data {id, name}; ``workspace list`` → BARE ARRAY.
     * ``match-replace add`` → data {id}; ``match-replace list`` → BARE ARRAY of
       {id,scope,match_kind,pattern,replacement,on_request,enabled}.
-    * ``match-replace rm|enable|disable`` are STILL not supported at runtime —
-      the subcommands parse but error: "match-replace rm/enable/disable are not
-      yet supported: the store writer exposes only add + list for rules".
+    * ``match-replace rm|enable|disable`` are now IMPLEMENTED at runtime (0.2.0):
+      ``rm`` → {removed:<id>}; ``enable`` → {id,enabled:true}; ``disable`` →
+      {id,enabled:false}.
     * ``session new`` → {name}; ``session use`` → {active}; ``session rm`` →
       {removed}; ``session list`` → {active, sessions:[...]}.
     * ``intercept enable/disable`` → {type:"Ack"}; ``intercept list`` →
@@ -68,6 +68,30 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       (use `export har`)"}.
     * ``req show 999`` (missing) → plain text "burpwn: no such flow: 999".
     * tag/note on a non-existent flow → sqlite FOREIGN KEY error.
+    * ``fuzz run`` (Intruder) → data {attack_id, name, base_flow_id, mode,
+      positions, payloads, status:"done"|"cancelled", baseline{status,resp_len,
+      latency_ms}|null, results:[{index,payloads,status,resp_len,latency_ms,
+      anomaly,error}] ranked by anomaly desc}. ``fuzz list`` → data {attacks:
+      [{id,name,workspace,base_flow_id,status,results:<count>,created_ts}],count}.
+      ``fuzz show <id>`` → data {attack, results:[per-payload rows, sorted by
+      --sort anomaly|status|len], count}.
+    * ``compare A B`` → data {flow_a, flow_b, status:{a,b,changed},
+      headers:{added,removed,changed} (unless --what body),
+      body:{identical,len_a,len_b,only_in_a,only_in_b,reflected:[tokens from A's
+      request echoed in B's response]} (unless --what headers)}.
+    * ``encode <scheme> <v>`` → data {scheme, encoded}. ``decode`` → data
+      {scheme, decoded, bytes?}; ``decode jwt`` → data {scheme:"jwt", alg,
+      header, claims, signature, verified:false} (signature NOT verified).
+    * ``session stats`` → data {session, total_execs, total_flows, network_execs,
+      network_zero_flow_execs, escaped_execs:[{exec_id,cmd}]}.
+    * ``session auth set`` → data {id, host}. ``session auth status`` → data
+      {profiles:[{id,host,login_cmd,header_template,token_set,token(masked|null),
+      rule_id}]}. ``session auth refresh`` → data {refreshed:[{host,rule_id,
+      token(masked)}]} (runs the login cmd through the sandbox, re-installs the
+      injection rule).
+    * ``intercept scope <pat> [--path P] [--method M] | --clear`` → {type:"Ack"}.
+    * ``init --check`` → data {checks:[{agent,verdict:"pass"|"fail"|"advisory",
+      detail,rewritten}], ok:<bool>}; exit code 1 if any agent fails to rewrite.
 
   MCP tool results (the handlers wrap differently — NO {ok,data,error}, NO
   "type" tag):
@@ -80,15 +104,34 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       workspace_new → {workspace_id}.
     * intercept_enable/disable → {ok:true}; intercept_list → {intercepts:[...]};
       await_intercept → {pending:true, intercept:{id,kind,host,method,path}} or
-      {pending:false}; intercept_forward/drop → {found:bool}.
+      {pending:false}; intercept_forward/drop → {found:bool}; intercept_scope →
+      {ok:true} (an Ack).
     * exec → {exit_code, captured_request_ids, exec_id}.
+    * req_replay → {status, response:"<raw HTTP string>"} (MCP adds a numeric
+      `status`; the CLI envelope's data is just {response:"..."}).
+    * fuzz → same object as CLI ``fuzz run`` data; fuzz_list → {attacks,count};
+      fuzz_results → {attack,results,count}.
+    * compare → same object as CLI ``compare`` data (flow_a/flow_b/status/
+      headers/body+reflected).
+    * encode → {scheme,encoded}; decode → {scheme,decoded,bytes?} or the jwt
+      object {alg,header,claims,signature,verified:false}.
+    * session_stats → {session,total_execs,total_flows,network_execs,
+      network_zero_flow_execs,escaped_execs:[{exec_id,cmd}]}.
+    * session_auth_set → {id,host}; session_auth_status → {profiles:[...masked]};
+      session_auth_refresh → {refreshed:[{host,rule_id,token}]}.
     * any intercept tool with no daemon → error string starting "no burpwn proxy
       daemon answering ...".
   MCP arg names: req_search.query, req_show.{id,raw}, tag_add.{flow_id,name,color?},
     note_add.{flow_id,body}, workspace_new.name, match_replace_add.{scope,kind,
     pattern,replacement,on_request}, await_intercept.timeout_secs,
-    intercept_forward.{id,set_headers:[{name,value}],set_body?}, intercept_drop.id,
-    exec.{argv:[...],workspace?(name string),timeout_secs?}.
+    intercept_forward.{id,set_headers:[{name,value}],set_body?,method?,path?}
+    (method/path now reach CLI parity), intercept_scope.{host?,path?,method?,clear?},
+    intercept_drop.id, exec.{argv:[...],workspace?(name string),timeout_secs?},
+    req_replay.{id,set_headers:[{name,value}],set_body?,method?},
+    fuzz.{flow,positions:[":"],payloads:[...],mode,concurrency?,delay_ms?,marker?,
+    name?}, fuzz_list.{workspace?}, fuzz_results.{attack_id,sort?,limit?},
+    compare.{flow_a,flow_b,what?}, encode/decode.{scheme,value},
+    session_auth_set.{login,extract,header,host?}, session_auth_refresh.{host?}.
 """
 
 from __future__ import annotations
@@ -150,13 +193,21 @@ SYSTEM_SHELL = (
 # name Claude Code exposes and that burpwn's PreToolUse hook matches).
 SHELL_TOOL_NAME = "Bash"
 
-# The 19 MCP tools exposed by `burpwn mcp` (verified against server.rs).
+# The 31 MCP tools exposed by `burpwn mcp` (verified against server.rs; 0.2.0
+# added the offensive surface: req_replay, fuzz/fuzz_list/fuzz_results, compare,
+# encode/decode, intercept_scope, session_stats and the session_auth_* trio).
+# Kept in exact sync with the real surface by `training/eval/surface.py --check`.
 MCP_TOOL_NAMES = {
     "session_list",
     "session_current",
+    "session_stats",
+    "session_auth_set",
+    "session_auth_refresh",
+    "session_auth_status",
     "req_list",
     "req_show",
     "req_search",
+    "req_replay",
     "workspace_list",
     "workspace_new",
     "tag_list",
@@ -169,23 +220,39 @@ MCP_TOOL_NAMES = {
     "intercept_list",
     "await_intercept",
     "intercept_forward",
+    "intercept_scope",
     "intercept_drop",
     "exec",
+    "fuzz",
+    "fuzz_list",
+    "fuzz_results",
+    "compare",
+    "encode",
+    "decode",
 }
 
-# Known CLI tokens (subcommands + flags) for the lenient command linter.
+# Known CLI tokens (subcommands + flags) for the lenient command linter. Kept in
+# exact sync with the real binary's `--help` tree by `surface.py --check` (which
+# also picks up `-s`/`-d` seen in an option's example text — harmless extras).
 KNOWN_CLI_SUBCOMMANDS = {
+    # top-level
     "doctor", "init", "ca", "session", "exec", "req", "intercept",
-    "match-replace", "workspace", "tag", "note", "export",
-    "init", "list", "show", "search", "replay", "new", "use", "rm",
-    "enable", "disable", "await", "forward", "drop", "add", "har", "pcap",
-    "export",
+    "match-replace", "workspace", "tag", "note", "export", "fuzz",
+    "compare", "encode", "decode",
+    # actions
+    "list", "show", "search", "replay", "new", "use", "rm", "run",
+    "enable", "disable", "await", "forward", "drop", "scope", "add",
+    "har", "pcap", "auth", "set", "refresh", "status", "stats",
 }
 KNOWN_CLI_FLAGS = {
     "--json", "-g", "--global", "--agent", "--name", "--workspace",
     "--timeout", "--session", "--host", "--status", "--method", "--protocol",
     "--port", "--limit", "--offset", "--raw", "--set-header", "--set-body",
     "--on", "-o", "--output", "-h", "--help", "-V", "--version",
+    # 0.2.0 additions
+    "--check", "--clear", "--concurrency", "--delay", "--extract", "--flow",
+    "--header", "--login", "--marker", "--mode", "--path", "--payload",
+    "--payloads", "--position", "--request", "--sort", "--what",
 }
 
 # Tools the engine commonly drives via `exec` (the sandboxed pentest tooling).
@@ -1309,6 +1376,75 @@ def fam_match_replace() -> list[dict[str, Any]]:
             ],
         )
     )
+    # rm / enable / disable — IMPLEMENTED at runtime as of 0.2.0.
+    out.append(
+        cli_example(
+            tags=["match-replace", "disable", "enable"],
+            turns=[
+                (
+                    "user",
+                    "Temporarily turn off rule 1 without deleting it, then switch it back on.",
+                ),
+                (
+                    "assistant",
+                    "Toggle the `enabled` flag in place — no need to re-add:\n\n```\n"
+                    "burpwn --json match-replace disable 1\nburpwn --json match-replace "
+                    "enable 1\n```\n\n`disable` returns "
+                    '`{"ok":true,"data":{"enabled":false,"id":1},"error":null}` and `enable` '
+                    'the mirror `{"ok":true,"data":{"enabled":true,"id":1},"error":null}`. A '
+                    "disabled rule stays in `match-replace list` (with `enabled:false`) but "
+                    "stops rewriting traffic until you re-enable it.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["match-replace", "rm"],
+            turns=[
+                ("user", "Delete match/replace rule 1 for good."),
+                (
+                    "assistant",
+                    "```\nburpwn --json match-replace rm 1\n```\n\nReturns "
+                    '`{"ok":true,"data":{"removed":1},"error":null}`; the rule is gone from '
+                    "`match-replace list`. (`rm`, `enable` and `disable` all operate on the "
+                    "live rule store as of 0.2.0 — no daemon restart needed.)",
+                ),
+            ],
+        )
+    )
+    # Multi-turn rule lifecycle (guarantees add/disable/rm survive the split).
+    out.append(
+        cli_example(
+            tags=["match-replace", "add", "disable", "rm", "multi-turn", "lifecycle"],
+            turns=[
+                ("user", "Add a rule that strips the CSP header from every response."),
+                (
+                    "assistant",
+                    "Rewrite the `Content-Security-Policy` header to empty on responses:\n\n"
+                    "```\nburpwn --json match-replace add \"\" header Content-Security-Policy "
+                    '"" --on response\n```\n\nReturns '
+                    "`" + _ok({"id": 1}) + "`. Every captured response now has its CSP "
+                    "blanked (handy while testing injected markup).",
+                ),
+                ("user", "It's interfering with one test — turn it off but keep it around."),
+                (
+                    "assistant",
+                    "```\nburpwn --json match-replace disable 1\n```\n\n`" +
+                    _ok({"enabled": False, "id": 1}) + "`. The rule stays in "
+                    "`match-replace list` as `enabled:false` and stops firing; "
+                    "`match-replace enable 1` switches it back on.",
+                ),
+                ("user", "Actually just remove it entirely."),
+                (
+                    "assistant",
+                    "```\nburpwn --json match-replace rm 1\n```\n\n`" +
+                    _ok({"removed": 1}) + "`. Rule 1 is deleted from the store — gone from "
+                    "`match-replace list` and no longer applied.",
+                ),
+            ],
+        )
+    )
     return out
 
 
@@ -1418,25 +1554,6 @@ def fam_negatives() -> list[dict[str, Any]]:
                     '(use `export har`)"}\n```\n\nUse HAR: `burpwn export har -o session.har`. '
                     "Most HTTP tooling imports HAR, and it keeps the decrypted bodies a pcap "
                     "of MITM'd TLS would not.",
-                ),
-            ],
-        )
-    )
-    out.append(
-        cli_example(
-            tags=["negative", "match-replace", "rm"],
-            turns=[
-                ("user", "Remove match/replace rule 1."),
-                (
-                    "assistant",
-                    "Heads up: although `match-replace rm`, `enable` and `disable` exist as "
-                    "subcommands, they are **not yet supported at runtime** — the store "
-                    "writer exposes only add + list. Running it errors:\n\n```\nburpwn: "
-                    "match-replace rm/enable/disable are not yet supported: the store writer "
-                    "exposes only add + list for rules\n```\n\nWorkaround: rules apply only "
-                    "while the session's proxy daemon is running, so to clear a rule today "
-                    "you stop/restart the session's daemon (or start a fresh session) and "
-                    "re-add the rules you still want with `match-replace add`.",
                 ),
             ],
         )
@@ -1583,9 +1700,11 @@ def fam_meta() -> list[dict[str, Any]]:
                     "Both expose the same engine. Use the **CLI** (`burpwn <cmd> --json`) for "
                     "ad-hoc shell work, scripting and piping. Use the **MCP server** "
                     "(`burpwn mcp`, stdio) when an LLM agent should call burpwn as tools — it "
-                    "exposes 19 tools (`req_list`, `req_show`, `req_search`, `exec`, "
-                    "`intercept_*`, `match_replace_*`, `tag_add`, `note_add`, "
-                    "`workspace_*`, `session_*`) with typed JSON arguments. One gotcha: the "
+                    "exposes 31 tools (`req_list`, `req_show`, `req_search`, `req_replay`, "
+                    "`exec`, `fuzz`/`fuzz_list`/`fuzz_results`, `compare`, `encode`/`decode`, "
+                    "`intercept_*` incl. `intercept_scope`, `match_replace_*`, `tag_add`, "
+                    "`note_add`, `workspace_*`, `session_*` incl. `session_stats` and the "
+                    "`session_auth_*` trio) with typed JSON arguments. One gotcha: the "
                     "MCP tool *results* are NOT wrapped in `{ok,data,error}` and use "
                     "different keys (e.g. `req_list` returns `{flows,count}`, intercept tools "
                     "return `{ok:true}`/`{pending:...}`/`{found:...}`), so don't expect the "
@@ -3703,6 +3822,1041 @@ def fam_mcp_conversations() -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# 0.2.0 offensive surface: fuzz (Intruder), compare, encode/decode, session
+# auth, intercept scope, init --check / session stats — taught across the three
+# styles (cli / mcp / shell), grounded in the real output shapes.
+# --------------------------------------------------------------------------- #
+
+
+def _fuzz_run_data(
+    attack_id: int, name: str, flow_id: int, mode: str,
+    positions: list[list[int]], payloads: list[str],
+    results: list[dict[str, Any]],
+    baseline: dict[str, Any] | None = None,
+    status: str = "done",
+) -> dict[str, Any]:
+    """A `fuzz run --json` `data` object (also the shape of the MCP `fuzz` tool)."""
+    return {
+        "attack_id": attack_id, "name": name, "base_flow_id": flow_id,
+        "mode": mode, "positions": positions, "payloads": payloads,
+        "status": status,
+        "baseline": baseline,
+        "results": results,
+    }
+
+
+def _fuzz_res(index: int, payload: str, status: int, resp_len: int,
+              latency_ms: int, anomaly: float) -> dict[str, Any]:
+    """One `fuzz run` result row (ranked by anomaly)."""
+    return {"index": index, "payloads": [payload], "status": status,
+            "resp_len": resp_len, "latency_ms": latency_ms,
+            "anomaly": anomaly, "error": None}
+
+
+def fam_fuzz() -> list[dict[str, Any]]:
+    """Intruder: `fuzz run` against a stored flow, then triage results by anomaly.
+    Also `fuzz list` / `fuzz show`."""
+    out: list[dict[str, Any]] = []
+
+    # 1) Sniper over a path id → BOLA/IDOR enumeration.
+    t = _t("restapi")
+    fid = _idbase(t) + 1
+    res = [
+        _fuzz_res(2, "1002", 200, 512, 44, 0.91),
+        _fuzz_res(5, "1005", 200, 508, 41, 0.88),
+        _fuzz_res(0, "1000", 403, 61, 22, 0.20),
+        _fuzz_res(1, "1001", 200, 118, 19, 0.00),
+    ]
+    data = _fuzz_run_data(
+        7, "bola-users", fid, "sniper", [[24, 28]],
+        ["1000", "1001", "1002", "1005"], res,
+        baseline={"status": 200, "resp_len": 118, "latency_ms": 19},
+    )
+    out.append(
+        cli_example(
+            tags=["fuzz", "intruder", "bola", "idor", "sniper", t.key],
+            turns=[
+                (
+                    "user",
+                    f"Flow {fid} is `GET /v1/users/1001/profile` with my token. Enumerate "
+                    "neighbouring user ids to test for BOLA.",
+                ),
+                (
+                    "assistant",
+                    "Mark the id in the path as the injection position and sniper a small id "
+                    "set:\n\n```\nburpwn --json fuzz run --flow "
+                    f"{fid} --position 24:28 --payload 1000 --payload 1001 --payload 1002 "
+                    "--payload 1005 --name bola-users\n```\n\nThe response ranks payloads by "
+                    "anomaly (deviation from the baseline):\n\n```json\n" + _ok(data) + "\n```"
+                    "\n\nPayloads `1002` and `1005` return `200` with a full-size body "
+                    "(anomaly ≈ 0.9) — other users' profiles served to my token = **BOLA**. "
+                    "`1000` is `403` (not mine, correctly denied); `1001` is my own baseline. "
+                    "`req replay` or `req show` the winning ids to build the PoC.",
+                ),
+            ],
+        )
+    )
+
+    # 2) cluster-bomb / battering-ram over a login body with a wordlist file.
+    t2 = _t("dvwa")
+    fid2 = _idbase(t2) + 2
+    res2 = [
+        _fuzz_res(7, "admin", 302, 0, 55, 0.72),
+        _fuzz_res(3, "root", 200, 1440, 48, 0.10),
+        _fuzz_res(0, "test", 200, 1455, 44, 0.00),
+    ]
+    data2 = _fuzz_run_data(
+        11, "login-user-fuzz", fid2, "battering-ram", [[18, 22]],
+        ["test", "root", "admin"], res2,
+        baseline={"status": 200, "resp_len": 1455, "latency_ms": 44},
+    )
+    out.append(
+        cli_example(
+            tags=["fuzz", "intruder", "auth", "battering-ram", "payloads-file", t2.key],
+            turns=[
+                (
+                    "user",
+                    f"Flow {fid2} is a login POST. Fuzz the username field from users.txt to "
+                    "find a valid account (a redirect vs the login page).",
+                ),
+                (
+                    "assistant",
+                    "Load the wordlist with `--payloads` (one per line) and mark the field; "
+                    "battering-ram puts the same payload in the single position:\n\n```\n"
+                    f"burpwn --json fuzz run --flow {fid2} --mode battering-ram "
+                    "--position 18:22 --payloads users.txt --name login-user-fuzz\n```\n\n"
+                    "```json\n" + _ok(data2) + "\n```\n\n`admin` stands out — `302` with a "
+                    "zero-length body (a redirect after a successful auth) versus the `200` "
+                    "login page everyone else gets (anomaly 0.72). That username is valid; "
+                    "pivot to a password attack or check the redirect target. Use "
+                    "`--mode cluster-bomb` with two `--position`/payload sets to fuzz user × "
+                    "pass together, `--concurrency` to parallelise and `--delay` to pace.",
+                ),
+            ],
+        )
+    )
+
+    # 3) fuzz list + fuzz show (multi-turn triage).
+    t3 = _t("spa")
+    aid = 4
+    list_data = {
+        "attacks": [
+            {"id": aid, "name": "idor-orders", "workspace": "default",
+             "base_flow_id": _idbase(t3) + 1, "status": "done", "results": 25,
+             "created_ts": 1781364000000},
+        ],
+        "count": 1,
+    }
+    show_data = {
+        "attack": {"id": aid, "name": "idor-orders", "status": "done",
+                   "base_flow_id": _idbase(t3) + 1, "mode": "sniper"},
+        "results": [
+            {"id": 61, "status_code": 200, "resp_len": 903, "latency_ms": 51,
+             "anomaly_score": 0.94, "payload": "8831"},
+            {"id": 62, "status_code": 200, "resp_len": 897, "latency_ms": 49,
+             "anomaly_score": 0.93, "payload": "8832"},
+        ],
+        "count": 2,
+    }
+    out.append(
+        cli_example(
+            tags=["fuzz", "list", "show", "triage", "multi-turn", t3.key],
+            turns=[
+                ("user", "What Intruder attacks have I run in this session?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json fuzz list\n```\n\n```json\n" + _ok(list_data) + "\n```"
+                    f"\n\nOne attack: id {aid} `idor-orders` (done, 25 results). Want the "
+                    "ranked results?",
+                ),
+                ("user", "Yes — show me the top 2 by anomaly."),
+                (
+                    "assistant",
+                    f"```\nburpwn --json fuzz show {aid} --sort anomaly --limit 2\n```\n\n"
+                    "```json\n" + _ok(show_data) + "\n```\n\nThe two highest-anomaly payloads "
+                    "(`8831`, `8832`) both return `200` with a full order body — those order "
+                    "ids belong to other accounts (IDOR). `--sort` also takes `status` or "
+                    "`len`; drop `--limit` for the whole table.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def _compare_data(fa: int, fb: int, sa: int, sb: int, *,
+                  only_a: list[str], only_b: list[str],
+                  reflected: list[str] | None = None,
+                  header_changes: list[dict[str, Any]] | None = None,
+                  what: str = "all") -> dict[str, Any]:
+    """A `compare --json` `data` object (also the MCP `compare` tool shape)."""
+    d: dict[str, Any] = {
+        "flow_a": fa, "flow_b": fb,
+        "status": {"a": sa, "b": sb, "changed": sa != sb},
+    }
+    if what in ("all", "headers"):
+        d["headers"] = {"added": [], "removed": [],
+                        "changed": header_changes or []}
+    if what in ("all", "body"):
+        d["body"] = {
+            "identical": not (only_a or only_b),
+            "len_a": 120 + len(",".join(only_a)),
+            "len_b": 120 + len(",".join(only_b)),
+            "only_in_a": only_a, "only_in_b": only_b,
+            "reflected": reflected or [],
+        }
+    return d
+
+
+def fam_compare() -> list[dict[str, Any]]:
+    """`compare` two flows: IDOR (same-shape body for another id), reflection
+    (XSS), and header-only diffs."""
+    out: list[dict[str, Any]] = []
+
+    # IDOR: my order vs another user's order — same 200, body differs only by id.
+    d1 = _compare_data(
+        30, 31, 200, 200,
+        only_a=['  "order_id": 5001,', '  "owner": "me@corp.com"'],
+        only_b=['  "order_id": 5002,', '  "owner": "victim@corp.com"'],
+        reflected=[],
+    )
+    out.append(
+        cli_example(
+            tags=["compare", "idor", "bola"],
+            turns=[
+                (
+                    "user",
+                    "I replayed my order (flow 30) and someone else's (flow 31). Did the "
+                    "second one actually leak their data?",
+                ),
+                (
+                    "assistant",
+                    "Diff the two flows:\n\n```\nburpwn --json compare 30 31\n```\n\n```json\n"
+                    + _ok(d1) + "\n```\n\nBoth are `200` (`status.changed:false`), and the "
+                    "body diff shows flow 31 returned `order_id 5002` owned by "
+                    "`victim@corp.com` — a different user's order served to your token. That "
+                    "confirms **IDOR/BOLA**. `only_in_a`/`only_in_b` are the differing body "
+                    "lines; identical structure + different owner is the signature.",
+                ),
+            ],
+        )
+    )
+
+    # Reflection → XSS candidate.
+    d2 = _compare_data(
+        40, 41, 200, 200,
+        only_a=[], only_b=['<div>Results for zzq7x9</div>'],
+        reflected=["zzq7x9"],
+    )
+    out.append(
+        cli_example(
+            tags=["compare", "xss", "reflection"],
+            turns=[
+                (
+                    "user",
+                    "Flow 40 is a baseline search; flow 41 is the same search with my marker "
+                    "`zzq7x9`. Is my input reflected?",
+                ),
+                (
+                    "assistant",
+                    "```\nburpwn --json compare 40 41\n```\n\n```json\n" + _ok(d2) + "\n```\n\n"
+                    "`body.reflected` lists tokens from flow 40's *request* that appear "
+                    "verbatim in flow 41's *response* — here `zzq7x9` is echoed unencoded "
+                    "into the HTML (`only_in_b` shows the `<div>`). That's a reflected-XSS "
+                    "candidate: replay with a `<script>`/`\"><img onerror>` payload via "
+                    "`burpwn req replay` and check whether it stays unescaped.",
+                ),
+            ],
+        )
+    )
+
+    # Header-only diff (--what headers).
+    d3 = _compare_data(
+        12, 18, 200, 200, only_a=[], only_b=[], what="headers",
+        header_changes=[{"name": "Set-Cookie", "a": "session=abc; HttpOnly",
+                         "b": "session=def"}],
+    )
+    out.append(
+        cli_example(
+            tags=["compare", "headers", "cookie"],
+            turns=[
+                (
+                    "user",
+                    "Compare just the response headers of flows 12 and 18 — I think one "
+                    "dropped the HttpOnly flag on the cookie.",
+                ),
+                (
+                    "assistant",
+                    "Scope the diff to headers:\n\n```\nburpwn --json compare 12 18 "
+                    "--what headers\n```\n\n```json\n" + _ok(d3) + "\n```\n\n`headers.changed` "
+                    "confirms it: flow 18's `Set-Cookie` lost `HttpOnly` (and `Secure`), so "
+                    "that session cookie is now script-readable — an XSS would be able to "
+                    "exfiltrate it. `--what` also takes `body` or `all` (the default).",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_encode_decode() -> list[dict[str, Any]]:
+    """`encode` / `decode` — token & parameter manipulation, including `decode
+    jwt`. Grounded in the real (verified) byte transforms."""
+    out: list[dict[str, Any]] = []
+
+    out.append(
+        cli_example(
+            tags=["encode", "decode", "base64"],
+            turns=[
+                ("user", "base64-encode `foobar`, and decode `Zm9vYmFy` back."),
+                (
+                    "assistant",
+                    "```\nburpwn --json encode base64 foobar\nburpwn --json decode base64 "
+                    "Zm9vYmFy\n```\n\nEncode → "
+                    + _ok({"encoded": "Zm9vYmFy", "scheme": "base64"})
+                    + "; decode → "
+                    + _ok({"bytes": 6, "decoded": "foobar", "scheme": "base64"})
+                    + ". `decode base64` also accepts the URL-safe alphabet and missing "
+                    "padding, so it round-trips `base64url` output too.",
+                ),
+            ],
+        )
+    )
+    out.append(
+        cli_example(
+            tags=["encode", "url", "hex"],
+            turns=[
+                (
+                    "user",
+                    "url-encode `a b&c=d` for a query param, and hex-encode `AB`.",
+                ),
+                (
+                    "assistant",
+                    "```\nburpwn --json encode url \"a b&c=d\"\nburpwn --json encode hex AB\n"
+                    "```\n\nURL → "
+                    + _ok({"encoded": "a%20b%26c%3Dd", "scheme": "url"})
+                    + "; hex → "
+                    + _ok({"encoded": "4142", "scheme": "hex"})
+                    + ". `encode` schemes are `base64|base64url|url|hex`; percent-encoding "
+                    "escapes everything outside the RFC-3986 unreserved set. Reverse either "
+                    "with `burpwn decode <scheme> <value>`.",
+                ),
+            ],
+        )
+    )
+    jwt = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+           "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6ImJ1cnB3biIsImFkbWluIjp0cnVlfQ."
+           "c2lnbmF0dXJl")
+    jwt_data = {
+        "alg": "HS256", "scheme": "jwt", "verified": False,
+        "header": {"alg": "HS256", "typ": "JWT"},
+        "claims": {"admin": True, "name": "burpwn", "sub": "1234567890"},
+        "signature": "c2lnbmF0dXJl",
+    }
+    out.append(
+        cli_example(
+            tags=["decode", "jwt", "token"],
+            turns=[
+                (
+                    "user",
+                    "Decode this JWT so I can read its claims: "
+                    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6ImJ1cnB3biIsImFkbWluIjp0cnVlfQ."
+                    "c2lnbmF0dXJl",
+                ),
+                (
+                    "assistant",
+                    f"```\nburpwn --json decode jwt {jwt}\n```\n\n```json\n" + _ok(jwt_data)
+                    + "\n```\n\n`alg` is `HS256` and the claims include `admin:true` for "
+                    "`sub 1234567890`. **`verified:false` — the signature is NOT checked**, "
+                    "this is a decoder only. To test verification, tamper a claim, re-encode, "
+                    "and `req replay` the request with the forged token (e.g. flip `admin` "
+                    "or try an `alg:none` header) and watch whether the server still trusts "
+                    "it.",
+                ),
+            ],
+        )
+    )
+    # Multi-turn token workshop (guarantees encode + decode survive the split).
+    out.append(
+        cli_example(
+            tags=["encode", "decode", "jwt", "multi-turn", "token"],
+            turns=[
+                (
+                    "user",
+                    "First, base64url-encode `{\"role\":\"admin\"}` — I want to forge a JWT "
+                    "payload.",
+                ),
+                (
+                    "assistant",
+                    "```\nburpwn --json encode base64url '{\"role\":\"admin\"}'\n```\n\n"
+                    + _ok({"encoded": "eyJyb2xlIjoiYWRtaW4ifQ", "scheme": "base64url"})
+                    + ". `base64url` uses the URL-safe alphabet with no `=` padding — exactly "
+                    "what a JWT segment needs. Splice this in as the payload segment.",
+                ),
+                (
+                    "user",
+                    "Now decode the current token so I can copy its header: "
+                    "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.sig",
+                ),
+                (
+                    "assistant",
+                    "```\nburpwn --json decode jwt "
+                    "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.sig\n```\n\n"
+                    + _ok({"scheme": "jwt", "alg": "HS256", "verified": False,
+                           "header": {"alg": "HS256"}, "claims": {"role": "user"},
+                           "signature": "sig"})
+                    + ". Reuse the `alg:HS256` header, swap in your `role:admin` payload from "
+                    "the previous step, and `req replay` the request with the forged token. "
+                    "`verified:false` is the reminder that burpwn never checks the signature — "
+                    "the *server's* response tells you whether verification is broken.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_session_auth() -> list[dict[str, Any]]:
+    """`session auth` — persist a login macro + token-injection rule and refresh
+    when the target starts returning 401s. Multi-turn where it fits."""
+    out: list[dict[str, Any]] = []
+    t = _t("auth")
+    login = ("curl -s https://auth.fintrack.dev/login -d user=analyst "
+             "-d pass=s3cr3t")
+    out.append(
+        cli_example(
+            tags=["session", "auth", "login-macro", "multi-turn", t.key],
+            turns=[
+                (
+                    "user",
+                    "My session tokens on fintrack.dev expire mid-scan and everything starts "
+                    "401ing. Automate re-auth.",
+                ),
+                (
+                    "assistant",
+                    "Persist a session-auth profile: the login command, a regex (one capture "
+                    "group) that pulls the token from its output, and the header template to "
+                    "inject:\n\n```\nburpwn --json session auth set "
+                    f"--login '{login}' "
+                    "--extract '\"token\":\"([^\"]+)\"' "
+                    "--header 'Authorization: Bearer {}' --host fintrack.dev\n```\n\nReturns "
+                    + _ok({"host": "fintrack.dev", "id": 1})
+                    + ". The profile is stored but no token is minted yet — run "
+                    "`session auth refresh` to fetch one.",
+                ),
+                ("user", "Right, mint the token now and wire up the injection."),
+                (
+                    "assistant",
+                    "```\nburpwn --json session auth refresh --host fintrack.dev\n```\n\n"
+                    "Runs the login command **through the sandbox**, extracts the token with "
+                    "your regex, and installs/updates a match-replace rule that injects "
+                    "`Authorization: Bearer <token>` into in-scope requests:\n\n```json\n"
+                    + _ok({"refreshed": [{"host": "fintrack.dev", "rule_id": 3,
+                                          "token": "eyJ0…q8Zg"}]})
+                    + "\n```\n\nThe token is masked in output. Re-run `session auth refresh` "
+                    "whenever 401s reappear — it's idempotent and updates the same rule.",
+                ),
+                ("user", "How do I check what's stored and whether a token is live?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json session auth status\n```\n\n```json\n"
+                    + _ok({"profiles": [{
+                        "id": 1, "host": "fintrack.dev", "login_cmd": login,
+                        "header_template": "Authorization: Bearer {}",
+                        "token_set": True, "token": "eyJ0…q8Zg", "rule_id": 3,
+                    }]})
+                    + "\n```\n\n`token_set:true` with a masked `token` means injection is "
+                    "live via `rule_id 3`; `token_set:false` means you still need a "
+                    "`refresh`. The raw token value is never printed.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_intercept_scope() -> list[dict[str, Any]]:
+    """`intercept scope` — narrow blocking interception so not every flow parks."""
+    out: list[dict[str, Any]] = []
+    ack = _ok({"type": "Ack"})
+    out.append(
+        cli_example(
+            tags=["intercept", "scope", "workflow"],
+            turns=[
+                (
+                    "user",
+                    "When I enable interception every single request parks and it's "
+                    "unusable. I only care about POSTs to /cart/checkout on shop.northwind."
+                    "example.",
+                ),
+                (
+                    "assistant",
+                    "Narrow the intercept scope so only matching flows block; everything "
+                    "else passes straight through (still captured):\n\n```\n"
+                    "burpwn intercept scope shop.northwind.example --path /cart/checkout "
+                    "--method POST\nburpwn intercept enable\n```\n\n`scope` returns "
+                    f"`{ack}`. Host/path are case-insensitive substrings and `--method` is "
+                    "exact; now only `POST …/cart/checkout` parks on `intercept await`.",
+                ),
+                ("user", "Done testing — go back to intercepting everything."),
+                (
+                    "assistant",
+                    "Clear the scope:\n\n```\nburpwn intercept scope --clear\n```\n\nReturns "
+                    f"`{ack}` and widens interception back to every flow. (Use "
+                    "`intercept disable` if you instead want to stop parking altogether.)",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_init_check_stats() -> list[dict[str, Any]]:
+    """`init --check` and `session stats` — verify the agent hook actually routes
+    traffic through `burpwn exec` (capture completeness)."""
+    out: list[dict[str, Any]] = []
+    check_data = {
+        "checks": [
+            {"agent": "claude", "verdict": "pass",
+             "detail": "network command rewritten through `burpwn exec`",
+             "rewritten": True},
+            {"agent": "cursor", "verdict": "advisory",
+             "detail": "hook installed but agent not detected on this host",
+             "rewritten": True},
+        ],
+        "ok": True,
+    }
+    out.append(
+        cli_example(
+            tags=["init", "check", "hook", "verify"],
+            turns=[
+                (
+                    "user",
+                    "How do I confirm my agent's commands are really being routed through "
+                    "burpwn and not escaping capture?",
+                ),
+                (
+                    "assistant",
+                    "Run the hook self-test — it drives a synthetic network command through "
+                    "each agent's rewrite path and asserts it becomes a `burpwn exec` "
+                    "invocation:\n\n```\nburpwn --json init --check\n```\n\n```json\n"
+                    + _ok(check_data) + "\n```\n\n`PASS`/`rewritten:true` means that agent's "
+                    "traffic is captured; a `FAIL` (and non-zero exit) means it would bypass "
+                    "the proxy — re-run `burpwn init --agent <name>` to reinstall. Restrict "
+                    "the check to one agent with `--agent claude`.",
+                ),
+            ],
+        )
+    )
+    stats_data = {
+        "session": "acme", "total_execs": 14, "total_flows": 213,
+        "network_execs": 12, "network_zero_flow_execs": 1,
+        "escaped_execs": [{"exec_id": "exec-91-2-1781400700000000000",
+                           "cmd": "wget https://cdn.acme.com/app.js"}],
+    }
+    out.append(
+        cli_example(
+            tags=["session", "stats", "capture", "escaped"],
+            turns=[
+                ("user", "Did all my tooling's traffic actually get captured this session?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json session stats\n```\n\n```json\n" + _ok(stats_data)
+                    + "\n```\n\n213 flows from 14 execs, but `network_zero_flow_execs:1` — "
+                    "one network-facing command captured **zero** flows and is listed under "
+                    "`escaped_execs` (`wget https://cdn.acme.com/app.js`). Its traffic likely "
+                    "escaped the proxy (wget not routed, or a pinned/UDP path). Verify the "
+                    "hook with `burpwn init --check` and re-run that command under "
+                    "`burpwn exec`.",
+                ),
+            ],
+        )
+    )
+    # Multi-turn: stats flags an escape → verify the hook (guarantees both survive).
+    out.append(
+        cli_example(
+            tags=["session", "stats", "init", "check", "capture", "multi-turn"],
+            turns=[
+                ("user", "Before I trust these results — was my capture complete this run?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json session stats\n```\n\n```json\n" + _ok(stats_data)
+                    + "\n```\n\nMostly yes — 213 flows — but `network_zero_flow_execs:1`: "
+                    "`wget https://cdn.acme.com/app.js` captured nothing (`escaped_execs`). "
+                    "That command's traffic bypassed the proxy. Want me to check whether the "
+                    "agent hook is even rewriting commands?",
+                ),
+                ("user", "Yes, check the hook."),
+                (
+                    "assistant",
+                    "```\nburpwn --json init --check\n```\n\n```json\n" + _ok(check_data)
+                    + "\n```\n\nThe hook itself is fine (`claude` PASS, `rewritten:true`), so "
+                    "the escape wasn't a broken rewrite — that `wget` likely ran outside an "
+                    "agent turn (or hit a pinned/UDP path). Re-run it explicitly under "
+                    "`burpwn exec -- wget …` and it'll be captured. A `FAIL` here (non-zero "
+                    "exit) would instead mean the hook needs reinstalling with `burpwn init "
+                    "--agent <name>`.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_mcp_offensive() -> list[dict[str, Any]]:
+    """Single-turn MCP calls for the 0.2.0 offensive tools: req_replay, fuzz,
+    fuzz_list, fuzz_results, compare, encode, decode, intercept_scope,
+    session_stats, session_auth_*."""
+    out: list[dict[str, Any]] = []
+
+    # req_replay (MCP adds a numeric status alongside the raw response).
+    out.append(
+        mcp_example(
+            tags=["mcp", "req_replay", "repeater", "authz"],
+            user="Replay flow 22 over MCP but strip the Authorization header to test authz.",
+            steps=[{
+                "tool": "req_replay",
+                "args": {"id": 22, "set_headers": [{"name": "Authorization", "value": ""}]},
+                "result": {"status": 200,
+                           "response": "HTTP/1.1 200 OK\r\ncontent-type: application/json"
+                                       "\r\n\r\n{\"id\":1001,\"role\":\"user\"}"},
+                "final": "Still `200` with the profile body after removing the token — the "
+                         "endpoint is missing authentication (a `401`/`403` would be correct). "
+                         "`req_replay` mirrors the CLI `req replay`; it also takes `set_body` "
+                         "and `method`.",
+            }],
+        )
+    )
+
+    # fuzz (Intruder) single-shot.
+    fid = _idbase(_t("restapi")) + 1
+    fdata = _fuzz_run_data(
+        9, "bola", fid, "sniper", [[24, 28]], ["1002", "1003"],
+        [_fuzz_res(0, "1002", 200, 512, 40, 0.90),
+         _fuzz_res(1, "1003", 403, 61, 21, 0.15)],
+        baseline={"status": 200, "resp_len": 118, "latency_ms": 19},
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "fuzz", "intruder", "bola"],
+            user=f"Sniper-fuzz the id at bytes 24:28 of flow {fid} with payloads 1002 and 1003.",
+            steps=[{
+                "tool": "fuzz",
+                "args": {"flow": fid, "positions": ["24:28"], "payloads": ["1002", "1003"],
+                         "mode": "sniper", "name": "bola"},
+                "result": fdata,
+                "final": "Attack 9 stored. Payload `1002` → `200` full body (anomaly 0.90) = "
+                         "another user's record (BOLA); `1003` → `403` (denied). Results are "
+                         "ranked by anomaly; fetch more later with `fuzz_results`.",
+            }],
+        )
+    )
+    # fuzz_list + fuzz_results.
+    out.append(
+        mcp_example(
+            tags=["mcp", "fuzz_list"],
+            user="What Intruder attacks are stored in this session?",
+            steps=[{
+                "tool": "fuzz_list", "args": {},
+                "result": {"attacks": [{"id": 9, "name": "bola", "workspace": "default",
+                                        "base_flow_id": fid, "status": "done", "results": 2,
+                                        "created_ts": 1781364000000}], "count": 1},
+                "final": "One attack: id 9 `bola` (done, 2 results). Call `fuzz_results` with "
+                         "`attack_id:9` for the per-payload table.",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "fuzz_results", "sort"],
+            user="Give me attack 9's results sorted by anomaly, top 1.",
+            steps=[{
+                "tool": "fuzz_results", "args": {"attack_id": 9, "sort": "anomaly", "limit": 1},
+                "result": {"attack": {"id": 9, "name": "bola", "status": "done",
+                                      "base_flow_id": fid, "mode": "sniper"},
+                           "results": [{"id": 71, "status_code": 200, "resp_len": 512,
+                                        "latency_ms": 40, "anomaly_score": 0.90,
+                                        "payload": "1002"}],
+                           "count": 1},
+                "final": "Top result: payload `1002` → `200`, anomaly 0.90 — the BOLA hit. "
+                         "`sort` also accepts `status` or `len`.",
+            }],
+        )
+    )
+    # compare over MCP.
+    out.append(
+        mcp_example(
+            tags=["mcp", "compare", "idor"],
+            user="Compare flows 30 and 31 — did the second leak another user's order?",
+            steps=[{
+                "tool": "compare", "args": {"flow_a": 30, "flow_b": 31},
+                "result": _compare_data(
+                    30, 31, 200, 200,
+                    only_a=['"owner":"me@corp.com"'],
+                    only_b=['"owner":"victim@corp.com"'], reflected=[]),
+                "final": "Both `200`; the body diff shows flow 31 owned by "
+                         "`victim@corp.com` vs your `me@corp.com` — same structure, different "
+                         "owner = IDOR. `body.reflected` would flag echoed request tokens for "
+                         "XSS reasoning.",
+            }],
+        )
+    )
+    # encode / decode over MCP.
+    out.append(
+        mcp_example(
+            tags=["mcp", "encode", "decode", "base64"],
+            user="base64-encode `admin:admin` for a Basic auth header.",
+            steps=[{
+                "tool": "encode", "args": {"scheme": "base64", "value": "admin:admin"},
+                "result": {"scheme": "base64", "encoded": "YWRtaW46YWRtaW4="},
+                "final": "`YWRtaW46YWRtaW4=` → use as `Authorization: Basic YWRtaW46YWRtaW4=`. "
+                         "`decode` reverses it; schemes are base64|base64url|url|hex(|jwt for "
+                         "decode).",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "decode", "jwt"],
+            user="Decode the claims of eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.sig",
+            steps=[{
+                "tool": "decode",
+                "args": {"scheme": "jwt", "value": "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.sig"},
+                "result": {"scheme": "jwt", "alg": "HS256", "verified": False,
+                           "header": {"alg": "HS256"}, "claims": {"role": "user"},
+                           "signature": "sig"},
+                "final": "`alg HS256`, claims `{role:user}`, `verified:false` (signature not "
+                         "checked). Forge `role:admin`, re-encode, and `req_replay` with the "
+                         "tampered token to test verification.",
+            }],
+        )
+    )
+    # intercept_scope over MCP (Ack → {ok:true}).
+    out.append(
+        mcp_example(
+            tags=["mcp", "intercept_scope"],
+            user="Only intercept POSTs to /login on auth.fintrack.dev, not everything.",
+            steps=[{
+                "tool": "intercept_scope",
+                "args": {"host": "auth.fintrack.dev", "path": "/login", "method": "POST"},
+                "result": {"ok": True},
+                "final": "Scope set (Ack `{ok:true}`); now only `POST …/login` on that host "
+                         "parks. Call `intercept_scope` with `clear:true` to widen back to "
+                         "every flow.",
+            }],
+        )
+    )
+    # session_stats over MCP.
+    out.append(
+        mcp_example(
+            tags=["mcp", "session_stats", "capture"],
+            user="Did any of my exec'd commands fail to capture their traffic?",
+            steps=[{
+                "tool": "session_stats", "args": {},
+                "result": {"session": "acme", "total_execs": 8, "total_flows": 96,
+                           "network_execs": 7, "network_zero_flow_execs": 1,
+                           "escaped_execs": [{"exec_id": "exec-3-1-1781400800000000000",
+                                              "cmd": "wget https://cdn.acme.com/a.js"}]},
+                "final": "One network-facing exec captured zero flows — `wget …/a.js` likely "
+                         "escaped the proxy. Verify the agent hook (CLI `init --check`) and "
+                         "re-run it under the sandbox.",
+            }],
+        )
+    )
+    # session_auth_set + status over MCP.
+    login = "curl -s https://auth.fintrack.dev/login -d user=analyst -d pass=s3cr3t"
+    out.append(
+        mcp_example(
+            tags=["mcp", "session_auth_set"],
+            user="Store a login macro for fintrack.dev that injects a bearer token.",
+            steps=[{
+                "tool": "session_auth_set",
+                "args": {"login": login, "extract": '"token":"([^"]+)"',
+                         "header": "Authorization: Bearer {}", "host": "fintrack.dev"},
+                "result": {"id": 1, "host": "fintrack.dev"},
+                "final": "Profile 1 saved for fintrack.dev. It won't inject anything until you "
+                         "call `session_auth_refresh` (which runs the login command in the "
+                         "sandbox and installs the injection rule).",
+            }],
+        )
+    )
+    out.append(
+        mcp_example(
+            tags=["mcp", "session_auth_refresh", "session_auth_status"],
+            user="Mint a fresh token for fintrack.dev and confirm it's live.",
+            steps=[
+                {
+                    "preamble": "Refresh runs the stored login command and (re)installs the "
+                    "injection rule.",
+                    "tool": "session_auth_refresh", "args": {"host": "fintrack.dev"},
+                    "result": {"refreshed": [{"host": "fintrack.dev", "rule_id": 3,
+                                              "token": "eyJ0…q8Zg"}]},
+                    "final": "Token minted and rule 3 installed (token masked). Let me confirm "
+                             "the stored profile.",
+                },
+                {
+                    "preamble": "Check the profile status.",
+                    "tool": "session_auth_status", "args": {},
+                    "result": {"profiles": [{"id": 1, "host": "fintrack.dev",
+                                             "login_cmd": login,
+                                             "header_template": "Authorization: Bearer {}",
+                                             "token_set": True, "token": "eyJ0…q8Zg",
+                                             "rule_id": 3}]},
+                    "final": "`token_set:true` via `rule_id 3` — injection is live; the token "
+                             "value stays masked. Re-run `session_auth_refresh` when 401s "
+                             "reappear.",
+                },
+            ],
+        )
+    )
+    return out
+
+
+def fam_mcp_offensive_convos() -> list[dict[str, Any]]:
+    """Multi-turn MCP conversations over the offensive tools (fuzz → results →
+    tag; replay → compare)."""
+    out: list[dict[str, Any]] = []
+    t = _t("mobapi")
+    fid = _idbase(t) + 1
+    fdata = _fuzz_run_data(
+        5, "idor-sweep", fid, "sniper", [[22, 26]], ["7001", "7002", "7003"],
+        [_fuzz_res(0, "7001", 200, 640, 38, 0.92),
+         _fuzz_res(1, "7002", 200, 631, 37, 0.90),
+         _fuzz_res(2, "7003", 404, 44, 20, 0.30)],
+        baseline={"status": 200, "resp_len": 128, "latency_ms": 18},
+    )
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "fuzz", "idor", "tag", t.key],
+            exchanges=[
+                {
+                    "user": f"Fuzz the account id at 22:26 in flow {fid} across 7001-7003 to "
+                    "hunt BOLA.",
+                    "steps": [{
+                        "preamble": "Run a sniper Intruder attack.",
+                        "tool": "fuzz",
+                        "args": {"flow": fid, "positions": ["22:26"],
+                                 "payloads": ["7001", "7002", "7003"], "mode": "sniper",
+                                 "name": "idor-sweep"},
+                        "result": fdata,
+                        "interp": "Attack 5 done. `7001` and `7002` return `200` full bodies "
+                        "(anomaly ~0.9) — other accounts; `7003` is `404`. Want me to pull "
+                        "the ranked results?",
+                    }],
+                },
+                {
+                    "user": "Yes, the top hit.",
+                    "steps": [{
+                        "preamble": "Fetch the highest-anomaly result.",
+                        "tool": "fuzz_results",
+                        "args": {"attack_id": 5, "sort": "anomaly", "limit": 1},
+                        "result": {"attack": {"id": 5, "name": "idor-sweep", "status": "done",
+                                              "base_flow_id": fid, "mode": "sniper"},
+                                   "results": [{"id": 80, "status_code": 200, "resp_len": 640,
+                                                "latency_ms": 38, "anomaly_score": 0.92,
+                                                "payload": "7001"}], "count": 1},
+                        "interp": "Payload `7001` → `200`, anomaly 0.92: account 7001's data "
+                        "served to your token. That's a confirmed BOLA. Tag the base flow?",
+                    }],
+                },
+                {
+                    "user": "Tag it bola-confirmed.",
+                    "steps": [{
+                        "preamble": "Tag the base flow as evidence.",
+                        "tool": "tag_add",
+                        "args": {"flow_id": fid, "name": "bola-confirmed"},
+                        "result": {"tag_id": 4},
+                        "interp": f"Flow {fid} tagged `bola-confirmed` (tag_id 4). Report it "
+                        "against the `/account/{{id}}` endpoint with 7001/7002 as evidence.",
+                    }],
+                },
+            ],
+        )
+    )
+    # replay → compare conversation.
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "req_replay", "compare", "idor"],
+            exchanges=[
+                {
+                    "user": "Replay flow 30 (my order) with the order id changed to 5002 in "
+                    "the body, so I can compare.",
+                    "steps": [{
+                        "preamble": "Repeater with a body edit.",
+                        "tool": "req_replay",
+                        "args": {"id": 30, "set_body": "{\"order_id\":5002}"},
+                        "result": {"status": 200,
+                                   "response": "HTTP/1.1 200 OK\r\n\r\n"
+                                               "{\"order_id\":5002,\"owner\":\"victim@corp.com\"}"},
+                        "interp": "`200` with `owner:victim@corp.com`. The response landed as a "
+                        "new flow; ask me to compare it against your original.",
+                    }],
+                },
+                {
+                    "user": "Compare the original 30 with that replay, flow 33.",
+                    "steps": [{
+                        "preamble": "Structured diff of the two flows.",
+                        "tool": "compare", "args": {"flow_a": 30, "flow_b": 33},
+                        "result": _compare_data(
+                            30, 33, 200, 200,
+                            only_a=['"owner":"me@corp.com"'],
+                            only_b=['"owner":"victim@corp.com"'], reflected=[]),
+                        "interp": "Same `200`, identical structure, only the `owner`/`order_id` "
+                        "differ — you read another user's order by changing the id. Confirmed "
+                        "IDOR; recommend tagging flow 33 as evidence.",
+                    }],
+                },
+            ],
+        )
+    )
+    return out
+
+
+def fam_shell_offensive() -> list[dict[str, Any]]:
+    """`Bash`-tool-call (shell) driving of the 0.2.0 offensive surface: fuzz,
+    compare, encode/decode, session auth."""
+    out: list[dict[str, Any]] = []
+
+    # fuzz run then show (two-turn shell).
+    t = _t("ecom")
+    fid = _idbase(t) + 1
+    run_data = _fuzz_run_data(
+        6, "coupon-fuzz", fid, "sniper", [[30, 38]],
+        ["SAVE10", "ADMIN99", "FREE100"],
+        [_fuzz_res(1, "ADMIN99", 200, 812, 47, 0.85),
+         _fuzz_res(0, "SAVE10", 200, 640, 44, 0.10),
+         _fuzz_res(2, "FREE100", 400, 52, 21, 0.40)],
+        baseline={"status": 200, "resp_len": 640, "latency_ms": 44},
+    )
+    out.append(
+        shell_example(
+            tags=["shell", "fuzz", "intruder", "multi-turn", t.key],
+            exchanges=[
+                {
+                    "user": f"Flow {fid} applies a coupon code. Fuzz the code field with a few "
+                    "guesses through burpwn.",
+                    "steps": [{
+                        "preamble": "Sniper the coupon position with inline payloads; results "
+                        "rank by anomaly.",
+                        "command": f"burpwn --json fuzz run --flow {fid} --position 30:38 "
+                        "--payload SAVE10 --payload ADMIN99 --payload FREE100 "
+                        "--name coupon-fuzz",
+                        "result": _ok(run_data),
+                        "interp": "`ADMIN99` stands out — `200` with a much larger body "
+                        "(anomaly 0.85), suggesting it applied an unexpected discount. Let me "
+                        "pull the stored attack to confirm.",
+                    }],
+                },
+                {
+                    "user": "Show the attack's results ranked.",
+                    "steps": [{
+                        "preamble": "List then show the attack by anomaly.",
+                        "command": "burpwn --json fuzz show 6 --sort anomaly --limit 2",
+                        "result": _ok({
+                            "attack": {"id": 6, "name": "coupon-fuzz", "status": "done",
+                                       "base_flow_id": fid, "mode": "sniper"},
+                            "results": [
+                                {"id": 90, "status_code": 200, "resp_len": 812,
+                                 "latency_ms": 47, "anomaly_score": 0.85, "payload": "ADMIN99"},
+                                {"id": 91, "status_code": 400, "resp_len": 52,
+                                 "latency_ms": 21, "anomaly_score": 0.40, "payload": "FREE100"},
+                            ], "count": 2}),
+                        "interp": "`ADMIN99` (flow 90) is the accepted anomaly — a valid/"
+                        "privileged coupon. Replay it with `burpwn req replay` to read the "
+                        "full response and quantify the discount.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # encode/decode a captured token via shell.
+    out.append(
+        shell_example(
+            tags=["shell", "decode", "jwt"],
+            exchanges=[
+                {
+                    "user": "I copied a JWT from a captured request: "
+                    "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.sig — what's in it?",
+                    "steps": [{
+                        "preamble": "Decode the JWT (signature is not verified).",
+                        "command": "burpwn --json decode jwt "
+                        "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoidXNlciJ9.sig",
+                        "result": _ok({"scheme": "jwt", "alg": "HS256", "verified": False,
+                                       "header": {"alg": "HS256"}, "claims": {"role": "user"},
+                                       "signature": "sig"}),
+                        "interp": "`alg HS256`, claims `{role:user}`, `verified:false`. To "
+                        "test broken verification, encode a tampered payload with "
+                        "`burpwn encode base64url '{\"role\":\"admin\"}'`, rebuild the token, "
+                        "and `burpwn req replay <flow> --set-header 'Authorization: Bearer "
+                        "<forged>'`.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # session auth set + refresh via shell.
+    login = "curl -s https://auth.fintrack.dev/login -d user=analyst -d pass=s3cr3t"
+    out.append(
+        shell_example(
+            tags=["shell", "session", "auth", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Set up auto re-auth for fintrack.dev so scans don't die on 401s.",
+                    "steps": [{
+                        "preamble": "Persist the login macro + injection template.",
+                        "command": "burpwn --json session auth set --login "
+                        f"'{login}' --extract '\"token\":\"([^\"]+)\"' "
+                        "--header 'Authorization: Bearer {}' --host fintrack.dev",
+                        "result": _ok({"host": "fintrack.dev", "id": 1}),
+                        "interp": "Profile 1 stored. Now mint the first token and install the "
+                        "injection rule.",
+                    }],
+                },
+                {
+                    "user": "Refresh it.",
+                    "steps": [{
+                        "preamble": "Run the login through the sandbox and install the rule.",
+                        "command": "burpwn --json session auth refresh --host fintrack.dev",
+                        "result": _ok({"refreshed": [{"host": "fintrack.dev", "rule_id": 3,
+                                                      "token": "eyJ0…q8Zg"}]}),
+                        "interp": "Token minted (masked) and `rule_id 3` now injects "
+                        "`Authorization: Bearer <token>` into in-scope requests. Re-run this "
+                        "whenever 401s come back — it's idempotent.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # compare via shell.
+    out.append(
+        shell_example(
+            tags=["shell", "compare", "idor"],
+            exchanges=[
+                {
+                    "user": "Diff flows 30 and 31 to see if 31 leaked another user's record.",
+                    "steps": [{
+                        "preamble": "Structured flow diff.",
+                        "command": "burpwn --json compare 30 31",
+                        "result": _ok(_compare_data(
+                            30, 31, 200, 200,
+                            only_a=['"owner":"me@corp.com"'],
+                            only_b=['"owner":"victim@corp.com"'], reflected=[])),
+                        "interp": "Both `200`, same body shape, only the `owner` differs "
+                        "(`victim@corp.com`) — reading another user's record via id swap is "
+                        "IDOR. Tag flow 31 as evidence with `burpwn tag add 31 idor`.",
+                    }],
+                },
+            ],
+        )
+    )
+    return out
+
+
 # Assembly, dedup, split.
 # --------------------------------------------------------------------------- #
 
@@ -3738,6 +4892,16 @@ FAMILIES = [
     fam_shell_engagements,
     fam_shell_vuln_workflows,
     fam_mcp_conversations,
+    # 0.2.0 offensive surface.
+    fam_fuzz,
+    fam_compare,
+    fam_encode_decode,
+    fam_session_auth,
+    fam_intercept_scope,
+    fam_init_check_stats,
+    fam_mcp_offensive,
+    fam_mcp_offensive_convos,
+    fam_shell_offensive,
 ]
 
 

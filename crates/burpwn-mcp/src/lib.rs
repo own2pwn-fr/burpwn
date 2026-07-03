@@ -10,6 +10,11 @@
 //! Mutation (write via the store): `match_replace_add`, `tag_add`, `note_add`,
 //! `workspace_new`.
 //!
+//! Offensive (Repeater / Intruder / utilities): `req_replay` (replay a stored
+//! flow with edits), `fuzz` / `fuzz_list` / `fuzz_results` (payload fuzzing,
+//! persisted as attacks), `compare` (structured two-flow diff + reflection
+//! check), and `encode` / `decode` (base64/base64url/url/hex, plus jwt decode).
+//!
 //! Daemon / intercept (drive the running `burpwn proxy` daemon via
 //! [`burpwn_cli::control::ControlClient`]): `intercept_enable`,
 //! `intercept_disable`, `intercept_list`, `await_intercept` (the long-poll that

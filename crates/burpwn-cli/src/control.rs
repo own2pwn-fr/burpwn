@@ -91,6 +91,20 @@ pub enum ControlRequest {
         /// The parked intercept id.
         id: u64,
     },
+    /// Narrow (or clear) the blocking-intercept scope so only in-scope flows are
+    /// parked. Empty fields match anything on that dimension; ALL fields empty
+    /// clears the scope (every flow is in scope again).
+    InterceptSetScope {
+        /// Host substring the flow must contain (empty = any).
+        #[serde(default)]
+        host: String,
+        /// Path substring the flow must contain (empty = any).
+        #[serde(default)]
+        path: String,
+        /// Exact request method, case-insensitive (empty = any).
+        #[serde(default)]
+        method: String,
+    },
     /// Shut the daemon down.
     Shutdown,
 }
@@ -346,6 +360,17 @@ impl ControlClient {
         self.request(ControlRequest::InterceptDrop { id }).await
     }
 
+    /// Set (or clear, when all fields are empty) the blocking-intercept scope.
+    pub async fn intercept_set_scope(
+        &mut self,
+        host: String,
+        path: String,
+        method: String,
+    ) -> Result<ControlResponse> {
+        self.request(ControlRequest::InterceptSetScope { host, path, method })
+            .await
+    }
+
     /// Ask the daemon to shut down.
     pub async fn shutdown(&mut self) -> Result<ControlResponse> {
         self.request(ControlRequest::Shutdown).await
@@ -375,6 +400,11 @@ mod tests {
                 },
             },
             ControlRequest::InterceptDrop { id: 9 },
+            ControlRequest::InterceptSetScope {
+                host: "api.example.com".into(),
+                path: "/admin".into(),
+                method: "POST".into(),
+            },
             ControlRequest::Shutdown,
         ];
         for r in reqs {

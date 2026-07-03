@@ -84,6 +84,52 @@ impl BurpwnServer {
             .and_then(ok_json)
     }
 
+    #[tool(
+        description = "Capture-completeness telemetry for the session: total execs vs captured flows, and network-facing execs that captured ZERO flows (traffic likely escaped capture — the agent hook may not be routing through `burpwn exec`)."
+    )]
+    async fn session_stats(&self) -> Result<CallToolResult, McpError> {
+        handlers::session_stats(self.paths(), self.session())
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    // --- session auth -----------------------------------------------------
+
+    #[tool(
+        description = "Persist a session-auth profile: a login command, a token-extraction regex (one capture group), and a header-injection template (e.g. 'Authorization: Bearer {}'), optionally scoped to a host. Use session_auth_refresh to mint the token."
+    )]
+    async fn session_auth_set(
+        &self,
+        Parameters(params): Parameters<SessionAuthSetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::session_auth_set(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Run the stored login command in the sandbox, extract a fresh token, and install/UPDATE the match/replace rule that injects the auth header into in-scope requests (idempotent). Use when a target starts returning 401s."
+    )]
+    async fn session_auth_refresh(
+        &self,
+        Parameters(params): Parameters<SessionAuthRefreshParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::session_auth_refresh(self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Show the stored session-auth profile(s) and whether a token is currently set (the token value is masked)."
+    )]
+    async fn session_auth_status(&self) -> Result<CallToolResult, McpError> {
+        handlers::session_auth_status(self.paths(), self.session())
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
     // --- query ------------------------------------------------------------
 
     #[tool(
@@ -229,13 +275,26 @@ impl BurpwnServer {
     }
 
     #[tool(
-        description = "Forward (release) a parked intercept by id, optionally setting headers and/or replacing the body."
+        description = "Forward (release) a parked intercept by id, optionally setting headers, replacing the body, or (for an await_intercept-parked request) changing the method/path."
     )]
     async fn intercept_forward(
         &self,
         Parameters(params): Parameters<InterceptForwardParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::intercept_forward(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Narrow blocking interception to a host/path/method so not every flow parks (set clear=true to widen back to every flow). Wires the proxy's scope filter."
+    )]
+    async fn intercept_scope(
+        &self,
+        Parameters(params): Parameters<InterceptScopeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::intercept_scope(self.paths(), self.session(), &params)
             .await
             .map_err(to_mcp_err)
             .and_then(ok_json)
@@ -266,6 +325,92 @@ impl BurpwnServer {
             .map_err(to_mcp_err)
             .and_then(ok_json)
     }
+
+    // --- repeater ---------------------------------------------------------
+
+    #[tool(
+        description = "Replay (Repeater) a stored flow, optionally editing method/headers/body, and return the response. Same transport as the CLI `req replay`."
+    )]
+    async fn req_replay(
+        &self,
+        Parameters(params): Parameters<ReqReplayParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::req_replay(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    // --- fuzz (Intruder) --------------------------------------------------
+
+    #[tool(
+        description = "Intruder: run a payload fuzzing attack against a stored flow's request. positions are start:end byte offsets (or § markers); mode is sniper|battering-ram|pitchfork|cluster-bomb. Persists an attack + per-payload results and returns the ranked table."
+    )]
+    async fn fuzz(
+        &self,
+        Parameters(params): Parameters<FuzzParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::fuzz_run(self.paths(), self.session(), &params)
+            .await
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(description = "List stored Intruder attacks (id, name, base flow, status, #results).")]
+    async fn fuzz_list(
+        &self,
+        Parameters(params): Parameters<FuzzListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::fuzz_list(self.paths(), self.session(), &params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Fetch one attack's per-payload results, sorted by anomaly|status|len (default anomaly), optionally limited."
+    )]
+    async fn fuzz_results(
+        &self,
+        Parameters(params): Parameters<FuzzResultsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::fuzz_results(self.paths(), self.session(), &params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    // --- compare / encode -------------------------------------------------
+
+    #[tool(
+        description = "Structured diff of two flows: status-line delta, header add/remove/change, line-based body diff, and a reflection check (tokens from flow A's request echoed in flow B's response). what = headers|body|all."
+    )]
+    async fn compare(
+        &self,
+        Parameters(params): Parameters<CompareParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::compare(self.paths(), self.session(), &params)
+            .map_err(to_mcp_err)
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Encode a value. scheme = base64|base64url|url|hex. Pure (no network)."
+    )]
+    async fn encode(
+        &self,
+        Parameters(params): Parameters<EncodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::encode(&params).map_err(to_mcp_err).and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Decode a value. scheme = base64|base64url|url|hex|jwt (jwt splits header.payload.signature and decodes to JSON without verifying the signature)."
+    )]
+    async fn decode(
+        &self,
+        Parameters(params): Parameters<EncodeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::decode(&params).map_err(to_mcp_err).and_then(ok_json)
+    }
 }
 
 #[tool_handler]
@@ -278,8 +423,10 @@ impl ServerHandler for BurpwnServer {
                  Query captured flows (req_list/req_show/req_search), run commands \
                  through the sandbox (exec), and drive blocking interception \
                  (intercept_enable, await_intercept long-poll, intercept_forward/drop). \
-                 Tools operate on the active session unless the server was started \
-                 with --session."
+                 Offensive tooling: req_replay (Repeater), fuzz/fuzz_list/fuzz_results \
+                 (Intruder), compare (structured flow diff + reflection check), and \
+                 encode/decode (base64/url/hex/jwt). Tools operate on the active \
+                 session unless the server was started with --session."
                     .into(),
             ),
             ..Default::default()

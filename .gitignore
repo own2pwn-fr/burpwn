@@ -7,3 +7,5 @@ Cargo.lock.orig
 *.session.db*
 /tmp
 .DS_Store
+__pycache__/
+*.pyc

@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use anyhow::{anyhow, bail, Context, Result};
 
 use burpwn_store::model::{FlowDetail, RequestData};
+use burpwn_store::Store;
 
 /// One header edit applied to the rebuilt request.
 #[derive(Debug, Clone)]
@@ -192,6 +193,26 @@ pub async fn replay(detail: &FlowDetail, req: &RequestData) -> Result<ReplayResu
         status: resp.status,
         raw_response,
     })
+}
+
+/// High-level Repeater: fetch flow `id` from `store`, apply the method/header/
+/// body edits, replay it, and return the result. Shared by the CLI `req replay`
+/// and the MCP `req_replay` tool so both take exactly the same path.
+pub async fn replay_flow(
+    store: &Store,
+    id: i64,
+    method: Option<&str>,
+    headers: &[ReplayEdit],
+    body: Option<Vec<u8>>,
+) -> Result<ReplayResult> {
+    let Some(detail) = store.reader().get_flow(id)? else {
+        bail!("no such flow: {id}");
+    };
+    let Some(base) = detail.request.clone() else {
+        bail!("flow {id} has no recorded request to replay");
+    };
+    let req = apply_edits(base, method, headers, body);
+    replay(&detail, &req).await
 }
 
 /// Reassemble a [`burpwn_proxy::ReplayResponse`] into raw HTTP-ish bytes (status

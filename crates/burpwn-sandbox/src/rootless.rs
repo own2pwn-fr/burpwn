@@ -198,6 +198,90 @@ pub fn ca_env_vars(ca_path: &str) -> Vec<(String, String)> {
 /// is generous for real tooling yet prevents host-memory exhaustion.
 const TMP_TMPFS_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Default `RLIMIT_AS` (max virtual address space) for the wrapped command:
+/// 8 GiB. Generous enough for real pentest tooling — including Go binaries,
+/// whose runtime reserves large amounts of *virtual* (not resident) address
+/// space — while still bounding a runaway allocation far below host-RAM
+/// exhaustion. Override with `BURPWN_RLIMIT_AS` (in bytes); set it to
+/// `0`/`unlimited` to disable entirely (e.g. for a tool that maps huge sparse
+/// arenas and hits the cap).
+pub const DEFAULT_RLIMIT_AS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Default `RLIMIT_NPROC` (max processes/threads for the sandbox user): 4096.
+/// A fork bomb is capped here long before it can exhaust host PIDs, yet parallel
+/// scanners (many workers/threads) stay comfortably under it. Override with
+/// `BURPWN_RLIMIT_NPROC`; `0`/`unlimited` disables it.
+pub const DEFAULT_RLIMIT_NPROC: u64 = 4096;
+
+/// Default `RLIMIT_CPU` (max CPU-seconds; SIGXCPU then SIGKILL past the hard
+/// cap): 3600. Deliberately far above any sane wall-clock timeout, so it only
+/// ever catches a pathological CPU spin the wall-clock timeout somehow missed —
+/// it is a backstop, not the primary bound. Override with `BURPWN_RLIMIT_CPU`
+/// (in seconds); `0`/`unlimited` disables it.
+pub const DEFAULT_RLIMIT_CPU_SECONDS: u64 = 3600;
+
+// Compile-time guardrail: the defaults must stay GENEROUS (guardrails, not
+// straitjackets) so normal pentest tooling is never broken — AS in the
+// multi-GiB range, thousands of procs, CPU seconds far above any sane
+// wall-clock timeout.
+const _: () = assert!(DEFAULT_RLIMIT_AS_BYTES >= 4 * 1024 * 1024 * 1024);
+const _: () = assert!(DEFAULT_RLIMIT_NPROC >= 1024);
+const _: () = assert!(DEFAULT_RLIMIT_CPU_SECONDS >= 600);
+
+/// Resource limits (rlimits) applied to the wrapped command right before
+/// `execve`, as anti-forkbomb / anti-OOM guardrails layered on top of the
+/// wall-clock timeout and the size-capped `/tmp`. Each field is `None` when the
+/// operator disabled that limit (its env var set to `0`/`unlimited`/`none`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxRlimits {
+    /// `RLIMIT_AS` — max virtual address space, in bytes.
+    pub address_space_bytes: Option<u64>,
+    /// `RLIMIT_NPROC` — max processes/threads for the sandbox user.
+    pub max_procs: Option<u64>,
+    /// `RLIMIT_CPU` — max CPU seconds.
+    pub cpu_seconds: Option<u64>,
+}
+
+/// Parse one `BURPWN_RLIMIT_*` value: unset/empty → `default`; `0`/`unlimited`/
+/// `none` → `None` (disabled); a valid integer → that value; anything else →
+/// `default` (never fail the sandbox over a malformed env var).
+fn parse_rlimit_env(raw: Option<String>, default: u64) -> Option<u64> {
+    match raw {
+        None => Some(default),
+        Some(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                Some(default)
+            } else if t == "0"
+                || t.eq_ignore_ascii_case("unlimited")
+                || t.eq_ignore_ascii_case("none")
+            {
+                None
+            } else {
+                t.parse::<u64>().ok().or(Some(default))
+            }
+        }
+    }
+}
+
+/// Resolve the [`SandboxRlimits`] from an arbitrary env accessor (pure — unit
+/// tested without touching the process environment).
+pub fn resolve_rlimits_from<F>(get: F) -> SandboxRlimits
+where
+    F: Fn(&str) -> Option<String>,
+{
+    SandboxRlimits {
+        address_space_bytes: parse_rlimit_env(get("BURPWN_RLIMIT_AS"), DEFAULT_RLIMIT_AS_BYTES),
+        max_procs: parse_rlimit_env(get("BURPWN_RLIMIT_NPROC"), DEFAULT_RLIMIT_NPROC),
+        cpu_seconds: parse_rlimit_env(get("BURPWN_RLIMIT_CPU"), DEFAULT_RLIMIT_CPU_SECONDS),
+    }
+}
+
+/// Resolve the [`SandboxRlimits`] from the real process environment.
+pub fn resolve_rlimits() -> SandboxRlimits {
+    resolve_rlimits_from(|k| std::env::var(k).ok())
+}
+
 /// Build the full `bwrap` argv for the user command. PURE (string-only) so it
 /// is unit-tested. NOTE: `--unshare-net` is intentionally ABSENT — bwrap must
 /// inherit the netns we created so the REDIRECT ruleset applies.
@@ -689,12 +773,47 @@ mod privileged {
     }
 
     /// Run the EXACT spike-proven `ip` sequence then load the nft ruleset.
+    ///
+    /// The ruleset's QUIC fail-fast guard prefers `reject` (immediate ICMP
+    /// port-unreachable). Some kernels lack `nf_reject`, on which loading the
+    /// `reject`-based ruleset fails; we then retry with the `drop` variant so the
+    /// sandbox still comes up (QUIC clients fall back on their own timeout rather
+    /// than instantly — documented in [`crate::nft`]).
     fn setup_netns(spec: &ExecSpec) -> Result<(), SandboxError> {
-        let (cmds, ruleset) = netns_setup_commands(spec.proxy_tcp_port, spec.proxy_dns_port);
+        use crate::nft::{redirect_ruleset_with, UdpAction};
+
+        let (cmds, reject_ruleset) =
+            netns_setup_commands(spec.proxy_tcp_port, spec.proxy_dns_port);
         for argv in &cmds {
             run_ok(argv)?;
         }
-        // nft -f - <<< ruleset
+        // Preferred: reject (nf_reject). On failure, fall back to drop so a
+        // kernel without nf_reject does not take the whole sandbox down.
+        match load_nft(&reject_ruleset) {
+            Ok(()) => Ok(()),
+            Err(reject_err) => {
+                tracing::warn!(
+                    error = %reject_err,
+                    "burpwn sandbox: nft reject ruleset failed to load (no nf_reject?), \
+                     falling back to drop for non-DNS UDP (QUIC fails on client timeout)"
+                );
+                let drop_ruleset = redirect_ruleset_with(
+                    spec.proxy_tcp_port,
+                    spec.proxy_dns_port,
+                    UdpAction::Drop,
+                );
+                load_nft(&drop_ruleset).map_err(|drop_err| {
+                    SandboxError::Runtime(format!(
+                        "nft load failed (reject: {reject_err}; drop fallback: {drop_err})"
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Feed a ruleset to `nft -f -`. Returns the stderr text on failure so the
+    /// caller can decide whether to retry (e.g. reject → drop fallback).
+    fn load_nft(ruleset: &str) -> Result<(), SandboxError> {
         let mut child = Command::new("nft")
             .args(["-f", "-"])
             .stdin(Stdio::piped())
@@ -836,20 +955,43 @@ mod privileged {
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
         }
+        // Resolve the anti-forkbomb / anti-OOM rlimits from the environment HERE
+        // (in the single-threaded forked child, before building the pre_exec
+        // closure) — reading env + allocating is fine at this point, whereas the
+        // pre_exec closure itself must stay async-signal-safe. The closure then
+        // only captures plain integers and calls setrlimit.
+        let rlimits = super::resolve_rlimits();
         // exec replaces the image; if it returns, it errored.
         let err = {
             use std::os::unix::process::CommandExt;
-            // Disable core dumps for the wrapped (untrusted) command so a crash
-            // cannot spill sandbox memory to host disk. setrlimit is
-            // async-signal-safe, so it is sound in `pre_exec`.
+            // Apply resource limits to the wrapped (untrusted) command before
+            // exec. setrlimit is async-signal-safe, so it is sound in `pre_exec`.
+            // All calls are best-effort: a failure here must NOT abort the exec.
             unsafe {
-                cmd.pre_exec(|| {
-                    let lim = libc::rlimit {
+                cmd.pre_exec(move || {
+                    // Disable core dumps so a crash cannot spill sandbox memory
+                    // to host disk.
+                    let zero = libc::rlimit {
                         rlim_cur: 0,
                         rlim_max: 0,
                     };
-                    // Best-effort: failure here must not abort the exec.
-                    libc::setrlimit(libc::RLIMIT_CORE, &lim);
+                    libc::setrlimit(libc::RLIMIT_CORE, &zero);
+                    // RLIMIT_AS / RLIMIT_NPROC / RLIMIT_CPU: bound address space,
+                    // process count (fork bomb) and CPU time. `res` is inferred
+                    // to the platform's rlimit-resource type from the RLIMIT_*
+                    // constants, so this stays portable across glibc/musl.
+                    let set = |res, value: Option<u64>| {
+                        if let Some(v) = value {
+                            let lim = libc::rlimit {
+                                rlim_cur: v,
+                                rlim_max: v,
+                            };
+                            libc::setrlimit(res, &lim);
+                        }
+                    };
+                    set(libc::RLIMIT_AS, rlimits.address_space_bytes);
+                    set(libc::RLIMIT_NPROC, rlimits.max_procs);
+                    set(libc::RLIMIT_CPU, rlimits.cpu_seconds);
                     Ok(())
                 });
             }
@@ -1175,6 +1317,41 @@ mod tests {
         };
         assert!(!missing_nft.is_ok());
         assert!(missing_nft.missing_summary().contains("nft"));
+    }
+
+    #[test]
+    fn rlimits_default_when_env_unset() {
+        let r = resolve_rlimits_from(|_| None);
+        assert_eq!(r.address_space_bytes, Some(DEFAULT_RLIMIT_AS_BYTES));
+        assert_eq!(r.max_procs, Some(DEFAULT_RLIMIT_NPROC));
+        assert_eq!(r.cpu_seconds, Some(DEFAULT_RLIMIT_CPU_SECONDS));
+    }
+
+    #[test]
+    fn rlimits_env_override_value_and_disable() {
+        let r = resolve_rlimits_from(|k| match k {
+            "BURPWN_RLIMIT_AS" => Some("1073741824".into()), // 1 GiB
+            "BURPWN_RLIMIT_NPROC" => Some("0".into()),       // disabled
+            "BURPWN_RLIMIT_CPU" => Some("unlimited".into()), // disabled
+            _ => None,
+        });
+        assert_eq!(r.address_space_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(r.max_procs, None);
+        assert_eq!(r.cpu_seconds, None);
+    }
+
+    #[test]
+    fn rlimits_malformed_value_falls_back_to_default() {
+        // A garbage env value must never fail the sandbox — it falls back to the
+        // generous default.
+        let r = resolve_rlimits_from(|k| {
+            if k == "BURPWN_RLIMIT_AS" {
+                Some("not-a-number".into())
+            } else {
+                None
+            }
+        });
+        assert_eq!(r.address_space_bytes, Some(DEFAULT_RLIMIT_AS_BYTES));
     }
 
     #[tokio::test]

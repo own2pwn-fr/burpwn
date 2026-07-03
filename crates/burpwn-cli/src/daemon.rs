@@ -25,7 +25,8 @@ use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use burpwn_proxy::intercept::{
-    InterceptController, InterceptData, InterceptDecision, InterceptKind, PendingIntercept,
+    InterceptController, InterceptData, InterceptDecision, InterceptKind, InterceptScope,
+    PendingIntercept,
 };
 use burpwn_proxy::{Proxy, ProxyConfig};
 use burpwn_store::Store;
@@ -229,6 +230,15 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
                 }
                 None => ControlResponse::Resolved { found: false },
             }
+        }
+        ControlRequest::InterceptSetScope { host, path, method } => {
+            // All-empty ⇒ a default scope that matches everything (i.e. cleared).
+            state.intercept.set_scope(InterceptScope {
+                host_contains: host,
+                path_contains: path,
+                method,
+            });
+            ControlResponse::Ack
         }
         ControlRequest::InterceptDrop { id } => {
             if state.intercept.resolve(id, InterceptDecision::Drop) {
@@ -483,6 +493,21 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
     let proxy_sock = paths.proxy_sock(session);
     let control_sock = paths.control_sock(session);
 
+    // Arm best-effort session-auth AUTO-refresh: the proxy signals 401/403 hosts
+    // (debounced) on this channel; the consumer checks whether that host has an
+    // auth profile and, if so, spawns `burpwn session auth refresh --host <host>`
+    // (which runs the login command through THIS proxy and updates the injection
+    // rule). The AuthWatcher debounce is the recursion guard — the login
+    // command's own traffic is suppressed for the debounce window (see
+    // `burpwn_proxy::auth`). Detached so a wedged refresh never blocks the daemon.
+    let auth_rx = proxy.auth().activate();
+    let auth_reader = store.reader();
+    let auth_exe = std::env::current_exe().ok();
+    let auth_session = session.to_string();
+    let auth = tokio::spawn(async move {
+        auth_refresh_consumer(auth_rx, auth_reader, auth_exe, auth_session).await;
+    });
+
     let scm_proxy = proxy.clone();
     let scm = tokio::spawn(async move { scm_proxy.serve_scm_unix(proxy_sock).await });
 
@@ -499,9 +524,80 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
 
     scm.abort();
     dns.abort();
+    auth.abort();
     let _ = std::fs::remove_file(paths.proxy_sock(session));
     let _ = std::fs::remove_file(&control_sock);
     result
+}
+
+/// Consume 401/403 host signals from the proxy's [`AuthWatcher`]: for each host,
+/// look up a matching session-auth profile in the store and, when one exists,
+/// spawn a detached `burpwn session auth refresh --host <host>` to re-mint the
+/// token + update its injection rule. The proxy-side debounce already bounds how
+/// often a host can be signalled, so this consumer stays trivial. A host with no
+/// profile is a cheap no-op (one store read).
+async fn auth_refresh_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    reader: burpwn_store::Reader,
+    exe: Option<std::path::PathBuf>,
+    session: String,
+) {
+    let Some(exe) = exe else {
+        tracing::debug!("auth auto-refresh disabled: own executable path unknown");
+        return;
+    };
+    while let Some(host) = rx.recv().await {
+        match reader.auth_profile_for_host(&host) {
+            Ok(Some(profile)) => {
+                tracing::warn!(
+                    %host,
+                    scope = %profile.host,
+                    "auth: observed 401/403 for a host with an auth profile; triggering refresh"
+                );
+                if let Err(e) = spawn_auth_refresh(&exe, &session, &profile.host) {
+                    tracing::warn!(error = %e, "auth: failed to spawn refresh");
+                }
+            }
+            Ok(None) => {} // no profile for this host: nothing to do.
+            Err(e) => tracing::debug!(error = %e, "auth: profile lookup failed"),
+        }
+    }
+}
+
+/// Spawn a detached `burpwn --json session auth refresh --host <scope>` child.
+/// Detached (its own session) so a slow login command never blocks the daemon;
+/// stdio to /dev/null and fd 3 closed so it never pins the exec envelope pipe.
+fn spawn_auth_refresh(
+    exe: &Path,
+    session: &str,
+    scope: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--json")
+        .arg("session")
+        .arg("auth")
+        .arg("refresh")
+        .arg("--session")
+        .arg(session)
+        .arg("--host")
+        .arg(scope)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setsid`/`close` are async-signal-safe and the only calls between
+    // fork and exec. Detach into a new session and drop fd 3 (the exec envelope
+    // pipe) so this background refresh never wedges a caller reading fd 3.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(3);
+            Ok(())
+        });
+    }
+    cmd.spawn().map(|_child| ())
 }
 
 /// Write `{ "dns_port": <port> }` to `ports.json`.
@@ -823,6 +919,69 @@ mod tests {
         // The queue was not touched: nothing parked.
         let resp = handle_request(&state, ControlRequest::Status).await;
         assert!(matches!(resp, ControlResponse::Status { pending: 0, .. }));
+    }
+
+    /// Intercept scope set/clear must round-trip through the control protocol
+    /// onto the live `InterceptController` (previously `set_scope` was dead code
+    /// no message reached). Set narrows the scope; an all-empty set clears it.
+    #[tokio::test]
+    async fn intercept_scope_set_and_clear_round_trips() {
+        let state = ctrl_state();
+        // Default scope matches everything.
+        assert_eq!(state.intercept.scope(), InterceptScope::default());
+
+        let resp = handle_request(
+            &state,
+            ControlRequest::InterceptSetScope {
+                host: "api.example.com".into(),
+                path: "/admin".into(),
+                method: "POST".into(),
+            },
+        )
+        .await;
+        assert!(matches!(resp, ControlResponse::Ack));
+        let scope = state.intercept.scope();
+        assert_eq!(scope.host_contains, "api.example.com");
+        assert_eq!(scope.path_contains, "/admin");
+        assert_eq!(scope.method, "POST");
+
+        // All-empty clears it back to match-everything.
+        let resp = handle_request(
+            &state,
+            ControlRequest::InterceptSetScope {
+                host: String::new(),
+                path: String::new(),
+                method: String::new(),
+            },
+        )
+        .await;
+        assert!(matches!(resp, ControlResponse::Ack));
+        assert_eq!(state.intercept.scope(), InterceptScope::default());
+    }
+
+    /// The scope must also survive a real socket round-trip through the client.
+    #[tokio::test]
+    async fn intercept_scope_round_trips_over_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let state = ctrl_state();
+        let ctrl = state.intercept.clone();
+
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move { serve_control(state, &server_sock).await });
+
+        let mut client = ControlClient::connect_retry(&sock, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let ack = client
+            .intercept_set_scope("target.test".into(), String::new(), String::new())
+            .await
+            .unwrap();
+        assert!(matches!(ack, ControlResponse::Ack));
+        assert_eq!(ctrl.scope().host_contains, "target.test");
+
+        let _ = client.shutdown().await;
+        let _ = server.await;
     }
 
     #[tokio::test]

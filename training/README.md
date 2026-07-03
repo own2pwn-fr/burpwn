@@ -51,11 +51,13 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-~1.5k deduplicated examples by default (`514 cli`, `299 mcp`, `655 shell`), of
-which **~50% are multi-turn**. The split is a deterministic, **style-stratified**
-95/5 split (all three styles appear in each split). The default emitted set is
-balanced to ~50% multi-turn by deterministically subsampling single-turn records;
-the **full corpus is ~3.3k examples** (`python generate.py --multiturn-frac 0`).
+**1,489** deduplicated examples by default (`525 cli`, `306 mcp`, `658 shell`), of
+which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
+(split 1,415 train / 74 validation). The split is a deterministic,
+**style-stratified** 95/5 split (all three styles appear in each split). The
+default emitted set is balanced to ~50% multi-turn by deterministically
+subsampling single-turn records; the **full corpus is 3,305 examples**
+(`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
 
@@ -176,11 +178,14 @@ turns, each driving tool rounds) follow the same grammar as `shell`.
 }
 ```
 
-The 19 MCP tools are: `session_list`, `session_current`, `req_list`,
-`req_show`, `req_search`, `workspace_list`, `workspace_new`, `tag_list`,
-`tag_add`, `note_add`, `match_replace_list`, `match_replace_add`,
+The 31 MCP tools are: `session_list`, `session_current`, `session_stats`,
+`session_auth_set`, `session_auth_refresh`, `session_auth_status`, `req_list`,
+`req_show`, `req_search`, `req_replay`, `workspace_list`, `workspace_new`,
+`tag_list`, `tag_add`, `note_add`, `match_replace_list`, `match_replace_add`,
 `intercept_enable`, `intercept_disable`, `intercept_list`, `await_intercept`,
-`intercept_forward`, `intercept_drop`, `exec`. All 19 appear as real tool calls.
+`intercept_forward`, `intercept_scope`, `intercept_drop`, `exec`, `fuzz`,
+`fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`. All 31 appear as
+real tool calls.
 
 ## Grounding / accuracy
 
@@ -249,8 +254,8 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (~50% multi-turn by default)
-python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (~3.3k records)
+python generate.py                     # writes dataset.jsonl + splits (1,489 records, ~50% multi-turn)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,305 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
 python generate.py --seed 7            # change the deterministic RNG seed

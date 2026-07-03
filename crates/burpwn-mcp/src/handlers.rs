@@ -71,6 +71,7 @@ pub fn req_list(
         port: params.port,
         limit: params.limit,
         offset: params.offset,
+        ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
     Ok(json!({ "flows": rows, "count": rows.len() }))
@@ -329,10 +330,33 @@ pub async fn intercept_forward(
             })
             .collect(),
         body: params.set_body.clone(),
-        method: None,
-        path: None,
+        // MCP forward now reaches CLI parity: it can also change the method/path
+        // of an `await_intercept`-parked request (previously CLI-only).
+        method: params.method.clone(),
+        path: params.path.clone(),
     };
     control_value(c.intercept_forward(params.id, edits).await?)
+}
+
+/// `intercept_scope` — narrow (or clear) blocking interception to a host/path/
+/// method so not every flow parks. `clear` (or all-empty fields) widens back to
+/// every flow.
+pub async fn intercept_scope(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::InterceptScopeParams,
+) -> Result<Value> {
+    let mut c = connect_control(paths, session).await?;
+    let (host, path, method) = if params.clear {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            params.host.clone().unwrap_or_default(),
+            params.path.clone().unwrap_or_default(),
+            params.method.clone().unwrap_or_default(),
+        )
+    };
+    control_value(c.intercept_set_scope(host, path, method).await?)
 }
 
 /// `intercept_drop`.
@@ -343,6 +367,241 @@ pub async fn intercept_drop(
 ) -> Result<Value> {
     let mut c = connect_control(paths, session).await?;
     control_value(c.intercept_drop(params.id).await?)
+}
+
+// --- req_replay (Repeater) --------------------------------------------------
+
+/// `req_replay` — replay a stored flow with optional edits, mirroring the CLI
+/// `req replay`. Shares [`burpwn_cli::replay::replay_flow`] so both take exactly
+/// the same transport path.
+pub async fn req_replay(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::ReqReplayParams,
+) -> Result<Value> {
+    use burpwn_cli::replay::{parse_header_spec, replay_flow};
+    let store = open_store(paths, session)?;
+    // Validate + normalise the header edits through the same CRLF-injection guard
+    // the CLI uses (parse_header_spec on a `Name: value` string).
+    let mut headers = Vec::new();
+    for h in &params.set_headers {
+        headers.push(parse_header_spec(&format!("{}: {}", h.name, h.value))?);
+    }
+    let body = params.set_body.clone().map(|b| b.into_bytes());
+    let result = replay_flow(&store, params.id, params.method.as_deref(), &headers, body).await?;
+    Ok(json!({
+        "status": result.status,
+        "response": String::from_utf8_lossy(&result.raw_response),
+    }))
+}
+
+// --- fuzz (Intruder) --------------------------------------------------------
+
+/// `fuzz` — run an Intruder attack against a stored flow and persist it.
+pub async fn fuzz_run(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::FuzzParams,
+) -> Result<Value> {
+    use burpwn_proxy::AttackMode;
+    use tokio_util::sync::CancellationToken;
+
+    let mode = AttackMode::from_str_opt(&params.mode)
+        .ok_or_else(|| anyhow!("mode must be sniper|battering-ram|pitchfork|cluster-bomb"))?;
+    let mut positions = Vec::new();
+    for spec in &params.positions {
+        positions.push(burpwn_cli::fuzz::parse_position(spec)?);
+    }
+    let payloads: Vec<Vec<u8>> = params.payloads.iter().map(|p| p.clone().into_bytes()).collect();
+
+    let spec = burpwn_cli::fuzz::FuzzSpec {
+        flow_id: params.flow,
+        request_bytes: None,
+        positions,
+        marker: params.marker.clone().map(|m| m.into_bytes()),
+        payloads,
+        mode,
+        concurrency: params.concurrency,
+        delay_ms: params.delay_ms,
+        name: params.name.clone(),
+    };
+    burpwn_cli::fuzz::fuzz_run(paths, session, spec, CancellationToken::new()).await
+}
+
+/// `fuzz_list` — list stored attacks.
+pub fn fuzz_list(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::FuzzListParams,
+) -> Result<Value> {
+    burpwn_cli::fuzz::fuzz_list(paths, session, params.workspace.as_deref())
+}
+
+/// `fuzz_results` — one attack's per-payload results.
+pub fn fuzz_results(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::FuzzResultsParams,
+) -> Result<Value> {
+    let sort = match &params.sort {
+        Some(s) => burpwn_cli::fuzz::ResultSort::from_str_opt(s)
+            .ok_or_else(|| anyhow!("sort must be anomaly|status|len, got {s:?}"))?,
+        None => burpwn_cli::fuzz::ResultSort::Anomaly,
+    };
+    burpwn_cli::fuzz::fuzz_show(paths, session, params.attack_id, sort, params.limit)
+}
+
+// --- compare ----------------------------------------------------------------
+
+/// `compare` — structured diff of two flows.
+pub fn compare(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::CompareParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let a = reader
+        .get_flow(params.flow_a)?
+        .ok_or_else(|| anyhow!("no such flow: {}", params.flow_a))?;
+    let b = reader
+        .get_flow(params.flow_b)?
+        .ok_or_else(|| anyhow!("no such flow: {}", params.flow_b))?;
+    let what = match &params.what {
+        Some(w) => burpwn_cli::compare::CompareWhat::from_str_opt(w)
+            .ok_or_else(|| anyhow!("what must be headers|body|all, got {w:?}"))?,
+        None => burpwn_cli::compare::CompareWhat::All,
+    };
+    Ok(burpwn_cli::compare::diff_flows(&a, &b, what))
+}
+
+// --- encode / decode --------------------------------------------------------
+
+/// `encode` — byte transform.
+pub fn encode(params: &crate::params::EncodeParams) -> Result<Value> {
+    burpwn_cli::encode::encode(&params.scheme, &params.value)
+}
+
+/// `decode` — reverse byte transform (plus `jwt`).
+pub fn decode(params: &crate::params::EncodeParams) -> Result<Value> {
+    burpwn_cli::encode::decode(&params.scheme, &params.value)
+}
+
+// --- session stats + auth --------------------------------------------------
+
+/// `session_stats` — capture-completeness telemetry: execs vs captured flows,
+/// and the network-facing execs that captured ZERO flows (traffic likely
+/// escaped capture, e.g. an agent hook silently no-op'd).
+pub fn session_stats(paths: &Paths, session: &str) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let stats = reader.exec_stats()?;
+    let escaped: Vec<Value> = reader
+        .exec_records()?
+        .into_iter()
+        .filter(|e| e.network_facing && e.flow_count == 0)
+        .map(|e| json!({ "exec_id": e.exec_id, "cmd": e.cmd }))
+        .collect();
+    Ok(json!({
+        "session": session,
+        "total_execs": stats.total_execs,
+        "total_flows": stats.total_flows,
+        "network_execs": stats.network_execs,
+        "network_zero_flow_execs": stats.network_zero_flow_execs,
+        "escaped_execs": escaped,
+    }))
+}
+
+/// `session_auth_set` — persist (or update) a session-auth profile. Store-only
+/// (no sandbox), so it runs in-process.
+pub async fn session_auth_set(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::SessionAuthSetParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let host = params.host.clone().unwrap_or_default();
+    let id =
+        burpwn_cli::auth::auth_set(&store, &host, &params.login, &params.extract, &params.header)
+            .await?;
+    Ok(json!({ "id": id, "host": host }))
+}
+
+/// `session_auth_status` — the stored profiles with the token value MASKED.
+pub fn session_auth_status(paths: &Paths, session: &str) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let profiles: Vec<Value> = store
+        .reader()
+        .auth_profiles()?
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "host": p.host,
+                "login_cmd": p.login_cmd,
+                "header_template": p.header_template,
+                "token_set": p.token.is_some(),
+                "token": p.token.as_deref().map(burpwn_cli::auth::mask_token),
+                "rule_id": p.rule_id,
+            })
+        })
+        .collect();
+    Ok(json!({ "profiles": profiles }))
+}
+
+/// `session_auth_refresh` — re-mint the token(s) + update the injection rule(s).
+/// This runs the login command in the sandbox, so it reuses the FULL CLI path
+/// (daemon-ensure + sandbox) by shelling out to `burpwn session auth refresh`
+/// (same rationale as [`run_exec`] shelling out for the sandbox).
+pub async fn session_auth_refresh(
+    session: &str,
+    params: &crate::params::SessionAuthRefreshParams,
+) -> Result<Value> {
+    let mut args = vec![
+        "--json".to_string(),
+        "session".to_string(),
+        "auth".to_string(),
+        "refresh".to_string(),
+        "--session".to_string(),
+        session.to_string(),
+    ];
+    if let Some(h) = &params.host {
+        args.push("--host".to_string());
+        args.push(h.clone());
+    }
+    run_burpwn_json(&args).await
+}
+
+/// Run `burpwn <args>` (which include `--json`) capturing stdout, and return the
+/// `data` of its `{ok,data,error}` envelope (or an error on `ok:false`). Used by
+/// the auth-refresh tool to reuse the CLI's daemon-ensure + sandbox path.
+async fn run_burpwn_json(args: &[String]) -> Result<Value> {
+    let exe = std::env::current_exe().context("locating the burpwn executable")?;
+    let output = tokio::process::Command::new(&exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawning burpwn")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let env: Option<Value> = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|l| serde_json::from_str(l).ok());
+    match env {
+        Some(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+            Ok(v.get("data").cloned().unwrap_or_else(|| json!({})))
+        }
+        Some(v) => Err(anyhow!(
+            "burpwn command failed: {}",
+            v.get("error").and_then(Value::as_str).unwrap_or("unknown")
+        )),
+        None => Err(anyhow!(
+            "burpwn produced no JSON envelope (exit {:?})",
+            output.status.code()
+        )),
+    }
 }
 
 // --- exec ------------------------------------------------------------------

@@ -11,6 +11,7 @@ description = "burpwn CLI: clap subcommand tree, JSON envelope output, orchestra
 [dependencies]
 clap.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -25,6 +26,9 @@ burpwn-proxy.workspace = true
 burpwn-sandbox.workspace = true
 burpwn-wrap.workspace = true
 libc.workspace = true
+# Already in the workspace lock (a burpwn-proxy dep); used by `session auth`
+# token extraction + injection-rule building.
+regex = "1.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -20,9 +20,11 @@
 //! - [`InterceptController`] (re-exported) — the blocking-intercept primitive
 //!   M6/M7 wire CLI + MCP onto.
 
+pub mod auth;
 pub mod classify;
 pub mod decode;
 pub mod dns;
+pub mod fuzz;
 pub mod http;
 pub mod intercept;
 pub mod matchreplace;
@@ -32,6 +34,7 @@ pub mod rawtcp;
 pub mod replay;
 mod util;
 pub mod wire;
+pub mod ws;
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, RawFd};
@@ -39,7 +42,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -52,7 +54,12 @@ use burpwn_tls::{
     upstream_connector, upstream_connector_alpn, CertAuthority, LeafGenerator, PinnedHosts,
 };
 
+pub use crate::auth::AuthWatcher;
 pub use crate::classify::{Class, PrefixedStream};
+pub use crate::fuzz::{
+    run_attack, AttackMode, AttackReport, BaselineStats, FuzzConfig, FuzzResult, HttpReplaySender,
+    Position, RequestSender, SentResponse, Template,
+};
 pub use crate::http::{HttpContext, Upstream};
 pub use crate::intercept::{
     InterceptController, InterceptData, InterceptDecision, InterceptKind, InterceptScope,
@@ -94,6 +101,7 @@ pub struct Proxy {
     reader: burpwn_store::Reader,
     pinned: PinnedHosts,
     intercept: InterceptController,
+    auth: AuthWatcher,
     workspace_id: i64,
     exec_id: Option<String>,
 }
@@ -114,6 +122,7 @@ impl Proxy {
             reader,
             pinned: PinnedHosts::new(),
             intercept: InterceptController::new(),
+            auth: AuthWatcher::new(),
             workspace_id: cfg.workspace_id,
             exec_id: cfg.exec_id,
         })
@@ -122,6 +131,13 @@ impl Proxy {
     /// The intercept primitive, for CLI/MCP wiring (M6/M7).
     pub fn intercept(&self) -> InterceptController {
         self.intercept.clone()
+    }
+
+    /// The session-auth auto-refresh trigger. The daemon calls
+    /// [`AuthWatcher::activate`] on this to arm best-effort auto-refresh (the
+    /// proxy then signals 401/403 hosts for the daemon to refresh).
+    pub fn auth(&self) -> AuthWatcher {
+        self.auth.clone()
     }
 
     /// The set of hosts that rejected MITM (spliced through).
@@ -191,6 +207,7 @@ impl Proxy {
         HttpContext {
             writer: self.writer.clone(),
             intercept: self.intercept.clone(),
+            auth: self.auth.clone(),
             rules: self.rules(),
             workspace_id,
             exec_id,
@@ -202,6 +219,10 @@ impl Proxy {
             upstream: Upstream::Plain {
                 addr: SocketAddr::new(conn.dst_ip, conn.dst_port),
             },
+            // Cleartext: no TLS to describe.
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
         }
     }
 
@@ -264,6 +285,7 @@ impl Proxy {
                 let ctx = HttpContext {
                     writer: self.writer.clone(),
                     intercept: self.intercept.clone(),
+                    auth: self.auth.clone(),
                     rules: self.rules(),
                     workspace_id,
                     exec_id,
@@ -277,6 +299,10 @@ impl Proxy {
                         server_name,
                         connector,
                     },
+                    // Negotiated (downstream MITM) TLS metadata for this flow.
+                    tls_version: info.version.clone(),
+                    tls_cipher: info.cipher.clone(),
+                    tls_alpn: info.alpn.clone(),
                 };
                 if info.alpn_h2 {
                     http::serve_h2(*stream, ctx).await?;
@@ -454,7 +480,7 @@ impl Proxy {
         self: Arc<Self>,
         req: Request<Incoming>,
         client_addr: String,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<crate::http::ProxyBody> {
         let (host, port) = match req
             .uri()
             .authority()
@@ -565,17 +591,17 @@ impl Proxy {
     }
 }
 
-fn bad_request(msg: &'static str) -> Response<Full<Bytes>> {
+fn bad_request(msg: &'static str) -> Response<crate::http::ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from_static(msg.as_bytes())))
+        .body(crate::http::full_body(Bytes::from_static(msg.as_bytes())))
         .unwrap()
 }
 
-fn bad_gateway(msg: &'static str) -> Response<Full<Bytes>> {
+fn bad_gateway(msg: &'static str) -> Response<crate::http::ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(Full::new(Bytes::from_static(msg.as_bytes())))
+        .body(crate::http::full_body(Bytes::from_static(msg.as_bytes())))
         .unwrap()
 }
 

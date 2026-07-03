@@ -1,7 +1,7 @@
 //! burpwn-cli — the clap subcommand tree (doctor, init, ca, session, exec, req,
-//! intercept, match-replace, workspace/tag/note, export) with a uniform JSON
-//! envelope and the orchestration glue wiring the store, proxy, sandbox, TLS and
-//! wrap layers together.
+//! intercept, match-replace, workspace/tag/note, export, fuzz, compare,
+//! encode/decode) with a uniform JSON envelope and the orchestration glue wiring
+//! the store, proxy, sandbox, TLS and wrap layers together.
 //!
 //! # Command tree
 //!
@@ -20,6 +20,9 @@
 //!   workspace new|list|use
 //!   tag add <flow> <name> | note add <flow> <text>
 //!   export har [--workspace] [-o file] | pcap
+//!   fuzz run --flow <id> … | list | show <attack_id>   Intruder
+//!   compare <flow_a> <flow_b> [--what headers|body|all]
+//!   encode <scheme> <value> | decode <scheme> <value>
 //! ```
 //!
 //! # Session / daemon / control contract (reused by the MCP crate)
@@ -40,13 +43,18 @@
 //! The binary crate calls [`run`]; it parses argv, sets up tracing, dispatches,
 //! and returns a process exit code.
 
+pub mod auth;
 pub mod cli;
 pub mod commands;
+pub mod compare;
 pub mod control;
 pub mod daemon;
+pub mod encode;
 pub mod envelope;
 pub mod exec;
+pub mod fuzz;
 pub mod har;
+pub mod initcheck;
 pub mod paths;
 pub mod replay;
 pub mod wrap_hook;

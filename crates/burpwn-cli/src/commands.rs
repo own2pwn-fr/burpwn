@@ -58,7 +58,7 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::WrapHook { agent } => cmd_wrap_hook(paths, agent),
         Command::Proxy(args) => cmd_proxy(paths, args).await,
         Command::Ca { action } => cmd_ca(&out, paths, action),
-        Command::Session { action } => cmd_session(&out, paths, action),
+        Command::Session { action } => cmd_session(&out, paths, action).await,
         Command::Exec(args) => cmd_exec(cli.json, paths, args, None).await,
         Command::Req { action } => cmd_req(&out, paths, action).await,
         Command::Intercept { action } => cmd_intercept(&out, paths, action).await,
@@ -67,6 +67,10 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::Tag { action } => cmd_tag(&out, paths, action).await,
         Command::Note { action } => cmd_note(&out, paths, action).await,
         Command::Export { action } => cmd_export(&out, paths, action),
+        Command::Fuzz { action } => cmd_fuzz(&out, paths, action).await,
+        Command::Compare(args) => cmd_compare(&out, paths, args),
+        Command::Encode { scheme, value } => cmd_encode(&out, &scheme, &value),
+        Command::Decode { scheme, value } => cmd_decode(&out, &scheme, &value),
     }
 }
 
@@ -119,6 +123,13 @@ fn cmd_doctor(out: &Output, paths: &Paths) -> Result<i32> {
 
 fn cmd_init(out: &Output, args: InitArgs) -> Result<i32> {
     let home = dirs_home()?;
+
+    // `--check` verifies rather than installs: drive a synthetic network command
+    // through each agent's wrap-hook path and report PASS/FAIL/ADVISORY.
+    if args.check {
+        return cmd_init_check(out, &home, args.agent.as_deref());
+    }
+
     let cfg = WrapConfig::load(&WrapConfig::default_path().unwrap_or_default()).unwrap_or_default();
     let mut reports = Vec::new();
 
@@ -149,6 +160,65 @@ fn cmd_init(out: &Output, args: InitArgs) -> Result<i32> {
     let human = format!("installed {} hook(s)", reports.len());
     out.ok(human, json!({ "installed": reports }));
     Ok(0)
+}
+
+/// `init --check`: verify each target agent's hook actually rewrites a synthetic
+/// network command through `burpwn exec`. Exits non-zero if any rewrite-capable
+/// agent FAILs.
+fn cmd_init_check(out: &Output, home: &std::path::Path, agent: Option<&str>) -> Result<i32> {
+    use crate::initcheck::{any_failure, check_agents, Verdict};
+
+    // Target agents: an explicit --agent, else the detected/installed ones, else
+    // ALL known agents (so the check is still informative on a clean box).
+    let agents = match agent {
+        Some(slug) => vec![Agent::from_slug(slug)
+            .ok_or_else(|| anyhow!("unknown agent: {slug:?} (try claude, cursor, gemini, …)"))?],
+        None => {
+            let detected = burpwn_wrap::detect_present(home);
+            if detected.is_empty() {
+                Agent::all().to_vec()
+            } else {
+                detected
+            }
+        }
+    };
+
+    let reports = check_agents(&agents);
+    let failed = any_failure(&reports);
+
+    let data: Vec<Value> = reports
+        .iter()
+        .map(|r| {
+            json!({
+                "agent": r.agent,
+                "verdict": r.verdict.as_str(),
+                "detail": r.detail,
+                "rewritten": r.rewritten,
+            })
+        })
+        .collect();
+
+    if out.json {
+        println!(
+            "{}",
+            Envelope::ok(json!({ "checks": data, "ok": !failed })).to_json_line()
+        );
+    } else {
+        for r in &reports {
+            let mark = match r.verdict {
+                Verdict::Pass => "PASS",
+                Verdict::Fail => "FAIL",
+                Verdict::Advisory => "ADVISORY",
+            };
+            println!("  {mark:<8} {:<12} {}", r.agent, r.detail);
+        }
+        if failed {
+            println!("=> FAIL: at least one agent does not rewrite commands through `burpwn exec`");
+        } else {
+            println!("=> ok");
+        }
+    }
+    Ok(if failed { 1 } else { 0 })
 }
 
 fn install_global_hook(
@@ -239,7 +309,7 @@ fn cmd_ca(out: &Output, paths: &Paths, action: CaAction) -> Result<i32> {
 
 // --- session ---------------------------------------------------------------
 
-fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Result<i32> {
+async fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Result<i32> {
     match action {
         SessionAction::New { name } => {
             let name = name.unwrap_or_else(|| DEFAULT_SESSION.to_string());
@@ -300,7 +370,194 @@ fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Result<i32
             );
             Ok(0)
         }
+        SessionAction::Stats { session } => cmd_session_stats(out, paths, session),
+        SessionAction::Auth { action } => cmd_session_auth(out, paths, action).await,
     }
+}
+
+// --- session stats (capture-completeness telemetry) ------------------------
+
+fn cmd_session_stats(out: &Output, paths: &Paths, session: Option<String>) -> Result<i32> {
+    let session = session.unwrap_or_else(|| paths.active_session());
+    validate_session_name(&session)?;
+    let store = open_store(paths, &session)?;
+    let reader = store.reader();
+    let stats = reader.exec_stats()?;
+    // The execs that escaped capture (network-facing, zero flows) — the actionable
+    // list an operator wants to see.
+    let escaped: Vec<Value> = reader
+        .exec_records()?
+        .into_iter()
+        .filter(|e| e.network_facing && e.flow_count == 0)
+        .map(|e| json!({ "exec_id": e.exec_id, "cmd": e.cmd }))
+        .collect();
+
+    if out.json {
+        println!(
+            "{}",
+            Envelope::ok(json!({
+                "session": session,
+                "total_execs": stats.total_execs,
+                "total_flows": stats.total_flows,
+                "network_execs": stats.network_execs,
+                "network_zero_flow_execs": stats.network_zero_flow_execs,
+                "escaped_execs": escaped,
+            }))
+            .to_json_line()
+        );
+    } else {
+        println!("session {session}:");
+        println!("  execs recorded        : {}", stats.total_execs);
+        println!("  flows captured        : {}", stats.total_flows);
+        println!("  network-facing execs  : {}", stats.network_execs);
+        println!(
+            "  network execs w/ ZERO captures : {}",
+            stats.network_zero_flow_execs
+        );
+        if !escaped.is_empty() {
+            println!("  ⚠ traffic likely escaped capture for:");
+            for e in &escaped {
+                println!("      {}", e["cmd"].as_str().unwrap_or("-"));
+            }
+            println!("    (run `burpwn init --check` to verify the agent hook)");
+        }
+    }
+    Ok(0)
+}
+
+// --- session auth ----------------------------------------------------------
+
+async fn cmd_session_auth(out: &Output, paths: &Paths, action: SessionAuthAction) -> Result<i32> {
+    match action {
+        SessionAuthAction::Set(args) => {
+            let session = args.session.unwrap_or_else(|| paths.active_session());
+            validate_session_name(&session)?;
+            paths.ensure_session_dir(&session)?;
+            let store = open_store(paths, &session)?;
+            let host = args.host.clone().unwrap_or_default();
+            let id = crate::auth::auth_set(&store, &host, &args.login, &args.extract, &args.header)
+                .await?;
+            out.ok(
+                format!(
+                    "auth profile {id} set for {}",
+                    if host.is_empty() { "all hosts" } else { &host }
+                ),
+                json!({ "id": id, "host": host }),
+            );
+            Ok(0)
+        }
+        SessionAuthAction::Status { session } => {
+            let session = session.unwrap_or_else(|| paths.active_session());
+            validate_session_name(&session)?;
+            let store = open_store(paths, &session)?;
+            let profiles = store.reader().auth_profiles()?;
+            let view: Vec<Value> = profiles
+                .iter()
+                .map(|p| {
+                    json!({
+                        "id": p.id,
+                        "host": p.host,
+                        "login_cmd": p.login_cmd,
+                        "header_template": p.header_template,
+                        "token_set": p.token.is_some(),
+                        "token": p.token.as_deref().map(crate::auth::mask_token),
+                        "rule_id": p.rule_id,
+                    })
+                })
+                .collect();
+            if out.json {
+                println!(
+                    "{}",
+                    Envelope::ok(json!({ "profiles": view })).to_json_line()
+                );
+            } else if profiles.is_empty() {
+                println!("(no auth profiles)");
+            } else {
+                for p in &profiles {
+                    let scope = if p.host.is_empty() { "*" } else { &p.host };
+                    let tok = match &p.token {
+                        Some(t) => crate::auth::mask_token(t),
+                        None => "(none)".into(),
+                    };
+                    println!(
+                        "  {:>3} {:<24} header={:?} token={tok}",
+                        p.id, scope, p.header_template
+                    );
+                }
+            }
+            Ok(0)
+        }
+        SessionAuthAction::Refresh { host, session } => {
+            cmd_session_auth_refresh(out, paths, host, session).await
+        }
+    }
+}
+
+/// `session auth refresh`: for each matching profile, run its login command in
+/// the sandbox, extract a fresh token, and (re)install its injection rule.
+async fn cmd_session_auth_refresh(
+    out: &Output,
+    paths: &Paths,
+    host: Option<String>,
+    session: Option<String>,
+) -> Result<i32> {
+    use crate::auth::{apply_refresh, extract_token, run_login, HeaderTemplate};
+
+    let session = session.unwrap_or_else(|| paths.active_session());
+    validate_session_name(&session)?;
+    paths.ensure_session_dir(&session)?;
+    let store = open_store(paths, &session)?;
+
+    // Select the profiles to refresh: an exact-host match, or all profiles.
+    let all = store.reader().auth_profiles()?;
+    let targets: Vec<_> = match &host {
+        Some(h) => all.into_iter().filter(|p| &p.host == h).collect(),
+        None => all,
+    };
+    if targets.is_empty() {
+        bail!("no matching auth profile (set one with `session auth set`)");
+    }
+
+    // The login command routes through the session's proxy, so ensure it is up.
+    ensure_daemon(paths, &session).await?;
+
+    let mut results = Vec::new();
+    for profile in &targets {
+        let template = HeaderTemplate::parse(&profile.header_template)?;
+        let output = run_login(paths, &session, &profile.login_cmd, None).await?;
+        let token = extract_token(&profile.extract_regex, &output)?;
+        let rule_id = apply_refresh(
+            &store,
+            &profile.host,
+            &template,
+            &token,
+            profile.rule_id,
+            now_millis(),
+        )
+        .await?;
+        results.push(json!({
+            "host": profile.host,
+            "rule_id": rule_id,
+            "token": crate::auth::mask_token(&token),
+        }));
+    }
+
+    if out.json {
+        println!(
+            "{}",
+            Envelope::ok(json!({ "refreshed": results })).to_json_line()
+        );
+    } else {
+        for r in &results {
+            println!(
+                "refreshed auth for {} (rule {}, token {})",
+                r["host"].as_str().unwrap_or("*"),
+                r["rule_id"],
+                r["token"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(0)
 }
 
 // --- exec ------------------------------------------------------------------
@@ -537,6 +794,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
         port: args.port,
         limit: args.limit,
         offset: args.offset,
+        ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
     if out.json {
@@ -689,12 +947,6 @@ async fn req_replay(
     args: ReqReplayArgs,
 ) -> Result<i32> {
     let store = open_store(paths, session)?;
-    let Some(detail) = store.reader().get_flow(args.id)? else {
-        bail!("no such flow: {}", args.id);
-    };
-    let Some(base) = detail.request.clone() else {
-        bail!("flow {} has no recorded request to replay", args.id);
-    };
 
     let mut headers = Vec::new();
     for spec in &args.set_header {
@@ -714,8 +966,8 @@ async fn req_replay(
         None => None,
     };
 
-    let req = replay::apply_edits(base, args.method.as_deref(), &headers, body);
-    let result = replay::replay(&detail, &req).await?;
+    let result =
+        replay::replay_flow(&store, args.id, args.method.as_deref(), &headers, body).await?;
 
     if out.json {
         println!(
@@ -757,6 +1009,23 @@ async fn cmd_intercept(out: &Output, paths: &Paths, action: InterceptAction) -> 
             client.intercept_forward(id, edits).await?
         }
         InterceptAction::Drop { id } => client.intercept_drop(id).await?,
+        InterceptAction::Scope {
+            pattern,
+            path,
+            method,
+            clear,
+        } => {
+            let (host, path, method) = if clear {
+                (String::new(), String::new(), String::new())
+            } else {
+                (
+                    pattern.unwrap_or_default(),
+                    path.unwrap_or_default(),
+                    method.unwrap_or_default(),
+                )
+            };
+            client.intercept_set_scope(host, path, method).await?
+        }
     };
 
     render_control(out, resp);
@@ -1079,6 +1348,208 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
     }
 }
 
+// --- fuzz (Intruder) --------------------------------------------------------
+
+async fn cmd_fuzz(out: &Output, paths: &Paths, action: FuzzAction) -> Result<i32> {
+    let session = paths.active_session();
+    match action {
+        FuzzAction::Run(args) => cmd_fuzz_run(out, paths, &session, args).await,
+        FuzzAction::List { workspace } => {
+            let v = crate::fuzz::fuzz_list(paths, &session, workspace.as_deref())?;
+            if out.json {
+                println!("{}", Envelope::ok(v).to_json_line());
+            } else {
+                let empty = Vec::new();
+                let rows = v["attacks"].as_array().unwrap_or(&empty);
+                if rows.is_empty() {
+                    println!("(no attacks)");
+                }
+                for a in rows {
+                    println!(
+                        "{:>4} [{}] {} (flow {}, {} results)",
+                        a["id"].as_i64().unwrap_or(0),
+                        a["status"].as_str().unwrap_or("-"),
+                        a["name"].as_str().unwrap_or("-"),
+                        a["base_flow_id"],
+                        a["results"].as_i64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(0)
+        }
+        FuzzAction::Show {
+            attack_id,
+            sort,
+            limit,
+        } => {
+            let sort = crate::fuzz::ResultSort::from_str_opt(&sort)
+                .ok_or_else(|| anyhow!("--sort must be anomaly|status|len, got {sort:?}"))?;
+            let v = crate::fuzz::fuzz_show(paths, &session, attack_id, sort, limit)?;
+            if out.json {
+                println!("{}", Envelope::ok(v).to_json_line());
+            } else {
+                let empty = Vec::new();
+                let rows = v["results"].as_array().unwrap_or(&empty);
+                if rows.is_empty() {
+                    println!("(no results)");
+                }
+                for r in rows {
+                    println!(
+                        "{:>4}  {:>3}  len {:>6}  {:>5}ms  anomaly {:.3}  {}",
+                        r["id"].as_i64().unwrap_or(0),
+                        r["status_code"],
+                        r["resp_len"],
+                        r["latency_ms"],
+                        r["anomaly_score"].as_f64().unwrap_or(0.0),
+                        r["payload"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+async fn cmd_fuzz_run(
+    out: &Output,
+    paths: &Paths,
+    session: &str,
+    args: FuzzRunArgs,
+) -> Result<i32> {
+    use burpwn_proxy::AttackMode;
+    use tokio_util::sync::CancellationToken;
+
+    let mode = AttackMode::from_str_opt(&args.mode)
+        .ok_or_else(|| anyhow!("--mode must be sniper|battering-ram|pitchfork|cluster-bomb"))?;
+
+    // Positions.
+    let mut positions = Vec::new();
+    for spec in &args.position {
+        positions.push(crate::fuzz::parse_position(spec)?);
+    }
+
+    // Payloads: inline --payload plus --payloads file (one per line).
+    let mut payloads: Vec<Vec<u8>> = args.payload.iter().map(|p| p.clone().into_bytes()).collect();
+    if let Some(file) = &args.payloads {
+        let data = std::fs::read_to_string(file)
+            .map_err(|e| anyhow!("reading --payloads file failed: {}", e.kind()))?;
+        for line in data.lines() {
+            payloads.push(line.as_bytes().to_vec());
+        }
+    }
+
+    let request_bytes = match &args.request {
+        Some(file) => Some(
+            std::fs::read(file)
+                .map_err(|e| anyhow!("reading --request file failed: {}", e.kind()))?,
+        ),
+        None => None,
+    };
+
+    let spec = crate::fuzz::FuzzSpec {
+        flow_id: args.flow,
+        request_bytes,
+        positions,
+        marker: args.marker.map(|m| m.into_bytes()),
+        payloads,
+        mode,
+        concurrency: args.concurrency,
+        delay_ms: args.delay,
+        name: args.name,
+    };
+
+    // Cancel the run on Ctrl-C.
+    let cancel = CancellationToken::new();
+    let cancel_bg = cancel.clone();
+    let sig = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_bg.cancel();
+        }
+    });
+
+    let result = crate::fuzz::fuzz_run(paths, session, spec, cancel).await;
+    sig.abort();
+    let v = result?;
+
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else {
+        println!(
+            "attack {} ({}): {} results, status {}",
+            v["attack_id"].as_i64().unwrap_or(0),
+            v["mode"].as_str().unwrap_or("-"),
+            v["results"].as_array().map(|a| a.len()).unwrap_or(0),
+            v["status"].as_str().unwrap_or("-"),
+        );
+        if let Some(b) = v["baseline"].as_object() {
+            println!(
+                "  baseline: status {} len {}",
+                b["status"], b["resp_len"]
+            );
+        }
+        let empty = Vec::new();
+        for r in v["results"].as_array().unwrap_or(&empty) {
+            println!(
+                "  {:>4}  {:>3}  len {:>6}  {:>5}ms  anomaly {:.3}  {}",
+                r["index"].as_i64().unwrap_or(0),
+                r["status"],
+                r["resp_len"],
+                r["latency_ms"],
+                r["anomaly"].as_f64().unwrap_or(0.0),
+                r["payloads"],
+            );
+        }
+    }
+    Ok(0)
+}
+
+// --- compare ----------------------------------------------------------------
+
+fn cmd_compare(out: &Output, paths: &Paths, args: CompareArgs) -> Result<i32> {
+    let session = paths.active_session();
+    let store = open_store(paths, &session)?;
+    let reader = store.reader();
+    let Some(a) = reader.get_flow(args.flow_a)? else {
+        bail!("no such flow: {}", args.flow_a);
+    };
+    let Some(b) = reader.get_flow(args.flow_b)? else {
+        bail!("no such flow: {}", args.flow_b);
+    };
+    let what = crate::compare::CompareWhat::from_str_opt(&args.what)
+        .ok_or_else(|| anyhow!("--what must be headers|body|all, got {:?}", args.what))?;
+    let v = crate::compare::diff_flows(&a, &b, what);
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    }
+    Ok(0)
+}
+
+// --- encode / decode --------------------------------------------------------
+
+fn cmd_encode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
+    let v = crate::encode::encode(scheme, value)?;
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else {
+        println!("{}", v["encoded"].as_str().unwrap_or(""));
+    }
+    Ok(0)
+}
+
+fn cmd_decode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
+    let v = crate::encode::decode(scheme, value)?;
+    if out.json {
+        println!("{}", Envelope::ok(v).to_json_line());
+    } else if scheme.eq_ignore_ascii_case("jwt") {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("{}", v["decoded"].as_str().unwrap_or(""));
+    }
+    Ok(0)
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dirs_home() -> Result<std::path::PathBuf> {
@@ -1383,6 +1854,7 @@ mod tests {
                 name: Some("work".into()),
             },
         )
+        .await
         .unwrap();
         assert!(paths.session_exists("work"));
         assert_eq!(paths.active_session(), "work");
@@ -1394,6 +1866,7 @@ mod tests {
                 name: Some("scratch".into()),
             },
         )
+        .await
         .unwrap();
         assert_eq!(paths.list_sessions(), vec!["scratch", "work"]);
 
@@ -1404,6 +1877,7 @@ mod tests {
                 name: "scratch".into(),
             },
         )
+        .await
         .unwrap();
         assert_eq!(paths.active_session(), "scratch");
 
@@ -1414,6 +1888,7 @@ mod tests {
                 name: "scratch".into(),
             },
         )
+        .await
         .unwrap();
         assert!(!paths.session_exists("scratch"));
         // active pointer reset to default after removing the active session.
