@@ -365,6 +365,39 @@ impl WriteHandle {
         recv_ack(rx).await
     }
 
+    /// Enqueue a response from a SYNCHRONOUS context that can neither `.await` nor
+    /// rely on a running Tokio runtime — specifically the streaming response
+    /// [`Body`]/`Drop` path, which fires at connection/exec teardown. A detached
+    /// `tokio::spawn` there is unsafe: it is cancelled (or panics for lack of a
+    /// runtime) before its channel send lands, silently dropping the response row.
+    /// A non-blocking `try_send` onto the persistent writer channel avoids that
+    /// entirely. Returns `false` only if the channel is full/closed (rare, given
+    /// [`DEFAULT_CHANNEL_CAP`]) so the caller can log the drop.
+    #[must_use]
+    pub fn response_sync(&self, flow_id: i64, data: ResponseData) -> bool {
+        self.tx
+            .try_send(WriteOp::Response {
+                flow_id,
+                data,
+                reply: None,
+            })
+            .is_ok()
+    }
+
+    /// Mark a flow finished from a synchronous context (companion to
+    /// [`WriteHandle::response_sync`]). Non-blocking; returns `false` on a
+    /// full/closed channel.
+    #[must_use]
+    pub fn flow_end_sync(&self, flow_id: i64, ts_end: i64) -> bool {
+        self.tx
+            .try_send(WriteOp::FlowEnd {
+                flow_id,
+                ts_end,
+                reply: None,
+            })
+            .is_ok()
+    }
+
     /// Fire-and-forget request (no ack) — for the absolute hot path.
     pub async fn request_nowait(&self, flow_id: i64, data: RequestData) -> Result<()> {
         self.send(WriteOp::Request {

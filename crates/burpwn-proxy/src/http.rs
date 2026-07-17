@@ -623,27 +623,37 @@ struct TeeBody {
 
 impl TeeBody {
     /// Persist the captured response exactly once (idempotent).
+    ///
+    /// This runs from `poll_frame` (stream end) OR `drop` (downstream disconnect /
+    /// connection teardown). The drop can happen outside a Tokio runtime context —
+    /// notably for H2, where hyper drops the response body as the connection winds
+    /// down — so a detached `tokio::spawn` here would be cancelled (or panic for lack
+    /// of a runtime) before its channel send lands, silently losing the response row
+    /// (the request, DNS and buffered-HTTP writes all await inline and survive; only
+    /// this streaming path spawned). Enqueue synchronously onto the persistent writer
+    /// channel instead — `try_send` needs neither `.await` nor a runtime.
     fn finish(&mut self) {
         let Some(state) = self.state.take() else {
             return;
         };
-        tokio::spawn(async move {
-            let timing = state.started.elapsed().as_millis() as i64;
-            let _ = state
-                .writer
-                .response(
-                    state.flow_id,
-                    ResponseData {
-                        status: state.status,
-                        http_version: state.http_version,
-                        headers: state.headers,
-                        body: state.captured,
-                        timing_ms: Some(timing),
-                    },
-                )
-                .await;
-            let _ = state.writer.flow_end(state.flow_id, now_millis()).await;
-        });
+        let timing = state.started.elapsed().as_millis() as i64;
+        let ok = state.writer.response_sync(
+            state.flow_id,
+            ResponseData {
+                status: state.status,
+                http_version: state.http_version,
+                headers: state.headers,
+                body: state.captured,
+                timing_ms: Some(timing),
+            },
+        );
+        if !ok {
+            tracing::warn!(
+                flow_id = state.flow_id,
+                "streaming response write dropped (writer channel full/closed)"
+            );
+        }
+        let _ = state.writer.flow_end_sync(state.flow_id, now_millis());
     }
 }
 
