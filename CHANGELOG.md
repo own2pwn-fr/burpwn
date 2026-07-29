@@ -3,7 +3,7 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-29
 
 ### Added — every error is coded, actionable, and leaves a debug report
 - **New crate `burpwn-error`**: the error contract. A catalogue of 41 stable
