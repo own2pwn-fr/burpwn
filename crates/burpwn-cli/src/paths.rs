@@ -25,9 +25,10 @@
 //! `<config_dir>/burpwn/config.toml` (XDG config), holding the `[wrap]` table
 //! consumed by [`burpwn_wrap::WrapConfig`].
 
+use burpwn_error::ErrorCode;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 /// The default active-session name when `current` is absent.
 pub const DEFAULT_SESSION: &str = "default";
@@ -46,9 +47,19 @@ pub struct Paths {
 impl Paths {
     /// Resolve the real per-user layout from XDG / `directories`.
     pub fn resolve() -> Result<Self> {
-        let base = data_base().ok_or_else(|| anyhow!("cannot determine a data directory"))?;
+        let base = data_base().ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::SessionNoDataDir,
+                "cannot determine a data directory"
+            )
+        })?;
         let runtime = runtime_base().unwrap_or_else(|| base.join("run"));
-        let config = config_base().ok_or_else(|| anyhow!("cannot determine a config directory"))?;
+        let config = config_base().ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::SessionNoDataDir,
+                "cannot determine a config directory"
+            )
+        })?;
         Ok(Self {
             base,
             runtime,
@@ -94,6 +105,15 @@ impl Paths {
     /// The sessions root (`<base>/sessions`).
     pub fn sessions_dir(&self) -> PathBuf {
         self.base.join("sessions")
+    }
+
+    /// Where automatic debug reports are written (`<base>/debug`).
+    ///
+    /// Under the DATA dir, not the runtime dir, on purpose: a report about a
+    /// crash is worth keeping across reboots — that is when someone gets round
+    /// to filing the issue.
+    pub fn debug_dir(&self) -> PathBuf {
+        self.base.join("debug")
     }
 
     /// A specific session's directory (`<base>/sessions/<name>`).
@@ -169,7 +189,11 @@ impl Paths {
         let meta = std::fs::symlink_metadata(&dir)
             .with_context(|| format!("stat runtime dir {}", dir.display()))?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
-            anyhow::bail!("runtime dir {} is not a regular directory", dir.display());
+            crate::fail!(
+                ErrorCode::DaemonRuntimeDir,
+                "runtime dir {} is not a regular directory",
+                dir.display()
+            );
         }
         // `recursive(true)` only sets the mode on directories it newly created;
         // if the dir already existed with looser perms (e.g. created before this
@@ -250,7 +274,10 @@ pub fn validate_session_name(name: &str) -> Result<()> {
         || name.contains('\\')
         || name.contains('\0')
     {
-        return Err(anyhow!("invalid session name: {name:?}"));
+        return Err(crate::coded!(
+            ErrorCode::SessionInvalidName,
+            "invalid session name: {name:?}"
+        ));
     }
     Ok(())
 }

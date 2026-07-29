@@ -14,11 +14,12 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use burpwn_cli::control::{ControlClient, Edits, HeaderEdit};
 use burpwn_cli::paths::Paths;
+use burpwn_error::ErrorCode;
 use burpwn_store::model::{FlowDetail, FlowFilter, MatchKind, NewMatchReplaceRule, Protocol};
 use burpwn_store::Store;
 
@@ -142,7 +143,11 @@ pub fn req_show(
     let store = open_store(paths, session)?;
     match store.reader().get_flow(params.id)? {
         Some(detail) => Ok(flow_detail_json(&detail, params.raw)),
-        None => Err(anyhow!("no such flow: {}", params.id)),
+        None => Err(burpwn_cli::coded!(
+            ErrorCode::InputNoSuchFlow,
+            "no such flow: {}",
+            params.id
+        )),
     }
 }
 
@@ -245,7 +250,8 @@ pub async fn workspace_new(
 async fn connect_control(paths: &Paths, session: &str) -> Result<ControlClient> {
     let sock = paths.control_sock(session);
     ControlClient::connect(&sock).await.map_err(|_| {
-        anyhow!(
+        burpwn_cli::coded!(
+            ErrorCode::DaemonUnreachable,
             "no burpwn proxy daemon answering on {} for session '{session}'. \
              Start it by running a command through the sandbox, e.g. the `exec` tool \
              or `burpwn exec -- <cmd>`, which spawns the daemon.",
@@ -279,7 +285,10 @@ fn control_value(resp: burpwn_cli::control::ControlResponse) -> Result<Value> {
             None => Ok(json!({ "pending": false })),
         },
         R::Resolved { found } => Ok(json!({ "found": found })),
-        R::Error { message } => Err(anyhow!("daemon error: {message}")),
+        R::Error { message } => Err(burpwn_cli::coded!(
+            ErrorCode::DaemonRejected,
+            "daemon error: {message}"
+        )),
     }
 }
 
@@ -406,8 +415,12 @@ pub async fn fuzz_run(
     use burpwn_proxy::AttackMode;
     use tokio_util::sync::CancellationToken;
 
-    let mode = AttackMode::from_str_opt(&params.mode)
-        .ok_or_else(|| anyhow!("mode must be sniper|battering-ram|pitchfork|cluster-bomb"))?;
+    let mode = AttackMode::from_str_opt(&params.mode).ok_or_else(|| {
+        burpwn_cli::coded!(
+            ErrorCode::InputInvalidValue,
+            "mode must be sniper|battering-ram|pitchfork|cluster-bomb"
+        )
+    })?;
     let mut positions = Vec::new();
     for spec in &params.positions {
         positions.push(burpwn_cli::fuzz::parse_position(spec)?);
@@ -448,8 +461,12 @@ pub fn fuzz_results(
     params: &crate::params::FuzzResultsParams,
 ) -> Result<Value> {
     let sort = match &params.sort {
-        Some(s) => burpwn_cli::fuzz::ResultSort::from_str_opt(s)
-            .ok_or_else(|| anyhow!("sort must be anomaly|status|len, got {s:?}"))?,
+        Some(s) => burpwn_cli::fuzz::ResultSort::from_str_opt(s).ok_or_else(|| {
+            burpwn_cli::coded!(
+                ErrorCode::InputInvalidValue,
+                "sort must be anomaly|status|len, got {s:?}"
+            )
+        })?,
         None => burpwn_cli::fuzz::ResultSort::Anomaly,
     };
     burpwn_cli::fuzz::fuzz_show(paths, session, params.attack_id, sort, params.limit)
@@ -465,15 +482,27 @@ pub fn compare(
 ) -> Result<Value> {
     let store = open_store(paths, session)?;
     let reader = store.reader();
-    let a = reader
-        .get_flow(params.flow_a)?
-        .ok_or_else(|| anyhow!("no such flow: {}", params.flow_a))?;
-    let b = reader
-        .get_flow(params.flow_b)?
-        .ok_or_else(|| anyhow!("no such flow: {}", params.flow_b))?;
+    let a = reader.get_flow(params.flow_a)?.ok_or_else(|| {
+        burpwn_cli::coded!(
+            ErrorCode::InputNoSuchFlow,
+            "no such flow: {}",
+            params.flow_a
+        )
+    })?;
+    let b = reader.get_flow(params.flow_b)?.ok_or_else(|| {
+        burpwn_cli::coded!(
+            ErrorCode::InputNoSuchFlow,
+            "no such flow: {}",
+            params.flow_b
+        )
+    })?;
     let what = match &params.what {
-        Some(w) => burpwn_cli::compare::CompareWhat::from_str_opt(w)
-            .ok_or_else(|| anyhow!("what must be headers|body|all, got {w:?}"))?,
+        Some(w) => burpwn_cli::compare::CompareWhat::from_str_opt(w).ok_or_else(|| {
+            burpwn_cli::coded!(
+                ErrorCode::InputInvalidValue,
+                "what must be headers|body|all, got {w:?}"
+            )
+        })?,
         None => burpwn_cli::compare::CompareWhat::All,
     };
     Ok(burpwn_cli::compare::diff_flows(&a, &b, what))
@@ -602,11 +631,13 @@ async fn run_burpwn_json(args: &[String]) -> Result<Value> {
         Some(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
             Ok(v.get("data").cloned().unwrap_or_else(|| json!({})))
         }
-        Some(v) => Err(anyhow!(
+        Some(v) => Err(burpwn_cli::coded!(
+            ErrorCode::Internal,
             "burpwn command failed: {}",
             v.get("error").and_then(Value::as_str).unwrap_or("unknown")
         )),
-        None => Err(anyhow!(
+        None => Err(burpwn_cli::coded!(
+            ErrorCode::Internal,
             "burpwn produced no JSON envelope (exit {:?})",
             output.status.code()
         )),
@@ -639,7 +670,10 @@ pub async fn run_exec(session: &str, params: &crate::params::ExecParams) -> Resu
     use tokio::io::AsyncReadExt;
 
     if params.argv.is_empty() {
-        return Err(anyhow!("exec: argv must not be empty"));
+        return Err(burpwn_cli::coded!(
+            ErrorCode::InputNothingToDo,
+            "exec: argv must not be empty"
+        ));
     }
 
     let exe = std::env::current_exe().context("locating the burpwn executable")?;
@@ -755,10 +789,14 @@ pub async fn run_exec(session: &str, params: &crate::params::ExecParams) -> Resu
             .and_then(Value::as_str)
             .or_else(|| env.get("message").and_then(Value::as_str))
             .unwrap_or("burpwn exec failed");
-        return Err(anyhow!("exec failed: {msg}"));
+        return Err(burpwn_cli::coded!(
+            ErrorCode::Internal,
+            "exec failed: {msg}"
+        ));
     }
 
-    Err(anyhow!(
+    Err(burpwn_cli::coded!(
+        ErrorCode::Internal,
         "burpwn exec produced no JSON envelope (exit status {:?}); stderr/stdout were inherited",
         status.code()
     ))

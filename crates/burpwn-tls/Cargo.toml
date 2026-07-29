@@ -9,6 +9,7 @@ repository.workspace = true
 description = "burpwn TLS-MITM: per-install CA, on-the-fly leaf certs, passthrough fallback"
 
 [dependencies]
+burpwn-error.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true

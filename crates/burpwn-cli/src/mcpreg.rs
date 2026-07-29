@@ -138,6 +138,14 @@ pub enum McpRegError {
     Io(#[from] std::io::Error),
 }
 
+impl burpwn_error::Coded for McpRegError {
+    fn code(&self) -> burpwn_error::ErrorCode {
+        match self {
+            McpRegError::Io(_) => burpwn_error::ErrorCode::InputFileUnreadable,
+        }
+    }
+}
+
 /// The desired JSON server object for a JSON host.
 fn json_server(slug: &str) -> Value {
     match slug {

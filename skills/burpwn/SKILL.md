@@ -38,6 +38,13 @@ If `burpwn doctor` fails (missing namespaces/`bwrap`/`nft`, or a kernel that can
 create the sandbox — e.g. WSL), fix that before
 starting remote work rather than silently falling back to un-captured commands.
 
+**When a burpwn command fails**, do not retry blindly: the error carries a stable
+code and remediation. In `--json` / MCP, read `diagnostic.code` and
+`diagnostic.remediation`; a `BW-SANDBOX-*` code means the sandbox could not be
+created, so nothing was captured (fix the host, do not fall back to un-wrapped
+commands). Each failure also writes a debug report whose path is in the message —
+attach it when reporting a problem, or read it with `burpwn debug show`.
+
 **Confirm capture is actually working** (traffic silently escaping the sandbox is
 the worst failure — you think you have evidence and you don't):
 

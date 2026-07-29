@@ -22,6 +22,7 @@ async-trait.workspace = true
 burpwn-store.workspace = true
 burpwn-proxy.workspace = true
 burpwn-cli.workspace = true
+burpwn-error.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

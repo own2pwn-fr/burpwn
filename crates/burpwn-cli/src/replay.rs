@@ -12,8 +12,9 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 
+use burpwn_error::ErrorCode;
 use burpwn_store::model::{FlowDetail, RequestData};
 use burpwn_store::Store;
 
@@ -40,10 +41,18 @@ pub fn parse_header_spec(spec: &str) -> Result<ReplayEdit> {
     let (name, value) = spec
         .split_once(':')
         .or_else(|| spec.split_once('='))
-        .ok_or_else(|| anyhow!("header must be `Name: value` or `Name=value`: {spec:?}"))?;
+        .ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::InputMalformedHeader,
+                "header must be `Name: value` or `Name=value`: {spec:?}"
+            )
+        })?;
     let name = name.trim();
     if name.is_empty() {
-        bail!("empty header name in {spec:?}");
+        crate::fail!(
+            ErrorCode::InputMalformedHeader,
+            "empty header name in {spec:?}"
+        );
     }
     let value = value.trim();
     // Reject CRLF / NUL injection: a `\r`/`\n` in name or value would smuggle
@@ -57,7 +66,10 @@ pub fn parse_header_spec(spec: &str) -> Result<ReplayEdit> {
         || value.contains('\n')
         || value.contains('\0')
     {
-        bail!("header name/value must not contain CR, LF or NUL: {spec:?}");
+        crate::fail!(
+            ErrorCode::InputMalformedHeader,
+            "header name/value must not contain CR, LF or NUL: {spec:?}"
+        );
     }
     Ok(ReplayEdit {
         name: name.to_string(),
@@ -171,7 +183,11 @@ pub async fn replay(detail: &FlowDetail, req: &RequestData) -> Result<ReplayResu
     let addr = dst_addr(detail)?;
     let host = replay_host(detail, req);
     if host.is_empty() {
-        bail!("flow {} has no host to replay to", detail.flow.id);
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "flow {} has no host to replay to",
+            detail.flow.id
+        );
     }
     let headers = parse_request_headers(&req.headers);
 
@@ -186,7 +202,13 @@ pub async fn replay(detail: &FlowDetail, req: &RequestData) -> Result<ReplayResu
         req.body.clone(),
     )
     .await
-    .map_err(|e| anyhow!("replay of flow {} failed: {e}", detail.flow.id))?;
+    .map_err(|e| {
+        crate::coded!(
+            ErrorCode::NetworkReplayFailed,
+            "replay of flow {} failed: {e}",
+            detail.flow.id
+        )
+    })?;
 
     let raw_response = render_response(&resp);
     Ok(ReplayResult {
@@ -206,10 +228,13 @@ pub async fn replay_flow(
     body: Option<Vec<u8>>,
 ) -> Result<ReplayResult> {
     let Some(detail) = store.reader().get_flow(id)? else {
-        bail!("no such flow: {id}");
+        crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {id}");
     };
     let Some(base) = detail.request.clone() else {
-        bail!("flow {id} has no recorded request to replay");
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "flow {id} has no recorded request to replay"
+        );
     };
     let req = apply_edits(base, method, headers, body);
     replay(&detail, &req).await

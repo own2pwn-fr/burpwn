@@ -24,6 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use burpwn_error::ErrorCode;
 use burpwn_proxy::intercept::{
     InterceptController, InterceptData, InterceptDecision, InterceptKind, InterceptScope,
     PendingIntercept,
@@ -280,7 +281,8 @@ pub async fn serve_control(state: ControlState, sock: impl AsRef<Path>) -> Resul
         match UnixStream::connect(sock).await {
             Ok(_) => {
                 // Something is already listening here: refuse to clobber it.
-                anyhow::bail!(
+                crate::fail!(
+                    ErrorCode::DaemonRejected,
                     "control socket {} is already served by a live daemon",
                     sock.display()
                 );

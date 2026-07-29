@@ -34,9 +34,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use regex::Regex;
 
+use burpwn_error::ErrorCode;
 use burpwn_sandbox::{doctor, RootlessRuntime, SandboxRuntime};
 use burpwn_store::model::{MatchKind, NewAuthProfile, NewMatchReplaceRule};
 use burpwn_store::Store;
@@ -60,23 +61,35 @@ impl HeaderTemplate {
     /// Parse a `Name: <prefix> {} <suffix>` template. The value part MUST contain
     /// the `{}` placeholder (else the token would never be injected).
     pub fn parse(header: &str) -> Result<Self> {
-        let (name, value) = header
-            .split_once(':')
-            .ok_or_else(|| anyhow!("--header must be `Name: value` with a {{}} placeholder"))?;
+        let (name, value) = header.split_once(':').ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::InputMalformedHeader,
+                "--header must be `Name: value` with a {{}} placeholder"
+            )
+        })?;
         let name = name.trim();
         let value_template = value.trim();
         if name.is_empty() {
-            bail!("--header has an empty header name: {header:?}");
+            crate::fail!(
+                ErrorCode::InputMalformedHeader,
+                "--header has an empty header name: {header:?}"
+            );
         }
         if !value_template.contains(TOKEN_PLACEHOLDER) {
-            bail!("--header value must contain the {{}} token placeholder: {header:?}");
+            crate::fail!(
+                ErrorCode::InputMalformedHeader,
+                "--header value must contain the {{}} token placeholder: {header:?}"
+            );
         }
         // Reject CR/LF/NUL that would smuggle extra header lines when injected.
         if [name, value_template]
             .iter()
             .any(|s| s.contains('\r') || s.contains('\n') || s.contains('\0'))
         {
-            bail!("--header must not contain CR, LF or NUL");
+            crate::fail!(
+                ErrorCode::InputMalformedHeader,
+                "--header must not contain CR, LF or NUL"
+            );
         }
         Ok(Self {
             name: name.to_string(),
@@ -95,12 +108,18 @@ impl HeaderTemplate {
 /// group, or no match, is an error.
 pub fn extract_token(regex: &str, output: &str) -> Result<String> {
     let re = Regex::new(regex).with_context(|| format!("invalid --extract regex {regex:?}"))?;
-    let caps = re
-        .captures(output)
-        .ok_or_else(|| anyhow!("--extract regex did not match the login command output"))?;
-    let group = caps
-        .get(1)
-        .ok_or_else(|| anyhow!("--extract regex must have one capture group (found none)"))?;
+    let caps = re.captures(output).ok_or_else(|| {
+        crate::coded!(
+            ErrorCode::NetworkAuthRefreshFailed,
+            "--extract regex did not match the login command output"
+        )
+    })?;
+    let group = caps.get(1).ok_or_else(|| {
+        crate::coded!(
+            ErrorCode::InputBadRegex,
+            "--extract regex must have one capture group (found none)"
+        )
+    })?;
     Ok(group.as_str().to_string())
 }
 
@@ -172,7 +191,7 @@ pub async fn auth_set(
     let _ = HeaderTemplate::parse(header)?;
     Regex::new(extract).with_context(|| format!("invalid --extract regex {extract:?}"))?;
     if login.trim().is_empty() {
-        bail!("--login must not be empty");
+        crate::fail!(ErrorCode::InputInvalidValue, "--login must not be empty");
     }
     store
         .writer()
@@ -203,7 +222,8 @@ pub async fn run_login(
         None => {
             let pf = doctor();
             if !pf.is_ok() {
-                bail!(
+                crate::fail!(
+                    ErrorCode::SandboxPrerequisites,
                     "sandbox preflight failed: {} — run `burpwn doctor`",
                     pf.missing_summary()
                 );

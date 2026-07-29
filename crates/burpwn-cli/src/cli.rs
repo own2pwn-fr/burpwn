@@ -24,6 +24,13 @@ pub enum Command {
     /// Probe the host for sandbox prerequisites and the CA.
     Doctor(DoctorArgs),
 
+    /// Inspect and collect debug reports.
+    Debug {
+        /// What to do.
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+
     /// Install agent / shell command-rewrite hooks.
     Init(InitArgs),
 
@@ -421,6 +428,36 @@ pub struct SessionAuthSetArgs {
     /// Session to operate on (defaults to the active session).
     #[arg(long)]
     pub session: Option<String>,
+}
+
+/// `debug` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum DebugAction {
+    /// Write a full debug report (host, prerequisites, live sandbox probe,
+    /// sessions) for attaching to a bug report.
+    Bundle(DebugBundleArgs),
+    /// List the debug reports burpwn wrote automatically on past failures.
+    List,
+    /// Print one stored report (the most recent by default).
+    Show {
+        /// Path of a report to print. Defaults to the most recent one.
+        path: Option<String>,
+    },
+}
+
+/// `debug bundle` arguments.
+#[derive(Debug, Args)]
+pub struct DebugBundleArgs {
+    /// Write the report here instead of the debug directory. `-` prints it to
+    /// stdout.
+    #[arg(long, short = 'o')]
+    pub out: Option<String>,
+
+    /// Skip the live sandbox probe (which forks a throwaway namespace). The
+    /// probe is the most useful part of the report on a host where capture is
+    /// not working, so it runs by default.
+    #[arg(long)]
+    pub no_probe: bool,
 }
 
 /// `doctor` arguments.

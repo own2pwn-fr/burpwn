@@ -9,6 +9,7 @@ repository.workspace = true
 description = "burpwn agent integration: per-agent command-rewrite hook installers + global shell hook"
 
 [dependencies]
+burpwn-error.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

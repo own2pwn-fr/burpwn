@@ -294,6 +294,18 @@ pub enum SkillError {
     },
 }
 
+impl burpwn_error::Coded for SkillError {
+    fn code(&self) -> burpwn_error::ErrorCode {
+        use burpwn_error::ErrorCode as C;
+        match self {
+            SkillError::Io(_) => C::InputFileUnreadable,
+            // The framework is known, the scope is not valid for it — that is a
+            // flag-value problem, not an unknown-agent one.
+            SkillError::ScopeUnsupported { .. } => C::InputInvalidValue,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Content rendering (pure)
 // ---------------------------------------------------------------------------

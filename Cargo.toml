@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/burpwn-error",
     "crates/burpwn-store",
     "crates/burpwn-tls",
     "crates/burpwn-proxy",
@@ -77,6 +78,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 
 # internal crates
+burpwn-error = { path = "crates/burpwn-error" }
 burpwn-store = { path = "crates/burpwn-store" }
 burpwn-tls = { path = "crates/burpwn-tls" }
 burpwn-proxy = { path = "crates/burpwn-proxy" }

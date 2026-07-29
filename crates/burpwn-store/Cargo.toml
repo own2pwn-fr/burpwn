@@ -9,6 +9,7 @@ repository.workspace = true
 description = "burpwn session storage: SQLite per-session, single-writer task, blob dedup, FTS5"
 
 [dependencies]
+burpwn-error.workspace = true
 rusqlite.workspace = true
 r2d2.workspace = true
 r2d2_sqlite.workspace = true

@@ -12,10 +12,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use burpwn_error::ErrorCode;
 use burpwn_proxy::{run_attack, AttackMode, FuzzConfig, HttpReplaySender, Template};
 use burpwn_store::model::{NewAttack, NewAttackResult, RequestData};
 use burpwn_store::Store;
@@ -124,10 +125,14 @@ pub async fn fuzz_run(
     let reader = store.reader();
 
     let Some(detail) = reader.get_flow(spec.flow_id)? else {
-        bail!("no such flow: {}", spec.flow_id);
+        crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {}", spec.flow_id);
     };
     let Some(req) = detail.request.clone() else {
-        bail!("flow {} has no recorded request to fuzz", spec.flow_id);
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "flow {} has no recorded request to fuzz",
+            spec.flow_id
+        );
     };
 
     // Template bytes: the raw override, else synthesized from the flow request.
@@ -137,10 +142,16 @@ pub async fn fuzz_run(
         .unwrap_or_else(|| flow_request_bytes(&req));
     let template = build_template(&base_bytes, &spec.positions, spec.marker.as_deref());
     if template.num_positions() == 0 {
-        bail!("no injection positions: pass --position start:end pairs or embed § markers");
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "no injection positions: pass --position start:end pairs or embed § markers"
+        );
     }
     if spec.payloads.is_empty() {
-        bail!("no payloads: pass --payload <p> (repeatable) or --payloads <file>");
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "no payloads: pass --payload <p> (repeatable) or --payloads <file>"
+        );
     }
 
     // Transport target: same resolution as `req replay`.
@@ -334,7 +345,7 @@ pub fn fuzz_show(
     let store = open_store(paths, session)?;
     let reader = store.reader();
     let Some(attack) = reader.attack_get(attack_id)? else {
-        bail!("no such attack: {attack_id}");
+        crate::fail!(ErrorCode::InputNoSuchAttack, "no such attack: {attack_id}");
     };
     let mut results = reader.attack_results(attack_id)?;
     match sort {
@@ -361,7 +372,12 @@ pub fn parse_position(spec: &str) -> Result<(usize, usize)> {
     let (s, e) = spec
         .split_once(':')
         .or_else(|| spec.split_once('-'))
-        .ok_or_else(|| anyhow::anyhow!("position must be start:end, got {spec:?}"))?;
+        .ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::InputInvalidValue,
+                "position must be start:end, got {spec:?}"
+            )
+        })?;
     let start: usize = s
         .trim()
         .parse()
@@ -371,7 +387,10 @@ pub fn parse_position(spec: &str) -> Result<(usize, usize)> {
         .parse()
         .with_context(|| format!("invalid position end in {spec:?}"))?;
     if start > end {
-        bail!("position start {start} > end {end}");
+        crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "position start {start} > end {end}"
+        );
     }
     Ok((start, end))
 }

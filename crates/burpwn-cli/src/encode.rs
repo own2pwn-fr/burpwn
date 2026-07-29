@@ -13,7 +13,8 @@
 //!   header + payload to pretty JSON, expose `alg` and the claims. The signature
 //!   is NOT verified (this is a decoder, not a validator).
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
+use burpwn_error::ErrorCode;
 use serde_json::{json, Value};
 
 /// Encode `value` using `scheme`. Returns the encoded string.
@@ -24,8 +25,14 @@ pub fn encode(scheme: &str, value: &str) -> Result<Value> {
         "base64url" | "b64url" | "base64-url" => base64_encode(bytes, URL_ALPHABET, false),
         "url" | "urlencode" | "percent" => url_encode(bytes),
         "hex" => hex_encode(bytes),
-        "jwt" => bail!("jwt is decode-only (a JWT is signed; use decode jwt)"),
-        other => bail!("unknown encode scheme {other:?} (base64|base64url|url|hex)"),
+        "jwt" => crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "jwt is decode-only (a JWT is signed; use decode jwt)"
+        ),
+        other => crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "unknown encode scheme {other:?} (base64|base64url|url|hex)"
+        ),
     };
     Ok(json!({ "scheme": scheme, "encoded": encoded }))
 }
@@ -58,7 +65,10 @@ pub fn decode(scheme: &str, value: &str) -> Result<Value> {
             }))
         }
         "jwt" => jwt_decode(value),
-        other => bail!("unknown decode scheme {other:?} (base64|base64url|url|hex|jwt)"),
+        other => crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "unknown decode scheme {other:?} (base64|base64url|url|hex|jwt)"
+        ),
     }
 }
 
@@ -106,7 +116,10 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
             '/' | '_' => 63,
             '=' => break,
             c if c.is_whitespace() => continue,
-            other => bail!("invalid base64 character {other:?}"),
+            other => crate::fail!(
+                ErrorCode::InputMalformedPayload,
+                "invalid base64 character {other:?}"
+            ),
         };
         bits = (bits << 6) | v;
         nbits += 6;
@@ -135,16 +148,27 @@ fn hex_encode(data: &[u8]) -> String {
 fn hex_decode(input: &str) -> Result<Vec<u8>> {
     let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if !clean.len().is_multiple_of(2) {
-        bail!("hex input has an odd number of digits");
+        crate::fail!(
+            ErrorCode::InputMalformedPayload,
+            "hex input has an odd number of digits"
+        );
     }
     let mut out = Vec::with_capacity(clean.len() / 2);
     for pair in clean.chunks(2) {
-        let hi = (pair[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| anyhow!("invalid hex digit {:?}", pair[0] as char))?;
-        let lo = (pair[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| anyhow!("invalid hex digit {:?}", pair[1] as char))?;
+        let hi = (pair[0] as char).to_digit(16).ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::InputMalformedPayload,
+                "invalid hex digit {:?}",
+                pair[0] as char
+            )
+        })?;
+        let lo = (pair[1] as char).to_digit(16).ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::InputMalformedPayload,
+                "invalid hex digit {:?}",
+                pair[1] as char
+            )
+        })?;
         out.push(((hi << 4) | lo) as u8);
     }
     Ok(out)
@@ -176,14 +200,17 @@ fn url_decode(input: &str) -> Result<Vec<u8>> {
         match bytes[i] {
             b'%' => {
                 if i + 2 >= bytes.len() {
-                    bail!("truncated percent-escape at offset {i}");
+                    crate::fail!(
+                        ErrorCode::InputMalformedPayload,
+                        "truncated percent-escape at offset {i}"
+                    );
                 }
-                let hi = (bytes[i + 1] as char)
-                    .to_digit(16)
-                    .ok_or_else(|| anyhow!("invalid percent-escape"))?;
-                let lo = (bytes[i + 2] as char)
-                    .to_digit(16)
-                    .ok_or_else(|| anyhow!("invalid percent-escape"))?;
+                let hi = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| {
+                    crate::coded!(ErrorCode::InputMalformedPayload, "invalid percent-escape")
+                })?;
+                let lo = (bytes[i + 2] as char).to_digit(16).ok_or_else(|| {
+                    crate::coded!(ErrorCode::InputMalformedPayload, "invalid percent-escape")
+                })?;
                 out.push(((hi << 4) | lo) as u8);
                 i += 3;
             }
@@ -206,17 +233,26 @@ fn url_decode(input: &str) -> Result<Vec<u8>> {
 fn jwt_decode(token: &str) -> Result<Value> {
     let parts: Vec<&str> = token.trim().split('.').collect();
     if parts.len() != 3 {
-        bail!(
+        crate::fail!(
+            ErrorCode::InputMalformedPayload,
             "not a JWT: expected 3 dot-separated segments, got {}",
             parts.len()
         );
     }
     let header_bytes = base64_decode(parts[0])?;
     let payload_bytes = base64_decode(parts[1])?;
-    let header: Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| anyhow!("JWT header is not valid JSON: {e}"))?;
-    let claims: Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| anyhow!("JWT payload is not valid JSON: {e}"))?;
+    let header: Value = serde_json::from_slice(&header_bytes).map_err(|e| {
+        crate::coded!(
+            ErrorCode::InputMalformedPayload,
+            "JWT header is not valid JSON: {e}"
+        )
+    })?;
+    let claims: Value = serde_json::from_slice(&payload_bytes).map_err(|e| {
+        crate::coded!(
+            ErrorCode::InputMalformedPayload,
+            "JWT payload is not valid JSON: {e}"
+        )
+    })?;
     let alg = header
         .get("alg")
         .and_then(Value::as_str)

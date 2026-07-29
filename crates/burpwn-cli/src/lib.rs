@@ -49,6 +49,8 @@ pub mod commands;
 pub mod compare;
 pub mod control;
 pub mod daemon;
+pub mod debugreport;
+pub mod diag;
 pub mod encode;
 pub mod envelope;
 pub mod exec;
@@ -75,33 +77,79 @@ use crate::paths::Paths;
 pub async fn run() -> Result<i32> {
     init_tracing();
     let cli = Cli::parse();
-    let paths = Paths::resolve()?;
+    // A failure to even resolve the data directory has to be reported the same
+    // way as everything else — but there is nowhere to write a report yet, so it
+    // is rendered without one.
+    let paths = match Paths::resolve() {
+        Ok(p) => p,
+        Err(e) => return Ok(report_without_paths(cli.json, &e)),
+    };
     let json = cli.json;
-    json_wrap(json, commands::dispatch(cli, &paths).await)
+    Ok(terminate(
+        json,
+        &paths,
+        commands::dispatch(cli, &paths).await,
+    ))
 }
 
 /// Like [`run`] but against an explicit [`Paths`] (for tests / embedding).
 pub async fn run_with(cli: Cli, paths: &Paths) -> Result<i32> {
     let json = cli.json;
-    json_wrap(json, commands::dispatch(cli, paths).await)
+    Ok(terminate(json, paths, commands::dispatch(cli, paths).await))
 }
 
-/// In `--json` mode, convert a top-level dispatch error into the stable
-/// `{ok:false,data:null,error}` envelope on stdout (so an agent always parses a
-/// structured result instead of a plain-text `burpwn: …` line on stderr) and
-/// exit non-zero. In human mode the error propagates to `main` for a plain
-/// message. Success is passed through unchanged.
-fn json_wrap(json: bool, result: Result<i32>) -> Result<i32> {
-    match result {
-        Err(e) if json => {
-            println!(
-                "{}",
-                envelope::Envelope::err(format!("{e:#}")).to_json_line()
-            );
-            Ok(1)
+/// The single place a burpwn failure becomes user-visible.
+///
+/// Everything a command can fail with converges here, and here it always gets
+/// the same four things: a catalogue code, the verbatim cause chain, what to do
+/// about it, and a debug report on disk. That uniformity is the point — there is
+/// no path by which a failure reaches the user as a bare sentence.
+///
+/// * human mode → the rendered block on stderr,
+/// * `--json` mode → the error envelope (legacy `error` string + structured
+///   `diagnostic`) on stdout, because an agent parses stdout,
+/// * exit code → the failure's [class](burpwn_error::ErrorClass::exit_code).
+///
+/// Success passes straight through, including `exec`'s pass-through of the
+/// wrapped command's own exit code.
+fn terminate(json: bool, paths: &Paths, result: Result<i32>) -> i32 {
+    let err = match result {
+        Ok(code) => return code,
+        Err(e) => e,
+    };
+    let mut diag = diag::diagnose(&err);
+    // Sandbox failures can say something far sharper than the catalogue's static
+    // advice, by re-creating the sandbox and reporting the step that breaks. It
+    // costs a fork, and only on a failure that is already fatal.
+    if diag.code.class() == burpwn_error::ErrorClass::Sandbox {
+        let probe = burpwn_sandbox::deep_probe();
+        if !probe.is_ok() {
+            for line in probe.remediation().into_iter().rev() {
+                diag = diag.advise(line);
+            }
         }
-        other => other,
     }
+    if let Some(path) = debugreport::write(paths, &diag) {
+        diag = diag.debug_report(path);
+    }
+    if json {
+        println!("{}", envelope::Envelope::diagnostic(&diag).to_json_line());
+    } else {
+        eprintln!("{}", diag.render());
+    }
+    diag.exit_code()
+}
+
+/// Render a failure that happened before [`Paths`] existed, so no report can be
+/// written. Same shape, minus the `debug` line.
+fn report_without_paths(json: bool, err: &anyhow::Error) -> i32 {
+    let diag = diag::diagnose(err);
+    if json {
+        println!("{}", envelope::Envelope::diagnostic(&diag).to_json_line());
+    } else {
+        eprintln!("{}", diag.render());
+    }
+    diag.exit_code()
 }
 
 fn init_tracing() {
@@ -157,17 +205,44 @@ mod tests {
         }
     }
 
+    // The terminal handler is the contract: no failure escapes it uncoded, and
+    // the exit code always names the failure's family.
     #[test]
-    fn json_wrap_emits_error_envelope_in_json_mode() {
-        // In --json mode a dispatch error becomes a structured envelope + exit 1.
-        let code = json_wrap(true, Err(anyhow::anyhow!("invalid session name: \"../x\"")))
-            .expect("json mode never propagates the error");
-        assert_eq!(code, 1);
-        // In human mode the error propagates unchanged for `main` to print.
-        let err = json_wrap(false, Err(anyhow::anyhow!("boom"))).unwrap_err();
-        assert_eq!(format!("{err:#}"), "boom");
-        // Success is passed through in both modes.
-        assert_eq!(json_wrap(true, Ok(0)).unwrap(), 0);
+    fn terminate_returns_the_class_exit_code_and_writes_a_report() {
+        use burpwn_error::ErrorCode;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+
+        let err = Err(coded!(ErrorCode::InputNoSuchFlow, "no such flow 7"));
+        assert_eq!(terminate(false, &paths, err), 75);
+
+        let reports = debugreport::recent(&paths.debug_dir(), 10);
+        assert_eq!(reports.len(), 1, "a failure must leave a debug report");
+        assert!(reports[0].to_string_lossy().contains("BW-INPUT-002"));
+    }
+
+    // An error nobody annotated still has to come out coded and non-zero.
+    #[test]
+    fn terminate_codes_an_unannotated_error_as_internal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        let err = Err(anyhow::anyhow!("something nobody anticipated"));
+        assert_eq!(terminate(false, &paths, err), 78);
+    }
+
+    #[test]
+    fn terminate_passes_success_through_including_exec_exit_codes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(tmp.path());
+        assert_eq!(terminate(true, &paths, Ok(0)), 0);
+        // `exec` returns the wrapped command's code; it must survive untouched.
+        assert_eq!(terminate(false, &paths, Ok(42)), 42);
+    }
+
+    #[test]
+    fn a_failure_before_paths_exist_is_still_coded() {
+        let err = anyhow::anyhow!("cannot determine a data directory");
+        assert_eq!(report_without_paths(false, &err), 78);
     }
 
     #[test]

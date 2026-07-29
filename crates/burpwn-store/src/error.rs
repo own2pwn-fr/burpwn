@@ -51,5 +51,66 @@ pub enum StoreError {
     },
 }
 
+impl burpwn_error::Coded for StoreError {
+    fn code(&self) -> burpwn_error::ErrorCode {
+        use burpwn_error::ErrorCode as C;
+        match self {
+            // An I/O error on the store is almost always "the file could not be
+            // opened/created" (permissions, missing dir, full disk) — which is
+            // the actionable framing, unlike a bare "io error".
+            StoreError::Io(_) => C::StoreOpen,
+            StoreError::Sqlite(_) | StoreError::Pool(_) | StoreError::Serde(_) => C::StoreSqlite,
+            StoreError::WriterGone | StoreError::NoReply(_) => C::StoreWriterGone,
+            StoreError::IncompatibleSchema { .. } => C::StoreSchemaTooNew,
+            StoreError::BlobTooLarge { .. } => C::StoreBlobTooLarge,
+        }
+    }
+}
+
 /// Convenience result alias for the store crate.
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burpwn_error::{Coded, ErrorCode};
+
+    #[test]
+    fn variants_map_onto_the_documented_codes() {
+        assert_eq!(StoreError::WriterGone.code(), ErrorCode::StoreWriterGone);
+        assert_eq!(
+            StoreError::IncompatibleSchema {
+                found: 9,
+                supported: 3
+            }
+            .code(),
+            ErrorCode::StoreSchemaTooNew
+        );
+        assert_eq!(
+            StoreError::BlobTooLarge { id: 1, limit: 10 }.code(),
+            ErrorCode::StoreBlobTooLarge
+        );
+        assert_eq!(
+            StoreError::NoReply("x".into()).code(),
+            ErrorCode::StoreWriterGone
+        );
+    }
+
+    // Every store failure must land in the STORE class, or the exit code lies.
+    #[test]
+    fn every_variant_is_in_the_store_class() {
+        let errors: Vec<StoreError> = vec![
+            StoreError::WriterGone,
+            StoreError::NoReply("x".into()),
+            StoreError::IncompatibleSchema {
+                found: 9,
+                supported: 3,
+            },
+            StoreError::BlobTooLarge { id: 1, limit: 10 },
+            StoreError::Io(std::io::Error::other("x")),
+        ];
+        for e in errors {
+            assert_eq!(e.code().class(), burpwn_error::ErrorClass::Store, "{e}");
+        }
+    }
+}

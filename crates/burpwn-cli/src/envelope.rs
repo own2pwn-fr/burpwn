@@ -17,7 +17,17 @@ pub struct Envelope {
     /// The success payload (`null` on error).
     pub data: Value,
     /// The error message (`null` on success).
+    ///
+    /// Kept as a plain string for backwards compatibility with everything that
+    /// already parses this envelope; since codes were introduced it carries the
+    /// [`Diagnostic::one_line`] form (`[BW-INPUT-002] no such flow 7: …`), so an
+    /// old consumer that only prints this field still shows the code.
     pub error: Option<String>,
+    /// The structured diagnostic: code, class, causes, remediation, exit code,
+    /// and the path of the debug report. `null` on success and for errors
+    /// raised before classification (there are none on the normal path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<Value>,
 }
 
 impl Envelope {
@@ -27,6 +37,7 @@ impl Envelope {
             ok: true,
             data,
             error: None,
+            diagnostic: None,
         }
     }
 
@@ -35,12 +46,24 @@ impl Envelope {
         Self::ok(Value::Null)
     }
 
-    /// An error envelope carrying `msg`.
+    /// An error envelope carrying `msg` and no structured diagnostic.
     pub fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             data: Value::Null,
             error: Some(msg.into()),
+            diagnostic: None,
+        }
+    }
+
+    /// An error envelope built from a classified failure: the legacy `error`
+    /// string plus the full structured `diagnostic`.
+    pub fn diagnostic(diag: &burpwn_error::Diagnostic) -> Self {
+        Self {
+            ok: false,
+            data: Value::Null,
+            error: Some(diag.one_line()),
+            diagnostic: Some(diag.to_json()),
         }
     }
 
@@ -82,6 +105,33 @@ mod tests {
         assert!(e.ok);
         assert_eq!(e.data, Value::Null);
         assert!(e.error.is_none());
+    }
+
+    // Old consumers only read `error`. They must still see the code, or the
+    // whole point of having codes is lost for anything already integrated.
+    #[test]
+    fn diagnostic_envelope_keeps_the_legacy_error_string() {
+        use burpwn_error::{Diagnostic, ErrorCode};
+        let d = Diagnostic::new(ErrorCode::InputNoSuchFlow, "no such flow 7").cause("db said no");
+        let e = Envelope::diagnostic(&d);
+        let v: Value = serde_json::from_str(&e.to_json_line()).unwrap();
+        assert_eq!(v["ok"], json!(false));
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.starts_with("[BW-INPUT-002] no such flow 7"), "{msg}");
+        assert_eq!(v["diagnostic"]["code"], json!("BW-INPUT-002"));
+        assert_eq!(v["diagnostic"]["exit_code"], json!(75));
+        assert!(!v["diagnostic"]["remediation"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    // The new field must not appear on success, so existing golden outputs and
+    // schema expectations for successful commands are untouched.
+    #[test]
+    fn success_envelopes_have_no_diagnostic_field() {
+        let s = Envelope::ok(json!({"id": 1})).to_json_line();
+        assert!(!s.contains("diagnostic"), "{s}");
     }
 
     #[test]

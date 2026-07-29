@@ -9,6 +9,7 @@ repository.workspace = true
 description = "burpwn rootless sandbox: per-command userns+netns+nftables+bubblewrap, RAII teardown"
 
 [dependencies]
+burpwn-error.workspace = true
 nix.workspace = true
 libc.workspace = true
 tokio.workspace = true

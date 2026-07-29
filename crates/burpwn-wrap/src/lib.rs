@@ -66,6 +66,21 @@ pub enum WrapError {
     NonObjectRoot(String),
 }
 
+impl burpwn_error::Coded for WrapError {
+    fn code(&self) -> burpwn_error::ErrorCode {
+        use burpwn_error::ErrorCode as C;
+        match self {
+            WrapError::NonObjectRoot(_) => C::AgentConfigShape,
+            // A parse failure on an agent's own config file is the same class of
+            // problem as a shape mismatch: the file is not what burpwn can edit.
+            WrapError::Json(_) | WrapError::TomlDe(_) | WrapError::TomlSer(_) => {
+                C::AgentConfigShape
+            }
+            WrapError::Io(_) => C::InputFileUnreadable,
+        }
+    }
+}
+
 /// Rewrite a single command line into its `burpwn exec` form.
 ///
 /// ```

@@ -7,6 +7,125 @@ Verified against `burpwn <cmd> --help`. Global option on every command:
 burpwn [--json] <command>
 ```
 
+## Errors
+
+Every failure carries a stable code, a cause chain, remediation, and a debug report.
+
+```text
+error [BW-SANDBOX-003] the command did NOT run captured — no traffic was intercepted
+  cause : sandbox setup failed at `netns_setup`: ip link add burp0 type dummy failed: …
+  fix   : the `dummy` network driver is unavailable — the sandbox needs it …
+        : run `burpwn doctor`: it recreates the sandbox live and names the failing step
+  debug : ~/.local/share/burpwn/debug/2026-07-29T18-33-17Z-BW-SANDBOX-003.json
+  exit  : 70
+```
+
+In `--json` mode the same information is in the envelope: `error` keeps the
+one-line form (`[CODE] message: cause`) and `diagnostic` carries
+`{code, class, title, message, causes, remediation, context, exit_code, debug_report}`.
+MCP tool errors carry the rendered block as the message and the same object as
+the error `data` — branch on `diagnostic.code`, not on the prose.
+
+The process exit code is the failure's CLASS, so a script can react without
+parsing anything. ⚠️ `burpwn exec` passes the wrapped command's exit code
+through, so a 70–78 out of `exec` is only burpwn's if the command itself did not
+produce it — the JSON envelope disambiguates.
+
+**SANDBOX** — exit code `70`
+
+| code | meaning |
+|---|---|
+| `BW-SANDBOX-001` | a sandbox prerequisite is not installed |
+| `BW-SANDBOX-002` | the kernel refused to create the sandbox namespaces |
+| `BW-SANDBOX-003` | the sandbox network could not be configured |
+| `BW-SANDBOX-004` | the in-sandbox capture listener could not bind |
+| `BW-SANDBOX-005` | the sandbox could not start the command |
+| `BW-SANDBOX-006` | the command hit its timeout and was killed |
+| `BW-SANDBOX-007` | the sandbox failed to run the command |
+
+**DAEMON** — exit code `71`
+
+| code | meaning |
+|---|---|
+| `BW-DAEMON-001` | the session proxy did not start in time |
+| `BW-DAEMON-002` | the session proxy is not reachable |
+| `BW-DAEMON-003` | the connection to the session proxy broke |
+| `BW-DAEMON-004` | the session proxy refused the request |
+| `BW-DAEMON-005` | the session runtime directory is unusable |
+
+**STORE** — exit code `72`
+
+| code | meaning |
+|---|---|
+| `BW-STORE-001` | the capture database could not be opened |
+| `BW-STORE-002` | a database operation failed |
+| `BW-STORE-003` | the capture database is from a newer burpwn |
+| `BW-STORE-004` | a stored body is larger than the safety limit |
+| `BW-STORE-005` | the capture writer has shut down |
+
+**TLS** — exit code `73`
+
+| code | meaning |
+|---|---|
+| `BW-TLS-001` | the MITM certificate authority could not be generated |
+| `BW-TLS-002` | the MITM certificate authority could not be loaded |
+| `BW-TLS-003` | the stored CA material is malformed |
+| `BW-TLS-004` | a certificate could not be minted for the target |
+
+**SESSION** — exit code `74`
+
+| code | meaning |
+|---|---|
+| `BW-SESSION-001` | the session name is not allowed |
+| `BW-SESSION-002` | no such session |
+| `BW-SESSION-003` | no such workspace |
+| `BW-SESSION-004` | burpwn cannot determine where to store its data |
+
+**INPUT** — exit code `75`
+
+| code | meaning |
+|---|---|
+| `BW-INPUT-001` | a flag was given an unsupported value |
+| `BW-INPUT-002` | no such flow |
+| `BW-INPUT-003` | no such fuzz attack |
+| `BW-INPUT-004` | a header specification is malformed |
+| `BW-INPUT-005` | the input is malformed for that scheme |
+| `BW-INPUT-006` | the command needs to know what to act on |
+| `BW-INPUT-007` | an input file could not be read |
+| `BW-INPUT-008` | refusing to write through an unsafe path |
+| `BW-INPUT-009` | there is nothing to act on |
+| `BW-INPUT-010` | the regex is invalid for this use |
+
+**AGENT** — exit code `76`
+
+| code | meaning |
+|---|---|
+| `BW-AGENT-001` | unknown agent / framework / MCP host |
+| `BW-AGENT-002` | the agent config file is not a shape burpwn can edit |
+| `BW-AGENT-003` | refusing to overwrite a file burpwn does not own |
+
+**NETWORK** — exit code `77`
+
+| code | meaning |
+|---|---|
+| `BW-NETWORK-001` | the replay request failed |
+| `BW-NETWORK-002` | the session-auth login macro failed |
+
+**INTERNAL** — exit code `78`
+
+| code | meaning |
+|---|---|
+| `BW-INTERNAL-001` | unexpected internal error |
+## debug
+`burpwn debug bundle [-o <path>|-] [--no-probe] [--json]` — write a full report (host,
+prerequisites, live sandbox probe, sessions) for a bug report. `-o -` prints it to stdout.
+`burpwn debug list` — the reports burpwn wrote automatically on past failures (last 20 kept).
+`burpwn debug show [<path>]` — print one (the most recent by default).
+
+Reports are redacted: env values outside a small allowlist are dropped, and
+token-shaped strings (JWTs, `Authorization:` values, long opaque runs) are
+replaced by `«redacted»`. Captured bodies are never included.
+
 ## doctor
 `burpwn doctor [--quick] [--json]` — probe the host for sandbox prerequisites and CA presence,
 then run a LIVE probe that really creates a throwaway userns+netns and executes the production

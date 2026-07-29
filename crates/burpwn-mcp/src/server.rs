@@ -46,13 +46,24 @@ fn ok_json(value: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
-/// Map an `anyhow::Error` from a handler into an MCP tool error.
-fn to_mcp_err(e: anyhow::Error) -> McpError {
-    McpError::internal_error(e.to_string(), None)
-}
-
 #[tool_router]
 impl BurpwnServer {
+    /// Map a handler failure into an MCP tool error the AGENT can act on.
+    ///
+    /// An agent cannot read a terminal, so everything a human would get from the
+    /// rendered error block has to travel in the tool result: the message text
+    /// IS that block, and the structured diagnostic (code, class, causes,
+    /// remediation, exit code, debug-report path) rides along in the error's
+    /// `data` so the agent can branch on the code instead of parsing prose. The
+    /// debug report is filed here too — the agent's user will want it.
+    fn err(&self, e: anyhow::Error) -> McpError {
+        let mut diag = burpwn_cli::diag::diagnose(&e);
+        if let Some(path) = burpwn_cli::debugreport::write(&self.inner.paths, &diag) {
+            diag = diag.debug_report(path);
+        }
+        McpError::internal_error(diag.render(), Some(diag.to_json()))
+    }
+
     /// Build the server for a resolved session.
     pub fn new(paths: Paths, session: String) -> Self {
         Self {
@@ -73,14 +84,14 @@ impl BurpwnServer {
     #[tool(description = "List all burpwn sessions and the active one.")]
     async fn session_list(&self) -> Result<CallToolResult, McpError> {
         handlers::session_list(self.paths())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
     #[tool(description = "Show the active session and whether its database exists.")]
     async fn session_current(&self) -> Result<CallToolResult, McpError> {
         handlers::session_current(self.paths())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -89,7 +100,7 @@ impl BurpwnServer {
     )]
     async fn session_stats(&self) -> Result<CallToolResult, McpError> {
         handlers::session_stats(self.paths(), self.session())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -104,7 +115,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::session_auth_set(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -117,7 +128,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::session_auth_refresh(self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -126,7 +137,7 @@ impl BurpwnServer {
     )]
     async fn session_auth_status(&self) -> Result<CallToolResult, McpError> {
         handlers::session_auth_status(self.paths(), self.session())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -140,7 +151,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<ReqListParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::req_list(self.paths(), self.session(), &params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -152,7 +163,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<ReqShowParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::req_show(self.paths(), self.session(), &params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -162,28 +173,28 @@ impl BurpwnServer {
         Parameters(params): Parameters<ReqSearchParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::req_search(self.paths(), self.session(), &params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
     #[tool(description = "List workspaces in the active session.")]
     async fn workspace_list(&self) -> Result<CallToolResult, McpError> {
         handlers::workspace_list(self.paths(), self.session())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
     #[tool(description = "List tags in the active session.")]
     async fn tag_list(&self) -> Result<CallToolResult, McpError> {
         handlers::tag_list(self.paths(), self.session())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
     #[tool(description = "List match/replace rules in the active session.")]
     async fn match_replace_list(&self) -> Result<CallToolResult, McpError> {
         handlers::match_replace_list(self.paths(), self.session())
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -198,7 +209,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::match_replace_add(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -209,7 +220,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::tag_add(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -220,7 +231,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::note_add(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -231,7 +242,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::workspace_new(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -241,7 +252,7 @@ impl BurpwnServer {
     async fn intercept_enable(&self) -> Result<CallToolResult, McpError> {
         handlers::intercept_enable(self.paths(), self.session())
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -249,7 +260,7 @@ impl BurpwnServer {
     async fn intercept_disable(&self) -> Result<CallToolResult, McpError> {
         handlers::intercept_disable(self.paths(), self.session())
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -257,7 +268,7 @@ impl BurpwnServer {
     async fn intercept_list(&self) -> Result<CallToolResult, McpError> {
         handlers::intercept_list(self.paths(), self.session())
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -270,7 +281,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::await_intercept(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -283,7 +294,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::intercept_forward(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -296,7 +307,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::intercept_scope(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -307,7 +318,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::intercept_drop(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -322,7 +333,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::run_exec(self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -337,7 +348,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::req_replay(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -352,7 +363,7 @@ impl BurpwnServer {
     ) -> Result<CallToolResult, McpError> {
         handlers::fuzz_run(self.paths(), self.session(), &params)
             .await
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -362,7 +373,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<FuzzListParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::fuzz_list(self.paths(), self.session(), &params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -374,7 +385,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<FuzzResultsParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::fuzz_results(self.paths(), self.session(), &params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -388,7 +399,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<CompareParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::compare(self.paths(), self.session(), &params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -398,7 +409,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<EncodeParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::encode(&params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 
@@ -410,7 +421,7 @@ impl BurpwnServer {
         Parameters(params): Parameters<EncodeParams>,
     ) -> Result<CallToolResult, McpError> {
         handlers::decode(&params)
-            .map_err(to_mcp_err)
+            .map_err(|e| self.err(e))
             .and_then(ok_json)
     }
 }

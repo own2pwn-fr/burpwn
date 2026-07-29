@@ -5,6 +5,43 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — every error is coded, actionable, and leaves a debug report
+- **New crate `burpwn-error`**: the error contract. A catalogue of 41 stable
+  `BW-<CLASS>-<NNN>` codes, each with a plain-language title and remediation advice; a
+  `Diagnostic` type that renders one failure as `code / cause / fix / debug / exit`; and the
+  redaction policy for debug reports. All pure logic, unit-tested.
+- **Process exit codes by failure class** — `70` sandbox, `71` daemon, `72` store, `73` TLS/CA,
+  `74` session, `75` input, `76` agent integration, `77` network, `78` internal. Chosen above
+  `0`/`1` and below the shell's reserved `126`/`127`/`128+n`. ⚠️ `burpwn exec` still passes the
+  wrapped command's exit code through, so a value in that range from `exec` is disambiguated by
+  the `--json` envelope, not by the number alone.
+- **Automatic debug reports** (`<data>/debug/<ts>-<code>.json`, last 20 kept), written on every
+  failure with the path printed in the message: burpwn version, redacted invocation, kernel /
+  distribution / WSL / container detection, sandbox prerequisites, a LIVE sandbox re-probe for
+  sandbox failures, and each session's on-disk state. Redacted before writing — env values
+  outside an allowlist are dropped and token-shaped strings (JWTs, `Authorization` values, long
+  opaque runs) are replaced; captured bodies are never included.
+- **`burpwn debug bundle | list | show`** — an on-demand report for bug reports (`-o -` writes it
+  to stdout), the reports from past failures, and a printer for one of them.
+- **`--json` envelope gains `diagnostic`** — `{code, class, title, message, causes, remediation,
+  context, exit_code, debug_report}`. The legacy `error` string is kept and now begins with the
+  code, so an existing consumer that only reads that field still shows it.
+- **MCP tool errors carry the same diagnostic**: the rendered block as the message and the
+  structured object as the error `data`, so an agent branches on `diagnostic.code` instead of
+  parsing prose. Previously they were `e.to_string()` — the outermost message only, with the
+  cause chain discarded.
+
+### Changed — no failure reaches the user as a bare sentence
+- A single terminal handler in `burpwn-cli` classifies every error chain: an explicit code wins,
+  then a typed error from a lower crate that knows its own code (`StoreError`, `TlsError`,
+  `SandboxError`, `WrapError`, `SkillError`, `McpRegError` now implement `burpwn_error::Coded`),
+  and otherwise `BW-INTERNAL-001`, which the catalogue documents as "this is a bug, report it".
+  The fallback is the point: an error nobody annotated still arrives coded, with an exit code and
+  a report, rather than degrading to a bare string.
+- Every `bail!`/`anyhow!` site across `burpwn-cli` and `burpwn-mcp` (95 of them) now names its
+  catalogue code. Sites that discarded a typed error with `map_err(|e| anyhow!("{e}"))` now
+  propagate it, so it classifies itself.
+
 ### Fixed — a host that cannot sandbox no longer looks like a host that captured nothing
 - **`burpwn doctor` now runs a LIVE sandbox probe** (`burpwn-sandbox/probe.rs`): it creates a real
   throwaway userns+netns and executes the production setup sequence inside it (`ip link set lo up`,

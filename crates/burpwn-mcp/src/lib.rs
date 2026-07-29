@@ -48,6 +48,7 @@ pub mod server;
 use anyhow::Result;
 
 use burpwn_cli::paths::{validate_session_name, Paths};
+use burpwn_error::ErrorCode;
 
 /// Default server-side `await_intercept` timeout (seconds), kept well under the
 /// typical MCP client request timeout so the long-poll returns `{pending:false}`
@@ -79,8 +80,12 @@ pub async fn run(args: McpArgs) -> Result<i32> {
     // filesystem path from it, so a caller can never escape the sessions dir.
     // `active_session()` is already self-validating (see paths.rs), so this only
     // ever rejects an explicitly-passed bad name.
-    validate_session_name(&session)
-        .map_err(|e| anyhow::anyhow!("invalid --session {session:?}: {e}"))?;
+    validate_session_name(&session).map_err(|e| {
+        burpwn_cli::coded!(
+            ErrorCode::SessionInvalidName,
+            "invalid --session {session:?}: {e}"
+        )
+    })?;
     // Ensure the session dir exists so query tools can open an (empty) store.
     paths.ensure_session_dir(&session)?;
 
@@ -90,11 +95,11 @@ pub async fn run(args: McpArgs) -> Result<i32> {
     let running = svc
         .serve(stdio())
         .await
-        .map_err(|e| anyhow::anyhow!("starting MCP stdio server: {e}"))?;
+        .map_err(|e| burpwn_cli::coded!(ErrorCode::Internal, "starting MCP stdio server: {e}"))?;
     running
         .waiting()
         .await
-        .map_err(|e| anyhow::anyhow!("MCP server loop: {e}"))?;
+        .map_err(|e| burpwn_cli::coded!(ErrorCode::Internal, "MCP server loop: {e}"))?;
     Ok(0)
 }
 

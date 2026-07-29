@@ -50,6 +50,32 @@ pub enum SandboxError {
     Io(String),
 }
 
+impl burpwn_error::Coded for SandboxError {
+    fn code(&self) -> burpwn_error::ErrorCode {
+        use burpwn_error::ErrorCode as C;
+        match self {
+            SandboxError::Preflight(_) => C::SandboxPrerequisites,
+            SandboxError::Timeout(_) => C::SandboxTimeout,
+            SandboxError::Io(_) => C::SandboxRuntime,
+            // The in-namespace stage is known exactly, so the code can be too —
+            // this is what turns "it failed" into "the dummy device could not be
+            // created", which is the difference between a usable and a useless
+            // error message.
+            SandboxError::Setup { stage, .. } => match stage.as_str() {
+                "netns_setup" => C::SandboxNetnsSetup,
+                "acceptor_bind" => C::SandboxAcceptorBind,
+                "command_fork" => C::SandboxCommandFork,
+                _ => C::SandboxRuntime,
+            },
+            // A `Runtime` error raised before the child ever entered its
+            // namespaces is the kernel refusing the unshare; everything else is
+            // generic runtime trouble.
+            SandboxError::Runtime(m) if m.contains("user namespace") => C::SandboxNamespaceRefused,
+            SandboxError::Runtime(_) => C::SandboxRuntime,
+        }
+    }
+}
+
 /// Parameters used to run one command inside a fresh sandbox.
 ///
 /// Serializable so the host runtime can hand it to the `__netns-agent` helper
@@ -268,6 +294,39 @@ mod tests {
         value.as_object_mut().unwrap().remove("status_path");
         let back: ExecSpec = serde_json::from_value(value).unwrap();
         assert!(back.status_path.is_none());
+    }
+
+    #[test]
+    fn setup_stages_map_onto_distinct_codes() {
+        use burpwn_error::{Coded, ErrorClass, ErrorCode};
+        let of = |stage: &str| {
+            SandboxError::Setup {
+                stage: stage.into(),
+                detail: "x".into(),
+            }
+            .code()
+        };
+        assert_eq!(of("netns_setup"), ErrorCode::SandboxNetnsSetup);
+        assert_eq!(of("acceptor_bind"), ErrorCode::SandboxAcceptorBind);
+        assert_eq!(of("command_fork"), ErrorCode::SandboxCommandFork);
+        // An unknown stage must still be a sandbox error, never a bare fallback.
+        assert_eq!(of("something-new").class(), ErrorClass::Sandbox);
+
+        assert_eq!(
+            SandboxError::Preflight("nft".into()).code(),
+            ErrorCode::SandboxPrerequisites
+        );
+        assert_eq!(
+            SandboxError::Timeout(Duration::from_secs(1)).code(),
+            ErrorCode::SandboxTimeout
+        );
+        assert_eq!(
+            SandboxError::Runtime(
+                "child exited before entering the user namespace (unshare failed)".into()
+            )
+            .code(),
+            ErrorCode::SandboxNamespaceRefused
+        );
     }
 
     #[test]

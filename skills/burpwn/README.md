@@ -53,4 +53,5 @@ skill *or* the hook; don't run both. Without the hook, route commands explicitly
 
 ## Prereqs the agent should check first
 - `burpwn doctor` — rootless namespace support + CA presence, plus a live sandbox probe (Linux only; not WSL).
+- `burpwn debug bundle|list|show` — debug reports (auto-written on every failure; redacted).
 - `burpwn ca init` — generate the MITM CA once (idempotent).

@@ -39,5 +39,59 @@ impl TlsError {
     }
 }
 
+impl burpwn_error::Coded for TlsError {
+    fn code(&self) -> burpwn_error::ErrorCode {
+        use burpwn_error::ErrorCode as C;
+        match self {
+            // Touching the CA files on disk failed: the actionable framing is
+            // "the CA could not be loaded", which points at `burpwn ca init`.
+            TlsError::Io { .. } => C::TlsCaLoad,
+            TlsError::MalformedCa { .. } => C::TlsCaMalformed,
+            // rcgen/rustls failures happen either while generating the CA or
+            // while minting a leaf; the SAN case is unambiguously a leaf.
+            TlsError::InvalidSan(..) => C::TlsLeafMint,
+            TlsError::Rcgen(_) | TlsError::Rustls(_) => C::TlsCaInit,
+        }
+    }
+}
+
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, TlsError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burpwn_error::{Coded, ErrorClass, ErrorCode};
+
+    #[test]
+    fn variants_map_onto_the_documented_codes() {
+        let io = TlsError::io("/tmp/ca.pem", std::io::Error::other("x"));
+        assert_eq!(io.code(), ErrorCode::TlsCaLoad);
+        assert_eq!(
+            TlsError::MalformedCa {
+                path: "/tmp/ca.pem".into(),
+                detail: "not pem".into()
+            }
+            .code(),
+            ErrorCode::TlsCaMalformed
+        );
+        assert_eq!(
+            TlsError::InvalidSan("..".into(), "bad".into()).code(),
+            ErrorCode::TlsLeafMint
+        );
+    }
+
+    #[test]
+    fn every_variant_is_in_the_tls_class() {
+        for e in [
+            TlsError::io("/tmp/ca.pem", std::io::Error::other("x")),
+            TlsError::MalformedCa {
+                path: "/tmp/ca.pem".into(),
+                detail: "x".into(),
+            },
+            TlsError::InvalidSan("x".into(), "y".into()),
+        ] {
+            assert_eq!(e.code().class(), ErrorClass::Tls, "{e}");
+        }
+    }
+}

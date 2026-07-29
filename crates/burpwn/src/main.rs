@@ -64,11 +64,15 @@ fn main() {
         rt.block_on(burpwn_cli::run())
     };
 
+    // `burpwn_cli::run` already renders and codes its own failures; what reaches
+    // here is the MCP server path, which must not degrade to a bare sentence
+    // just because it took a different route out.
     let code = match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("burpwn: {e:#}");
-            1
+            let diag = burpwn_cli::diag::diagnose(&e);
+            eprintln!("{}", diag.render());
+            diag.exit_code()
         }
     };
     std::process::exit(code);

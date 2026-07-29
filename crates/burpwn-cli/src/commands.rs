@@ -3,13 +3,15 @@
 //! envelope per the global `--json` flag.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use burpwn_sandbox::{deep_probe, doctor, RootlessRuntime, SandboxError, SandboxRuntime};
+use burpwn_error::ErrorCode;
+use burpwn_sandbox::{deep_probe, doctor, RootlessRuntime, SandboxRuntime};
 use burpwn_store::model::{FlowFilter, MatchKind, NewMatchReplaceRule, Protocol};
 use burpwn_store::Store;
 use burpwn_tls::CertAuthority;
@@ -17,6 +19,8 @@ use burpwn_wrap::{install, install_global, Agent, WrapConfig};
 
 use crate::cli::*;
 use crate::control::{ControlClient, ControlResponse, Edits, HeaderEdit};
+use crate::debugreport;
+use crate::diag::WithCode;
 use crate::envelope::Envelope;
 use crate::exec;
 use crate::paths::{validate_session_name, Paths, DEFAULT_SESSION};
@@ -54,6 +58,7 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
     let out = Output::new(cli.json);
     match cli.command {
         Command::Doctor(args) => cmd_doctor(&out, paths, args),
+        Command::Debug { action } => cmd_debug(&out, paths, action),
         Command::Init(args) => cmd_init(&out, args),
         Command::WrapHook { agent } => cmd_wrap_hook(paths, agent),
         Command::Proxy(args) => cmd_proxy(paths, args).await,
@@ -127,12 +132,13 @@ fn cmd_skill(out: &Output, action: SkillAction) -> Result<i32> {
             };
             let root = scope_root(scope)?;
             let target = skill::target_by_slug(&args.agent).ok_or_else(|| {
-                anyhow!(
+                crate::coded!(
+                    ErrorCode::AgentUnknown,
                     "unknown framework: {:?} (try `burpwn skill list`)",
                     args.agent
                 )
             })?;
-            let rep = skill::uninstall(target, &root, scope).map_err(|e| anyhow!("{e}"))?;
+            let rep = skill::uninstall(target, &root, scope).map_err(anyhow::Error::new)?;
             out.ok(
                 format!(
                     "{}: {} ({})",
@@ -164,12 +170,18 @@ fn cmd_skill_install(out: &Output, args: SkillInstallArgs) -> Result<i32> {
     let selected: Vec<&'static skill::SkillTarget> = if args.all {
         skill::targets().iter().collect()
     } else {
-        let slug = args
-            .agent
-            .as_deref()
-            .ok_or_else(|| anyhow!("pass --agent <slug> or --all (see `burpwn skill list`)"))?;
-        let t = skill::target_by_slug(slug)
-            .ok_or_else(|| anyhow!("unknown framework: {slug:?} (try `burpwn skill list`)"))?;
+        let slug = args.agent.as_deref().ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::InputMissingSelection,
+                "pass --agent <slug> or --all (see `burpwn skill list`)"
+            )
+        })?;
+        let t = skill::target_by_slug(slug).ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::AgentUnknown,
+                "unknown framework: {slug:?} (try `burpwn skill list`)"
+            )
+        })?;
         vec![t]
     };
 
@@ -200,7 +212,7 @@ fn cmd_skill_install(out: &Output, args: SkillInstallArgs) -> Result<i32> {
                     "reason": e.to_string(),
                 }));
             }
-            Err(e) => return Err(anyhow!("{e}")),
+            Err(e) => return Err(anyhow::Error::new(e)),
         }
     }
 
@@ -264,10 +276,12 @@ fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
         return Ok(0);
     }
 
-    let slug = args
-        .agent
-        .as_deref()
-        .ok_or_else(|| anyhow!("pass --agent <host> or --list (see `mcp register --list`)"))?;
+    let slug = args.agent.as_deref().ok_or_else(|| {
+        crate::coded!(
+            ErrorCode::InputMissingSelection,
+            "pass --agent <host> or --list (see `mcp register --list`)"
+        )
+    })?;
 
     // Frameworks with no stdio MCP host: clear message, not a guessed path.
     if let Some(name) = mcpreg::unsupported_slug(slug) {
@@ -280,13 +294,17 @@ fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
         return Ok(1);
     }
 
-    let host = mcpreg::host_by_slug(slug)
-        .ok_or_else(|| anyhow!("unknown MCP host: {slug:?} (try `mcp register --list`)"))?;
+    let host = mcpreg::host_by_slug(slug).ok_or_else(|| {
+        crate::coded!(
+            ErrorCode::AgentUnknown,
+            "unknown MCP host: {slug:?} (try `mcp register --list`)"
+        )
+    })?;
 
     // MCP host configs are user-level; `--global` is accepted for symmetry.
     let _ = args.global;
     let home = dirs_home()?;
-    let rep = mcpreg::register(host, &home, args.print).map_err(|e| anyhow!("{e}"))?;
+    let rep = mcpreg::register(host, &home, args.print).map_err(anyhow::Error::new)?;
 
     if args.print {
         println!("# {} -> {}", rep.slug, rep.path.display());
@@ -408,6 +426,109 @@ fn cmd_doctor(out: &Output, paths: &Paths, args: DoctorArgs) -> Result<i32> {
     Ok(if ok { 0 } else { 1 })
 }
 
+// --- debug reports ---------------------------------------------------------
+
+fn cmd_debug(out: &Output, paths: &Paths, action: DebugAction) -> Result<i32> {
+    match action {
+        DebugAction::Bundle(args) => cmd_debug_bundle(out, paths, args),
+        DebugAction::List => cmd_debug_list(out, paths),
+        DebugAction::Show { path } => cmd_debug_show(out, paths, path),
+    }
+}
+
+fn cmd_debug_bundle(out: &Output, paths: &Paths, args: DebugBundleArgs) -> Result<i32> {
+    let doc = debugreport::build(paths, None, !args.no_probe);
+    let body = serde_json::to_string_pretty(&doc)?;
+
+    // `-o -` is the "give it to me on stdout so I can pipe it" form; it must not
+    // also print a human line, or the JSON is no longer pipeable.
+    if args.out.as_deref() == Some("-") {
+        println!("{body}");
+        return Ok(0);
+    }
+
+    let path = match args.out {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let dir = paths.debug_dir();
+            std::fs::create_dir_all(&dir).with_code_msg(
+                ErrorCode::InputUnsafePath,
+                format!("creating {}", dir.display()),
+            )?;
+            dir.join(format!("{}-bundle.json", now_millis()))
+        }
+    };
+    std::fs::write(&path, &body).with_code_msg(
+        ErrorCode::InputUnsafePath,
+        format!("writing {}", path.display()),
+    )?;
+
+    if out.json {
+        println!(
+            "{}",
+            Envelope::ok(json!({"path": path.display().to_string(), "bytes": body.len()}))
+                .to_json_line()
+        );
+    } else {
+        println!("debug report written to {}", path.display());
+        println!("it contains no credentials (env values and token-shaped strings are redacted)");
+    }
+    Ok(0)
+}
+
+fn cmd_debug_list(out: &Output, paths: &Paths) -> Result<i32> {
+    let dir = paths.debug_dir();
+    let reports = debugreport::recent(&dir, 100);
+    if out.json {
+        let items: Vec<Value> = reports
+            .iter()
+            .map(|p| json!({"path": p.display().to_string()}))
+            .collect();
+        println!("{}", Envelope::ok(json!({"reports": items})).to_json_line());
+        return Ok(0);
+    }
+    if reports.is_empty() {
+        println!(
+            "no debug reports in {} (nothing has failed yet)",
+            dir.display()
+        );
+        return Ok(0);
+    }
+    println!("debug reports in {} (newest first):", dir.display());
+    for path in &reports {
+        println!("  {}", path.display());
+    }
+    Ok(0)
+}
+
+fn cmd_debug_show(out: &Output, paths: &Paths, path: Option<String>) -> Result<i32> {
+    let path = match path {
+        Some(p) => PathBuf::from(p),
+        None => match debugreport::recent(&paths.debug_dir(), 1)
+            .into_iter()
+            .next()
+        {
+            Some(p) => p,
+            None => crate::fail!(
+                ErrorCode::InputNothingToDo,
+                "no debug report to show — nothing has failed yet, or run `burpwn debug bundle`"
+            ),
+        },
+    };
+    let body = std::fs::read_to_string(&path).with_code_msg(
+        ErrorCode::InputFileUnreadable,
+        format!("reading {}", path.display()),
+    )?;
+    if out.json {
+        // Re-emit as data so `--json` stays one envelope per invocation.
+        let doc: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        println!("{}", Envelope::ok(doc).to_json_line());
+    } else {
+        println!("{body}");
+    }
+    Ok(0)
+}
+
 // --- init / wrap-hook ------------------------------------------------------
 
 fn cmd_init(out: &Output, args: InitArgs) -> Result<i32> {
@@ -423,9 +544,13 @@ fn cmd_init(out: &Output, args: InitArgs) -> Result<i32> {
     let mut reports = Vec::new();
 
     if let Some(slug) = &args.agent {
-        let agent = Agent::from_slug(slug)
-            .ok_or_else(|| anyhow!("unknown agent: {slug:?} (try claude, cursor, gemini, …)"))?;
-        let r = install(agent, &home, &cfg.exclude_commands).map_err(|e| anyhow!("{e}"))?;
+        let agent = Agent::from_slug(slug).ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::AgentUnknown,
+                "unknown agent: {slug:?} (try claude, cursor, gemini, …)"
+            )
+        })?;
+        let r = install(agent, &home, &cfg.exclude_commands).map_err(anyhow::Error::new)?;
         reports.push(
             json!({ "agent": agent.slug(), "path": r.path, "action": format!("{:?}", r.action) }),
         );
@@ -437,7 +562,7 @@ fn cmd_init(out: &Output, args: InitArgs) -> Result<i32> {
             install_global_hook(&home, &cfg, &mut reports)?;
         }
         for agent in detected {
-            let r = install(agent, &home, &cfg.exclude_commands).map_err(|e| anyhow!("{e}"))?;
+            let r = install(agent, &home, &cfg.exclude_commands).map_err(anyhow::Error::new)?;
             reports.push(json!({ "agent": agent.slug(), "path": r.path, "action": format!("{:?}", r.action) }));
         }
     }
@@ -460,8 +585,12 @@ fn cmd_init_check(out: &Output, home: &std::path::Path, agent: Option<&str>) -> 
     // Target agents: an explicit --agent, else the detected/installed ones, else
     // ALL known agents (so the check is still informative on a clean box).
     let agents = match agent {
-        Some(slug) => vec![Agent::from_slug(slug)
-            .ok_or_else(|| anyhow!("unknown agent: {slug:?} (try claude, cursor, gemini, …)"))?],
+        Some(slug) => vec![Agent::from_slug(slug).ok_or_else(|| {
+            crate::coded!(
+                ErrorCode::AgentUnknown,
+                "unknown agent: {slug:?} (try claude, cursor, gemini, …)"
+            )
+        })?],
         None => {
             let detected = burpwn_wrap::detect_present(home);
             if detected.is_empty() {
@@ -522,7 +651,7 @@ fn install_global_hook(
         // Only touch an rc that already exists (don't create shells the user lacks).
         if rc_path.exists() {
             let changed =
-                install_global(&rc_path, &cfg.exclude_commands).map_err(|e| anyhow!("{e}"))?;
+                install_global(&rc_path, &cfg.exclude_commands).map_err(anyhow::Error::new)?;
             reports.push(json!({ "agent": "global-shell", "path": rc_path, "action": if changed { "Installed" } else { "AlreadyPresent" } }));
             any = true;
         }
@@ -531,7 +660,7 @@ fn install_global_hook(
         // No rc present: install into ~/.bashrc so the hook exists somewhere.
         let rc_path = home.join(".bashrc");
         let changed =
-            install_global(&rc_path, &cfg.exclude_commands).map_err(|e| anyhow!("{e}"))?;
+            install_global(&rc_path, &cfg.exclude_commands).map_err(anyhow::Error::new)?;
         reports.push(json!({ "agent": "global-shell", "path": rc_path, "action": if changed { "Installed" } else { "AlreadyPresent" } }));
     }
     Ok(())
@@ -574,7 +703,7 @@ fn cmd_ca(out: &Output, paths: &Paths, action: CaAction) -> Result<i32> {
     match action {
         CaAction::Init => {
             let ca = CertAuthority::load_or_generate(paths.ca_dir())
-                .map_err(|e| anyhow!("CA init failed: {e}"))?;
+                .map_err(|e| crate::coded!(ErrorCode::TlsCaInit, "CA init failed: {e}"))?;
             let _ = ca; // generated/loaded as a side effect.
             out.ok(
                 format!("CA ready at {}", paths.ca_pem().display()),
@@ -584,7 +713,7 @@ fn cmd_ca(out: &Output, paths: &Paths, action: CaAction) -> Result<i32> {
         }
         CaAction::Export => {
             let ca = CertAuthority::load_or_generate(paths.ca_dir())
-                .map_err(|e| anyhow!("CA load failed: {e}"))?;
+                .map_err(|e| crate::coded!(ErrorCode::TlsCaLoad, "CA load failed: {e}"))?;
             let pem = ca.cert_pem();
             if out.json {
                 println!("{}", Envelope::ok(json!({ "pem": pem })).to_json_line());
@@ -632,7 +761,7 @@ async fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Resu
         SessionAction::Use { name } => {
             validate_session_name(&name)?;
             if !paths.session_exists(&name) {
-                bail!("no such session: {name}");
+                crate::fail!(ErrorCode::SessionNotFound, "no such session: {name}");
             }
             paths.set_active_session(&name)?;
             out.ok(
@@ -644,7 +773,7 @@ async fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Resu
         SessionAction::Rm { name } => {
             validate_session_name(&name)?;
             if !paths.session_exists(&name) {
-                bail!("no such session: {name}");
+                crate::fail!(ErrorCode::SessionNotFound, "no such session: {name}");
             }
             std::fs::remove_dir_all(paths.session_dir(&name))
                 .with_context(|| "removing session dir")?;
@@ -804,7 +933,10 @@ async fn cmd_session_auth_refresh(
         None => all,
     };
     if targets.is_empty() {
-        bail!("no matching auth profile (set one with `session auth set`)");
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "no matching auth profile (set one with `session auth set`)"
+        );
     }
 
     // The login command routes through the session's proxy, so ensure it is up.
@@ -868,7 +1000,8 @@ pub async fn cmd_exec(
     paths.ensure_session_dir(&session)?;
 
     // Ensure the CA exists (the sandbox needs to bind it in).
-    CertAuthority::load_or_generate(paths.ca_dir()).map_err(|e| anyhow!("CA: {e}"))?;
+    CertAuthority::load_or_generate(paths.ca_dir())
+        .map_err(|e| crate::coded!(ErrorCode::TlsCaLoad, "CA: {e}"))?;
 
     // Resolve the --workspace NAME to an id (creating it if absent); omitted ⇒
     // the default workspace. Done before the run so attribution can target it.
@@ -911,46 +1044,19 @@ pub async fn cmd_exec(
     .await
     {
         Ok(result) => result,
-        // The sandbox never came up, so the command never ran captured. Say so
-        // plainly — and diagnose it live, because the usual cause is a kernel
-        // that cannot do what `ip`/`nft` are asking (WSL), which the user has no
-        // way to guess from the raw `ip`/`nft` error alone.
-        Err(e) => return Err(explain_sandbox_setup_failure(json, e)),
+        // The command never ran captured, which is the fact that matters here —
+        // an `exec` that silently produced no traffic is worse than one that
+        // failed loudly. The terminal handler codes it and, for a sandbox
+        // failure, appends a live diagnosis of why the sandbox would not come up.
+        Err(e) => {
+            return Err(e.context("the command did NOT run captured — no traffic was intercepted"))
+        }
     };
 
     if json {
         exec::write_json_envelope(&exec::exec_envelope(&result));
     }
     Ok(result.exit_code)
-}
-
-/// Enrich a failed `exec` with a live sandbox diagnosis when — and only when —
-/// the failure was the sandbox setup itself ([`SandboxError::Setup`]).
-///
-/// Any other error is returned untouched. In `--json` mode nothing extra is
-/// printed (the caller renders the error envelope); in human mode the
-/// remediation lines go to stderr, where they are actionable.
-fn explain_sandbox_setup_failure(json: bool, err: anyhow::Error) -> anyhow::Error {
-    let is_setup = err.chain().any(|c| {
-        matches!(
-            c.downcast_ref::<SandboxError>(),
-            Some(SandboxError::Setup { .. })
-        )
-    });
-    if !is_setup || json {
-        return err;
-    }
-    let probe = deep_probe();
-    if !probe.is_ok() {
-        eprintln!(
-            "burpwn: the sandbox cannot be created on this host ({}).",
-            probe.summary()
-        );
-        for line in probe.remediation() {
-            eprintln!("  - {line}");
-        }
-    }
-    err.context("the command did NOT run captured — no traffic was intercepted")
 }
 
 /// Ensure a daemon answers `Status` on the session's control socket; spawn the
@@ -1107,7 +1213,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
             let found = ws.iter().find(|w| &w.name == name);
             match found {
                 Some(w) => Some(w.id),
-                None => bail!("no such workspace: {name}"),
+                None => crate::fail!(ErrorCode::WorkspaceNotFound, "no such workspace: {name}"),
             }
         }
     };
@@ -1155,7 +1261,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
 fn req_show(out: &Output, paths: &Paths, session: &str, id: i64, raw: bool) -> Result<i32> {
     let store = open_store(paths, session)?;
     let Some(detail) = store.reader().get_flow(id)? else {
-        bail!("no such flow: {id}");
+        crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {id}");
     };
     if raw {
         // Print the verbatim request/response bytes (head + body).
@@ -1284,8 +1390,13 @@ async fn req_replay(
             // (possibly resolved/absolute) path back: an error message that
             // varies by path existence/permission is a path-probing oracle for
             // agent-driven automation. Report only the io error kind.
-            let data = std::fs::read(&spec[1..])
-                .map_err(|e| anyhow!("reading --set-body @file failed: {}", e.kind()))?;
+            let data = std::fs::read(&spec[1..]).map_err(|e| {
+                crate::coded!(
+                    ErrorCode::InputFileUnreadable,
+                    "reading --set-body @file failed: {}",
+                    e.kind()
+                )
+            })?;
             Some(data)
         }
         Some(spec) => Some(spec.clone().into_bytes()),
@@ -1437,7 +1548,10 @@ async fn cmd_match_replace(out: &Output, paths: &Paths, action: MatchReplaceActi
             let on_request = match on.as_str() {
                 "request" | "req" => true,
                 "response" | "resp" => false,
-                other => bail!("--on must be request|response, got {other:?}"),
+                other => crate::fail!(
+                    ErrorCode::InputInvalidValue,
+                    "--on must be request|response, got {other:?}"
+                ),
             };
             let id = store
                 .writer()
@@ -1537,7 +1651,7 @@ async fn cmd_workspace(out: &Output, paths: &Paths, action: WorkspaceAction) -> 
                     format!("workspace {name} is id {}", w.id),
                     json!({ "id": w.id, "name": name }),
                 ),
-                None => bail!("no such workspace: {name}"),
+                None => crate::fail!(ErrorCode::WorkspaceNotFound, "no such workspace: {name}"),
             }
         }
     }
@@ -1642,7 +1756,10 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
                     // does not follow the final component, so a symlink is caught.
                     if let Ok(meta) = std::fs::symlink_metadata(&path) {
                         if meta.file_type().is_symlink() {
-                            bail!("refusing to write HAR through an existing symlink: {path}");
+                            crate::fail!(
+                                ErrorCode::InputUnsafePath,
+                                "refusing to write HAR through an existing symlink: {path}"
+                            );
                         }
                     }
                     std::fs::write(&path, &text).with_context(|| format!("writing {path}"))?;
@@ -1708,8 +1825,12 @@ async fn cmd_fuzz(out: &Output, paths: &Paths, action: FuzzAction) -> Result<i32
             sort,
             limit,
         } => {
-            let sort = crate::fuzz::ResultSort::from_str_opt(&sort)
-                .ok_or_else(|| anyhow!("--sort must be anomaly|status|len, got {sort:?}"))?;
+            let sort = crate::fuzz::ResultSort::from_str_opt(&sort).ok_or_else(|| {
+                crate::coded!(
+                    ErrorCode::InputInvalidValue,
+                    "--sort must be anomaly|status|len, got {sort:?}"
+                )
+            })?;
             let v = crate::fuzz::fuzz_show(paths, &session, attack_id, sort, limit)?;
             if out.json {
                 println!("{}", Envelope::ok(v).to_json_line());
@@ -1745,8 +1866,12 @@ async fn cmd_fuzz_run(
     use burpwn_proxy::AttackMode;
     use tokio_util::sync::CancellationToken;
 
-    let mode = AttackMode::from_str_opt(&args.mode)
-        .ok_or_else(|| anyhow!("--mode must be sniper|battering-ram|pitchfork|cluster-bomb"))?;
+    let mode = AttackMode::from_str_opt(&args.mode).ok_or_else(|| {
+        crate::coded!(
+            ErrorCode::InputInvalidValue,
+            "--mode must be sniper|battering-ram|pitchfork|cluster-bomb"
+        )
+    })?;
 
     // Positions.
     let mut positions = Vec::new();
@@ -1761,18 +1886,26 @@ async fn cmd_fuzz_run(
         .map(|p| p.clone().into_bytes())
         .collect();
     if let Some(file) = &args.payloads {
-        let data = std::fs::read_to_string(file)
-            .map_err(|e| anyhow!("reading --payloads file failed: {}", e.kind()))?;
+        let data = std::fs::read_to_string(file).map_err(|e| {
+            crate::coded!(
+                ErrorCode::InputFileUnreadable,
+                "reading --payloads file failed: {}",
+                e.kind()
+            )
+        })?;
         for line in data.lines() {
             payloads.push(line.as_bytes().to_vec());
         }
     }
 
     let request_bytes = match &args.request {
-        Some(file) => Some(
-            std::fs::read(file)
-                .map_err(|e| anyhow!("reading --request file failed: {}", e.kind()))?,
-        ),
+        Some(file) => Some(std::fs::read(file).map_err(|e| {
+            crate::coded!(
+                ErrorCode::InputFileUnreadable,
+                "reading --request file failed: {}",
+                e.kind()
+            )
+        })?),
         None => None,
     };
 
@@ -1837,13 +1970,18 @@ fn cmd_compare(out: &Output, paths: &Paths, args: CompareArgs) -> Result<i32> {
     let store = open_store(paths, &session)?;
     let reader = store.reader();
     let Some(a) = reader.get_flow(args.flow_a)? else {
-        bail!("no such flow: {}", args.flow_a);
+        crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {}", args.flow_a);
     };
     let Some(b) = reader.get_flow(args.flow_b)? else {
-        bail!("no such flow: {}", args.flow_b);
+        crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {}", args.flow_b);
     };
-    let what = crate::compare::CompareWhat::from_str_opt(&args.what)
-        .ok_or_else(|| anyhow!("--what must be headers|body|all, got {:?}", args.what))?;
+    let what = crate::compare::CompareWhat::from_str_opt(&args.what).ok_or_else(|| {
+        crate::coded!(
+            ErrorCode::InputInvalidValue,
+            "--what must be headers|body|all, got {:?}",
+            args.what
+        )
+    })?;
     let v = crate::compare::diff_flows(&a, &b, what);
     if out.json {
         println!("{}", Envelope::ok(v).to_json_line());
@@ -1882,7 +2020,7 @@ fn cmd_decode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
 fn dirs_home() -> Result<std::path::PathBuf> {
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME is not set"))
+        .ok_or_else(|| crate::coded!(ErrorCode::SessionNoDataDir, "HOME is not set"))
 }
 
 fn now_millis() -> i64 {

@@ -105,6 +105,50 @@ make install                # PREFIX=/usr/local make install  (may need sudo); `
 The `curl | sh` path downloads the release binary for your architecture (x86_64 / aarch64 Linux) and
 verifies its checksum; if none matches it falls back to a `cargo` source build.
 
+## Errors, exit codes and debug reports
+
+Every failure comes out the same way: a stable code, the verbatim cause chain,
+what to do about it, and a debug report on disk.
+
+```text
+$ burpwn exec -- curl https://target.example/
+error [BW-SANDBOX-003] the command did NOT run captured — no traffic was intercepted
+  cause : sandbox setup failed at `netns_setup`: ip link add burp0 type dummy failed:
+          Error: Unknown device type.
+  fix   : the `dummy` network driver is unavailable — the sandbox needs it for the
+          netns egress sink (`ip link add burp0 type dummy`)
+        : run `burpwn doctor`: it recreates the sandbox live and names the failing step
+  debug : ~/.local/share/burpwn/debug/2026-07-29T18-33-17Z-BW-SANDBOX-003.json
+  exit  : 70
+```
+
+- **Codes** (`BW-<CLASS>-<NNN>`) are stable and never renumbered. The full
+  catalogue is in [`skills/burpwn/reference.md`](./skills/burpwn/reference.md).
+- **Exit codes** are the failure's class, so scripts branch without parsing:
+  `70` sandbox, `71` daemon, `72` store, `73` TLS/CA, `74` session, `75` input,
+  `76` agent integration, `77` network, `78` internal (a bug).
+  ⚠️ `burpwn exec` passes the wrapped command's exit code through, so a value in
+  that range out of `exec` may be the command's own — `--json` disambiguates.
+- **`--json`** keeps the existing `error` string (now prefixed with the code) and
+  adds a `diagnostic` object with the code, class, causes, remediation and the
+  report path. MCP tool errors carry the same object in the error `data`.
+- **Debug reports** are written automatically on every failure (last 20 kept):
+  burpwn's version, the invocation, kernel/distro/WSL/container detection, the
+  sandbox prerequisites and — for sandbox failures — a live re-probe, plus the
+  on-disk state of each session.
+
+```sh
+burpwn debug list                # reports from past failures
+burpwn debug show               # print the most recent one
+burpwn debug bundle             # write a fresh full report to attach to an issue
+burpwn debug bundle -o - | less # …or straight to stdout
+```
+
+Reports are redacted before they touch disk: environment values outside a small
+allowlist are dropped, and token-shaped strings (JWTs, `Authorization` values,
+long opaque runs) are replaced by `«redacted»`. Captured request/response bodies
+are never included — the report describes the store, it never reads from it.
+
 ## Build (from source)
 
 ```sh

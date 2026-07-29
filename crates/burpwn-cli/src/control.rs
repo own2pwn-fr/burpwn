@@ -22,6 +22,7 @@
 //!   daemon keyed by id, so a later `InterceptForward`/`InterceptDrop` resolves it.
 //! - [`ControlRequest::Shutdown`] tears the daemon down.
 
+use burpwn_error::ErrorCode;
 use serde::{Deserialize, Serialize};
 
 /// A single header edit (`name: value`) applied when forwarding an intercept.
@@ -185,7 +186,7 @@ pub fn encode_response(resp: &ControlResponse) -> String {
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -244,7 +245,8 @@ impl ControlClient {
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(sock))
             .await
             .map_err(|_| {
-                anyhow!(
+                crate::coded!(
+                    ErrorCode::DaemonUnreachable,
                     "timed out connecting to control socket {} after {}s",
                     sock.display(),
                     CONNECT_TIMEOUT.as_secs()
@@ -266,7 +268,8 @@ impl ControlClient {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => {
-                    return Err(anyhow!(
+                    return Err(crate::coded!(
+                        ErrorCode::DaemonNotReady,
                         "control socket {} never became ready: {e}",
                         sock.display()
                     ))
@@ -290,7 +293,8 @@ impl ControlClient {
         let timeout = request_timeout(&req);
         match tokio::time::timeout(timeout, self.request_inner(req)).await {
             Ok(res) => res,
-            Err(_) => Err(anyhow!(
+            Err(_) => Err(crate::coded!(
+                ErrorCode::DaemonProtocol,
                 "control request timed out after {}s (daemon not responding)",
                 timeout.as_secs()
             )),
@@ -311,10 +315,14 @@ impl ControlClient {
             .read_line(&mut buf)
             .await?;
         if n == 0 {
-            return Err(anyhow!("control connection closed before a response"));
+            return Err(crate::coded!(
+                ErrorCode::DaemonProtocol,
+                "control connection closed before a response"
+            ));
         }
         if !buf.ends_with('\n') && n as u64 >= MAX_RESPONSE_LINE {
-            return Err(anyhow!(
+            return Err(crate::coded!(
+                ErrorCode::DaemonProtocol,
                 "control response exceeds {MAX_RESPONSE_LINE} bytes (daemon misbehaving)"
             ));
         }
