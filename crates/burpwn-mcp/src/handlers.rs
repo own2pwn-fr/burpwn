@@ -284,6 +284,13 @@ fn control_value(resp: burpwn_cli::control::ControlResponse) -> Result<Value> {
             Some(it) => Ok(json!({ "pending": true, "intercept": it })),
             None => Ok(json!({ "pending": false })),
         },
+        // `found: false` means the forward/drop did NOT happen. Returning it as a
+        // successful tool result invites an agent to move on believing the
+        // intercept was released.
+        R::Resolved { found: false } => Err(burpwn_cli::coded!(
+            ErrorCode::InputNoSuchIntercept,
+            "no parked intercept with that id (list them with intercept_list)"
+        )),
         R::Resolved { found } => Ok(json!({ "found": found })),
         R::Error { message } => Err(burpwn_cli::coded!(
             ErrorCode::DaemonRejected,

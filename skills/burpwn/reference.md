@@ -95,6 +95,7 @@ produce it — the JSON envelope disambiguates.
 | `BW-INPUT-008` | refusing to write through an unsafe path |
 | `BW-INPUT-009` | there is nothing to act on |
 | `BW-INPUT-010` | the regex is invalid for this use |
+| `BW-INPUT-011` | no such parked intercept |
 
 **AGENT** — exit code `76`
 

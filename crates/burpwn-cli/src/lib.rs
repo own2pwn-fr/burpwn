@@ -239,6 +239,31 @@ mod tests {
         assert_eq!(terminate(false, &paths, Ok(42)), 42);
     }
 
+    // The bypass this guards against is easy to reintroduce and invisible in
+    // review: print `error: …` yourself and `return Ok(1)`. The command then
+    // exits 1 instead of its class code, with no catalogue code and no debug
+    // report — and in `--json` mode it can even come back as `ok: true`.
+    // Failures must travel as `Err`, so the terminal handler sees them.
+    #[test]
+    fn no_command_prints_its_own_error_instead_of_returning_one() {
+        let src = include_str!("commands.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            // `contains`, not `starts_with`: the worst instance of this bug was
+            // an inline match arm (`Response::Error { .. } => eprintln!("error: …")`),
+            // which a line-prefix check walks straight past.
+            .filter(|(_, l)| {
+                l.contains("eprintln!(\"error:") || l.contains("eprintln!(\"burpwn: error")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these print an error instead of returning one: {offenders:?}"
+        );
+    }
+
     #[test]
     fn a_failure_before_paths_exist_is_still_coded() {
         let err = anyhow::anyhow!("cannot determine a data directory");

@@ -231,6 +231,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "burpwn-cli",
+ "burpwn-error",
  "burpwn-mcp",
  "burpwn-sandbox",
  "clap",

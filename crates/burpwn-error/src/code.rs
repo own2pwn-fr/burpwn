@@ -185,6 +185,9 @@ pub enum ErrorCode {
     InputNothingToDo,
     /// A user-supplied regex is invalid or lacks its capture group.
     InputBadRegex,
+    /// The referenced parked intercept does not exist (already forwarded,
+    /// dropped, or never parked).
+    InputNoSuchIntercept,
 
     // --- agent integration (exit 76) ---------------------------------------
     /// The named agent / framework / MCP host is not one burpwn knows.
@@ -235,7 +238,8 @@ impl ErrorCode {
             | InputFileUnreadable
             | InputUnsafePath
             | InputNothingToDo
-            | InputBadRegex => ErrorClass::Input,
+            | InputBadRegex
+            | InputNoSuchIntercept => ErrorClass::Input,
             AgentUnknown | AgentConfigShape | AgentRefusedOverwrite => ErrorClass::Agent,
             NetworkReplayFailed | NetworkAuthRefreshFailed => ErrorClass::Network,
             Internal => ErrorClass::Internal,
@@ -286,6 +290,7 @@ impl ErrorCode {
             InputUnsafePath => 8,
             InputNothingToDo => 9,
             InputBadRegex => 10,
+            InputNoSuchIntercept => 11,
 
             AgentUnknown => 1,
             AgentConfigShape => 2,
@@ -352,6 +357,7 @@ impl ErrorCode {
             InputUnsafePath => "refusing to write through an unsafe path",
             InputNothingToDo => "there is nothing to act on",
             InputBadRegex => "the regex is invalid for this use",
+            InputNoSuchIntercept => "no such parked intercept",
 
             AgentUnknown => "unknown agent / framework / MCP host",
             AgentConfigShape => "the agent config file is not a shape burpwn can edit",
@@ -472,6 +478,10 @@ impl ErrorCode {
             InputBadRegex => vec![
                 "`--extract` needs exactly one capture group: the token to extract",
             ],
+            InputNoSuchIntercept => vec![
+                "list what is currently parked with `burpwn intercept list` — an intercept \
+                 disappears once it has been forwarded or dropped",
+            ],
 
             AgentUnknown => vec!["the supported names are listed in the message above"],
             AgentConfigShape => vec![
@@ -532,6 +542,7 @@ impl ErrorCode {
         ErrorCode::InputUnsafePath,
         ErrorCode::InputNothingToDo,
         ErrorCode::InputBadRegex,
+        ErrorCode::InputNoSuchIntercept,
         ErrorCode::AgentUnknown,
         ErrorCode::AgentConfigShape,
         ErrorCode::AgentRefusedOverwrite,
@@ -571,7 +582,7 @@ mod tests {
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(*code, back);
         }
-        assert_eq!(ErrorCode::ALL.len(), 41, "register new codes in ALL");
+        assert_eq!(ErrorCode::ALL.len(), 42, "register new codes in ALL");
     }
 
     #[test]
@@ -636,6 +647,58 @@ mod tests {
             // Above 0/1, below the shell's reserved 126/127/128+n.
             assert!((2..126).contains(&c), "{class:?} -> {c}");
         }
+    }
+
+    // A code nobody can ever emit is worse than no code: it is documentation
+    // for a failure that does not exist, and it hides the fact that the real
+    // failure is being reported some other (uncoded) way. This caught
+    // `AgentRefusedOverwrite`, which was documented while the refusal it names
+    // was being reported as a SUCCESS.
+    #[test]
+    fn every_code_is_actually_emitted_somewhere() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(crates) = std::fs::read_dir(root.join("crates")) else {
+            return; // not a workspace checkout
+        };
+        let mut sources = String::new();
+        let mut stack: Vec<std::path::PathBuf> =
+            crates.flatten().map(|e| e.path().join("src")).collect();
+        while let Some(dir) = stack.pop() {
+            // The catalogue's own file defines every variant; it proves nothing
+            // about whether anyone emits them.
+            if dir.ends_with("burpwn-error/src") {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    sources.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                }
+            }
+        }
+        if sources.is_empty() {
+            return;
+        }
+        let unemitted: Vec<String> = ErrorCode::ALL
+            .iter()
+            .filter(|c| {
+                let name = format!("{c:?}");
+                // Emitted as `ErrorCode::X` at a call site, or as `C::X` inside a
+                // `Coded` impl that aliases the enum.
+                !sources.contains(&format!("ErrorCode::{name}"))
+                    && !sources.contains(&format!("C::{name}"))
+            })
+            .map(|c| c.id())
+            .collect();
+        assert!(
+            unemitted.is_empty(),
+            "codes in the catalogue that nothing can ever emit: {unemitted:?}"
+        );
     }
 
     // The published catalogue is a contract, so the docs must not drift from

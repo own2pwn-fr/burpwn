@@ -216,6 +216,22 @@ fn cmd_skill_install(out: &Output, args: SkillInstallArgs) -> Result<i32> {
         }
     }
 
+    // A refusal is a legitimate per-target OUTCOME under `--all` (some targets
+    // install, some are already owned by someone else). But when the user named
+    // exactly one target, "refused" means the thing they asked for did not
+    // happen — reporting that as success, with exit 0, hides it.
+    if !args.all {
+        if let Some(rep) = reports.first() {
+            if rep["action"] == json!(skill::SkillAction::Refused.as_str()) {
+                crate::fail!(
+                    ErrorCode::AgentRefusedOverwrite,
+                    "{} already exists and was not written by burpwn",
+                    rep["path"].as_str().unwrap_or("the target file")
+                );
+            }
+        }
+    }
+
     let human = format!("processed {} skill target(s)", reports.len());
     out.ok(human, json!({ "installed": reports }));
     Ok(0)
@@ -285,13 +301,10 @@ fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
 
     // Frameworks with no stdio MCP host: clear message, not a guessed path.
     if let Some(name) = mcpreg::unsupported_slug(slug) {
-        let msg = format!("{name} has no stdio MCP host to register into; see its docs");
-        if out.json {
-            println!("{}", Envelope::err(&msg).to_json_line());
-        } else {
-            eprintln!("error: {msg}");
-        }
-        return Ok(1);
+        crate::fail!(
+            ErrorCode::AgentUnknown,
+            "{name} has no stdio MCP host to register into; see its docs"
+        );
     }
 
     let host = mcpreg::host_by_slug(slug).ok_or_else(|| {
@@ -310,6 +323,17 @@ fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
         println!("# {} -> {}", rep.slug, rep.path.display());
         print!("{}", rep.content);
         return Ok(0);
+    }
+
+    // `mcp register` always targets exactly one host, so a refusal — the config
+    // file is not the shape burpwn can edit — is a failure, not an outcome.
+    // Reporting it as success left the user believing the tools were registered.
+    if rep.action == mcpreg::McpAction::Refused {
+        crate::fail!(
+            ErrorCode::AgentConfigShape,
+            "{} is not a config burpwn can edit; it was left intact",
+            rep.path.display()
+        );
     }
 
     out.ok(
@@ -1013,16 +1037,11 @@ pub async fn cmd_exec(
         None => {
             let pf = doctor();
             if !pf.is_ok() {
-                let msg = format!(
-                    "sandbox preflight failed: {} — run `burpwn doctor`",
+                crate::fail!(
+                    ErrorCode::SandboxPrerequisites,
+                    "sandbox preflight failed: {}",
                     pf.missing_summary()
                 );
-                if json {
-                    exec::write_json_envelope(&Envelope::err(&msg));
-                } else {
-                    eprintln!("error: {msg}");
-                }
-                return Ok(1);
             }
             // Ensure a daemon is running for this session.
             ensure_daemon(paths, &session).await?;
@@ -1465,7 +1484,7 @@ async fn cmd_intercept(out: &Output, paths: &Paths, action: InterceptAction) -> 
         }
     };
 
-    render_control(out, resp);
+    render_control(out, resp)?;
     Ok(0)
 }
 
@@ -1490,11 +1509,30 @@ fn build_edits(
     })
 }
 
-fn render_control(out: &Output, resp: ControlResponse) {
+/// Render one control response.
+///
+/// Returns `Err` for [`ControlResponse::Error`] so a refusal by the daemon is a
+/// FAILURE, not a success that happens to print the word "error": it used to
+/// print to stderr and still exit 0 — and in `--json` mode it was wrapped in an
+/// `ok: true` envelope, which is actively misleading to a script or an agent.
+fn render_control(out: &Output, resp: ControlResponse) -> Result<()> {
+    if let ControlResponse::Error { message } = &resp {
+        crate::fail!(ErrorCode::DaemonRejected, "{message}");
+    }
+    // `forward`/`drop` answer `Resolved { found: false }` when the id names no
+    // parked intercept. That is the request NOT being carried out, so it cannot
+    // be a success: it used to print "id not found" and exit 0, which reads to a
+    // script — or an agent driving await→forward — as if the request went through.
+    if let ControlResponse::Resolved { found: false } = &resp {
+        crate::fail!(
+            ErrorCode::InputNoSuchIntercept,
+            "no parked intercept with that id"
+        );
+    }
     let data = serde_json::to_value(&resp).unwrap_or(Value::Null);
     if out.json {
         println!("{}", Envelope::ok(data).to_json_line());
-        return;
+        return Ok(());
     }
     match resp {
         ControlResponse::Status {
@@ -1526,10 +1564,13 @@ fn render_control(out: &Output, resp: ControlResponse) {
             None => println!("(timed out, none parked)"),
         },
         ControlResponse::Resolved { found } => {
-            println!("{}", if found { "resolved" } else { "id not found" });
+            println!("resolved");
+            let _ = found; // `found: false` is rejected before we get here.
         }
-        ControlResponse::Error { message } => eprintln!("error: {message}"),
+        // Already turned into a coded failure above.
+        ControlResponse::Error { .. } => unreachable!("handled before rendering"),
     }
+    Ok(())
 }
 
 // --- match-replace ---------------------------------------------------------
@@ -1780,13 +1821,10 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
         }
         ExportAction::Pcap { output } => {
             let _ = output;
-            let msg = "pcap export is not yet implemented (use `export har`)";
-            if out.json {
-                println!("{}", Envelope::err(msg).to_json_line());
-            } else {
-                eprintln!("error: {msg}");
-            }
-            Ok(1)
+            crate::fail!(
+                ErrorCode::InputInvalidValue,
+                "pcap export is not yet implemented (use `export har`)"
+            );
         }
     }
 }

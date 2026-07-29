@@ -33,8 +33,15 @@ fn main() {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("burpwn: failed to start the async runtime: {e}");
-            std::process::exit(1);
+            // Even the earliest possible failure gets the standard shape; there
+            // is no `Paths` yet, so it is rendered without a debug report.
+            let diag = burpwn_error::Diagnostic::new(
+                burpwn_error::ErrorCode::Internal,
+                "failed to start the async runtime",
+            )
+            .cause(e.to_string());
+            eprintln!("{}", diag.render());
+            std::process::exit(diag.exit_code());
         }
     };
 

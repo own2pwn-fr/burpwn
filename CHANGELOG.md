@@ -31,6 +31,28 @@ All notable changes to burpwn are documented here. The format is based on
   parsing prose. Previously they were `e.to_string()` — the outermost message only, with the
   cause chain discarded.
 
+### Fixed — failures that were being reported as successes
+An exhaustiveness audit of the new error contract found six paths that bypassed it entirely by
+printing their own message and returning a success-shaped result:
+- **`intercept forward|drop` on an id that names no parked intercept** exited **0** and printed
+  "id not found"; in `--json` it came back as `ok: true`. An agent driving `await → forward` had
+  no way to notice the forward never happened. Now `BW-INPUT-011` (new code), exit 75.
+- **`intercept …` when the daemon answered with an error** exited **0** and printed to stderr;
+  in `--json` the daemon's error was wrapped in an `ok: true` envelope. Now `BW-DAEMON-004`.
+- **`mcp register` on a config file burpwn cannot edit** reported `action: "Refused"` and exited
+  0, leaving the user believing the tools were registered. Now `BW-AGENT-002`.
+- **`skill install --agent X` on a file burpwn does not own** likewise reported `Refused` and
+  exited 0. Now `BW-AGENT-003` — but only for a single explicit `--agent`, since under `--all` a
+  refusal is a legitimate per-target outcome.
+- **`exec` when the sandbox preflight fails** and **`export pcap`** printed `error: …` and exited
+  1 instead of their class exit code, with no catalogue code and no debug report.
+- **A failure to start the async runtime** exited 1 with a bare sentence.
+
+Two regression guards now hold the line: one asserts no command prints `error:` itself instead of
+returning an `Err` (the pattern behind five of the six), and one asserts every catalogue code is
+actually emitted somewhere — that is what exposed `BW-AGENT-003` as documentation for a failure
+that was being reported as a success.
+
 ### Changed — no failure reaches the user as a bare sentence
 - A single terminal handler in `burpwn-cli` classifies every error chain: an explicit code wins,
   then a typed error from a lower crate that knows its own code (`StoreError`, `TlsError`,
