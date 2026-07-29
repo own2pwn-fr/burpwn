@@ -56,7 +56,7 @@ namespace, so LLM traffic is excluded by construction.
 ## Usage (target surface)
 
 ```sh
-burpwn doctor                                  # check the rootless prerequisites
+burpwn doctor                                  # prerequisites + a LIVE sandbox probe (--quick skips it)
 burpwn ca init && burpwn ca export             # generate / print the MITM CA
 burpwn session new --name engagement-1
 burpwn exec -- curl -s https://target.example/ # runs sandboxed; traffic captured + decrypted
@@ -81,6 +81,13 @@ burpwn init --check                            # verify each agent hook really r
 Linux-only (relies on user/network namespaces, nftables, bubblewrap). Install the prerequisites
 first — Fedora/RHEL: `sudo dnf install bubblewrap nftables iproute`; Debian/Ubuntu:
 `sudo apt install bubblewrap nftables iproute2`.
+
+> **WSL is not supported.** The Microsoft WSL2 kernel ships **no loadable modules**, and the
+> features the sandbox needs are built as modules there (`CONFIG_DUMMY=m`, `CONFIG_NFT_REDIR=m`,
+> `CONFIG_NF_REJECT_IPV4=m`). `ip` and `nft` are installed and *look* fine, but `ip link add …
+> type dummy` and the nftables `redirect` expression fail at runtime, so nothing can be captured.
+> `burpwn doctor` detects this exactly (it really creates a throwaway sandbox) and says so. Use a
+> real Linux host/VM, or boot WSL on a custom kernel built with those options set to `=y`.
 
 ```sh
 # one-liner: download the prebuilt binary, install to ~/.local/bin, generate the CA, run preflight

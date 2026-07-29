@@ -24,13 +24,19 @@
 //!   the [`SandboxError`] type, and the privilege-free [`MockRuntime`].
 //! * [`rootless`] — the prod [`RootlessRuntime`] + [`doctor`]/[`Preflight`]
 //!   (privileged paths gated behind preflight; pure helpers CI-tested).
+//! * [`probe`] — the LIVE deep probe behind `burpwn doctor`: it really creates a
+//!   throwaway userns+netns and runs the production setup sequence in it, so a
+//!   kernel that has the binaries but not the features (WSL) is caught here
+//!   instead of silently producing empty captures.
 
 pub mod nft;
+pub mod probe;
 pub mod rootless;
 pub mod runtime;
 pub mod wire;
 
 pub use nft::{redirect_ruleset, redirect_ruleset_with, UdpAction};
+pub use probe::{deep_probe, is_wsl, netns_probe_main, ProbeReport, ProbeStep, NETNS_PROBE_ARG};
 pub use rootless::{
     doctor, netns_agent_main, resolve_rlimits, Preflight, RootlessRuntime, SandboxRlimits,
     DEFAULT_RLIMIT_AS_BYTES, DEFAULT_RLIMIT_CPU_SECONDS, DEFAULT_RLIMIT_NPROC, NETNS_AGENT_ARG,

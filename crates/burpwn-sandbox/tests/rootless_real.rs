@@ -45,6 +45,7 @@ async fn runs_true_inside_a_real_sandbox() {
         workspace_id: 1,
         timeout: None,
         inherit_stdio: false,
+        status_path: None,
     };
 
     let outcome = rt.run(spec).await.expect("sandbox run should succeed");

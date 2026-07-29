@@ -8,7 +8,11 @@ burpwn [--json] <command>
 ```
 
 ## doctor
-`burpwn doctor [--json]` — probe the host for sandbox prerequisites and CA presence.
+`burpwn doctor [--quick] [--json]` — probe the host for sandbox prerequisites and CA presence,
+then run a LIVE probe that really creates a throwaway userns+netns and executes the production
+setup sequence in it (dummy device, nftables REDIRECT ruleset, bubblewrap). Reports the failing
+step plus remediation — this is what catches a host where `ip`/`nft` are installed but the kernel
+cannot use them (WSL). `--quick` skips the live probe.
 
 ## init
 `burpwn init [--global] [--agent <AGENT>] [--json]`

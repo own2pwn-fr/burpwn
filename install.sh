@@ -92,10 +92,20 @@ case ":$PATH:" in
 esac
 
 say "Generating the MITM CA…"; "$BURPWN" ca init || true
-say "Checking rootless prerequisites…"
+say "Checking rootless prerequisites (this really creates a throwaway sandbox)…"
 if ! "$BURPWN" doctor; then
   echo "  Fedora/RHEL:   sudo dnf install bubblewrap nftables iproute"
   echo "  Debian/Ubuntu: sudo apt install bubblewrap nftables iproute2"
+  # WSL cannot be fixed by a package: its kernel ships no loadable modules, and
+  # the sandbox needs dummy/nft_redir, which are =m there. Say it here too, so
+  # the failure is understood at install time rather than at the first exec.
+  case "$(uname -r)" in
+    *microsoft*|*WSL*|*wsl*)
+      warn "this is WSL — the Microsoft kernel ships no loadable modules, so burpwn cannot"
+      warn "capture traffic here. Use a real Linux host/VM, or a custom WSL2 kernel built with"
+      warn "CONFIG_DUMMY=y and CONFIG_NFT_REDIR=y (.wslconfig \`kernel=\`)."
+      ;;
+  esac
 fi
 [ "$WANT_HOOKS" = "1" ] && { say "Installing the global shell hook…"; "$BURPWN" init --global || true; }
 

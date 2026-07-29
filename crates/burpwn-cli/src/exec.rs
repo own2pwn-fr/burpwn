@@ -307,6 +307,9 @@ pub fn build_spec(
         workspace_id: 1,
         timeout,
         inherit_stdio,
+        // Set per-invocation by `run_exec`, which owns the exec_id the path is
+        // named after.
+        status_path: None,
     }
 }
 
@@ -336,6 +339,13 @@ pub async fn run_exec(
     // The proxy stamps flows from this run with these, via the wire header.
     spec.exec_id = exec_id.clone();
     spec.workspace_id = workspace_id;
+    // Where the in-namespace agent drops a failure record if the sandbox cannot
+    // be brought up. It lives next to proxy.sock, in the session run dir, which
+    // is masked (tmpfs) inside bwrap — so the wrapped command cannot forge one.
+    spec.status_path = spec
+        .proxy_sock
+        .parent()
+        .map(|dir| dir.join(format!("{exec_id}.setup-err")));
     // Also expose the id in the child's env (harmless): tools may read it.
     spec.env.push(("BURPWN_EXEC_ID".into(), exec_id.clone()));
 

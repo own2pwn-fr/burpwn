@@ -14,6 +14,15 @@ fn main() {
         std::process::exit(burpwn_sandbox::netns_agent_main());
     }
 
+    // Same deal for the deep-probe helper `burpwn doctor` re-execs into a
+    // throwaway userns+netns: it must stay single-threaded to spawn ip/nft/bwrap.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == burpwn_sandbox::NETNS_PROBE_ARG)
+    {
+        std::process::exit(burpwn_sandbox::netns_probe_main());
+    }
+
     // Install the process-wide rustls crypto provider exactly once, before any
     // TLS work (leaf signing, MITM accept, upstream connect). `ring`, matching
     // the workspace's rustls feature selection.

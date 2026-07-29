@@ -22,7 +22,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Probe the host for sandbox prerequisites and the CA.
-    Doctor,
+    Doctor(DoctorArgs),
 
     /// Install agent / shell command-rewrite hooks.
     Init(InitArgs),
@@ -421,6 +421,18 @@ pub struct SessionAuthSetArgs {
     /// Session to operate on (defaults to the active session).
     #[arg(long)]
     pub session: Option<String>,
+}
+
+/// `doctor` arguments.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Skip the live sandbox probe and only check that the prerequisites are
+    /// installed. Much faster, but it CANNOT tell you whether the kernel can
+    /// actually create the sandbox (a host may have `ip`/`nft` installed and
+    /// still lack the modules behind them — this is exactly what happens on
+    /// WSL), so the deep probe is the default.
+    #[arg(long)]
+    pub quick: bool,
 }
 
 /// `exec` arguments.

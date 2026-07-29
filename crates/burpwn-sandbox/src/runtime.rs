@@ -29,6 +29,19 @@ pub enum SandboxError {
     /// A privileged setup/teardown step failed (clone, uid_map, netns, nft…).
     #[error("sandbox runtime error: {0}")]
     Runtime(String),
+    /// The in-namespace setup failed BEFORE the command could run — the netns,
+    /// its nftables ruleset, or the acceptor could not be brought up, so no
+    /// traffic could ever have been captured. Distinguished from
+    /// [`SandboxError::Runtime`] because it is the failure the user must be told
+    /// about explicitly (it is what an unsupported kernel — e.g. WSL — looks
+    /// like) instead of it surfacing as a vague "captured ZERO flows" warning.
+    #[error("sandbox setup failed at `{stage}`: {detail} — run `burpwn doctor` for a diagnosis")]
+    Setup {
+        /// Which in-namespace stage failed (`netns_setup`, `acceptor_bind`, …).
+        stage: String,
+        /// The raw error text from that stage.
+        detail: String,
+    },
     /// The command was spawned but exceeded its timeout and was killed.
     #[error("sandbox command timed out after {0:?}")]
     Timeout(Duration),
@@ -71,6 +84,14 @@ pub struct ExecSpec {
     /// When true, inherit the parent's stdio (pass-through mode for the CLI);
     /// when false (default), capture stdout/stderr into the [`ExecOutcome`].
     pub inherit_stdio: bool,
+    /// Optional host path the in-namespace agent writes a JSON failure record to
+    /// when it cannot bring the sandbox up. The agent runs behind an `execve` in
+    /// another namespace, so its stderr is not a reliable channel back to us
+    /// (in pass-through mode it goes straight to the user's terminal, mixed into
+    /// the command's own output); this file is. The host parent reads and
+    /// deletes it after reaping, turning it into [`SandboxError::Setup`].
+    #[serde(default)]
+    pub status_path: Option<PathBuf>,
 }
 
 impl ExecSpec {
@@ -89,6 +110,7 @@ impl ExecSpec {
             workspace_id: 1,
             timeout: None,
             inherit_stdio: false,
+            status_path: None,
         }
     }
 }
@@ -235,5 +257,28 @@ mod tests {
         let s = spec();
         assert!(!s.inherit_stdio);
         assert!(s.timeout.is_none());
+        assert!(s.status_path.is_none());
+    }
+
+    // The spec crosses an `execve` as JSON, so an older/newer helper image must
+    // still deserialize a spec that predates `status_path`.
+    #[test]
+    fn exec_spec_deserializes_without_status_path() {
+        let mut value = serde_json::to_value(spec()).unwrap();
+        value.as_object_mut().unwrap().remove("status_path");
+        let back: ExecSpec = serde_json::from_value(value).unwrap();
+        assert!(back.status_path.is_none());
+    }
+
+    #[test]
+    fn setup_error_names_the_stage_and_points_at_doctor() {
+        let e = SandboxError::Setup {
+            stage: "netns_setup".into(),
+            detail: "ip link add burp0 type dummy failed: Error: Unknown device type.".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("netns_setup"));
+        assert!(msg.contains("Unknown device type"));
+        assert!(msg.contains("burpwn doctor"));
     }
 }

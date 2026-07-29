@@ -588,7 +588,16 @@ mod privileged {
                     let _ = nix::sys::wait::waitpid(child, None);
                     return Err(e);
                 }
-                reap_child(child, out_r, err_r, spec.timeout)
+                let outcome = reap_child(child, out_r, err_r, spec.timeout);
+                // A sandbox that never came up must NOT be reported as a command
+                // that merely exited non-zero: the agent's sentinel exit code
+                // would otherwise be indistinguishable from the command's own,
+                // and the caller would only see the downstream "captured ZERO
+                // flows" warning. The failure record makes it explicit.
+                match take_setup_failure(spec.status_path.as_deref()) {
+                    Some(err) => Err(err),
+                    None => outcome,
+                }
             }
         }
     }
@@ -619,6 +628,7 @@ mod privileged {
         std::env::remove_var(super::SPEC_ENV);
 
         if let Err(e) = setup_netns(&spec) {
+            report_setup_failure(&spec, "netns_setup", &e);
             eprintln!("burpwn __netns-agent: netns setup failed: {e}");
             return 124;
         }
@@ -634,6 +644,7 @@ mod privileged {
         let listener_v4 = match TcpListener::bind(("127.0.0.1", tcp_port)) {
             Ok(l) => l,
             Err(e) => {
+                report_setup_failure(&spec, "acceptor_bind", &SandboxError::Io(e.to_string()));
                 eprintln!("burpwn __netns-agent: bind 127.0.0.1:{tcp_port} failed: {e}");
                 return 123;
             }
@@ -727,10 +738,54 @@ mod privileged {
                 code
             }
             Err(e) => {
+                report_setup_failure(&spec, "command_fork", &SandboxError::Runtime(e.to_string()));
                 eprintln!("burpwn __netns-agent: command fork failed: {e}");
                 122
             }
         }
+    }
+
+    /// AGENT: record a setup failure at `spec.status_path` so the HOST parent
+    /// can report it as [`SandboxError::Setup`]. Best-effort by design — a
+    /// failure to write the record must never change the agent's exit code (the
+    /// sentinel exit code and the stderr line remain the fallback signals).
+    fn report_setup_failure(spec: &ExecSpec, stage: &str, err: &SandboxError) {
+        let Some(path) = spec.status_path.as_ref() else {
+            return;
+        };
+        // Record the INNER detail, not the Display of the wrapper: the host side
+        // re-wraps it in `SandboxError::Setup`, and nesting "sandbox runtime
+        // error:" inside "sandbox setup failed at …:" reads as noise.
+        let detail = match err {
+            SandboxError::Runtime(m) | SandboxError::Io(m) => m.trim(),
+            other => &other.to_string(),
+        };
+        let record = serde_json::json!({ "stage": stage, "error": detail.trim() });
+        let _ = std::fs::write(path, record.to_string());
+    }
+
+    /// HOST: consume the agent's setup-failure record, if it left one. Reading
+    /// is destructive (the file is removed) so a later exec reusing the same
+    /// path can never inherit a stale failure.
+    pub(super) fn take_setup_failure(
+        status_path: Option<&std::path::Path>,
+    ) -> Option<SandboxError> {
+        let path = status_path?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        let _ = std::fs::remove_file(path);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        Some(SandboxError::Setup {
+            stage: parsed
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            detail: parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no detail)")
+                .to_string(),
+        })
     }
 
     /// PARENT: wait until the child has entered its new userns, write the
@@ -1107,6 +1162,7 @@ mod tests {
             workspace_id: 42,
             timeout: None,
             inherit_stdio: false,
+            status_path: None,
         }
     }
 

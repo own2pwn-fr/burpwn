@@ -3,6 +3,28 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed — a host that cannot sandbox no longer looks like a host that captured nothing
+- **`burpwn doctor` now runs a LIVE sandbox probe** (`burpwn-sandbox/probe.rs`): it creates a real
+  throwaway userns+netns and executes the production setup sequence inside it (`ip link set lo up`,
+  `ip link add burp0 type dummy`, address/route, the nftables REDIRECT ruleset, then `bwrap`),
+  reporting which step failed, why, and how to fix it. The previous preflight only checked that
+  `ip`/`nft`/`bwrap` were **on PATH**, so it printed `=> ready` on hosts where the kernel cannot
+  actually create the sandbox. `--quick` restores the old, binaries-only behaviour.
+- **WSL is now diagnosed explicitly.** The WSL2 kernel ships no loadable modules while
+  `CONFIG_DUMMY`, `CONFIG_NFT_REDIR` and `CONFIG_NF_REJECT_IPV4` are all `=m` there, so
+  `ip link add … type dummy` and the nftables `redirect` expression fail at runtime. Every
+  `burpwn exec` then died with an empty `req list` and a misleading "captured ZERO flows —
+  is the agent hook rewriting through `burpwn exec`?" warning, which points at the wrong thing.
+  `doctor` now detects the WSL kernel and says the sandbox cannot work there, with the two real
+  options (custom `=y` kernel via `.wslconfig`, or a real Linux host).
+- **`exec` reports sandbox-setup failures as failures** (`SandboxError::Setup`): the in-namespace
+  agent now writes a JSON failure record to a host path carried in the `ExecSpec`, so the host
+  side can tell "the sandbox never came up" apart from "the command exited non-zero" instead of
+  relying on the agent's sentinel exit code. The CLI prints the failing stage, runs the live probe
+  for remediation, and states that the command did **not** run captured.
+
 ## [0.2.0] - 2026-07-03
 
 This release turns burpwn from a strong capture engine into an offensive

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
-use burpwn_sandbox::{doctor, RootlessRuntime, SandboxRuntime};
+use burpwn_sandbox::{deep_probe, doctor, RootlessRuntime, SandboxError, SandboxRuntime};
 use burpwn_store::model::{FlowFilter, MatchKind, NewMatchReplaceRule, Protocol};
 use burpwn_store::Store;
 use burpwn_tls::CertAuthority;
@@ -53,7 +53,7 @@ impl Output {
 pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
     let out = Output::new(cli.json);
     match cli.command {
-        Command::Doctor => cmd_doctor(&out, paths),
+        Command::Doctor(args) => cmd_doctor(&out, paths, args),
         Command::Init(args) => cmd_init(&out, args),
         Command::WrapHook { agent } => cmd_wrap_hook(paths, agent),
         Command::Proxy(args) => cmd_proxy(paths, args).await,
@@ -312,10 +312,20 @@ fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
 
 // --- doctor ---------------------------------------------------------------
 
-fn cmd_doctor(out: &Output, paths: &Paths) -> Result<i32> {
+fn cmd_doctor(out: &Output, paths: &Paths, args: DoctorArgs) -> Result<i32> {
     let pf = doctor();
     let ca_present = paths.ca_pem().exists();
-    let ok = pf.is_ok() && ca_present;
+    let installed_ok = pf.is_ok() && ca_present;
+
+    // The LIVE probe is what actually answers "can this host capture traffic?".
+    // It needs the prerequisites to exist first, so it is skipped when the
+    // shallow checks already failed (there would be nothing to probe with).
+    let probe = if args.quick || !pf.is_ok() {
+        None
+    } else {
+        Some(deep_probe())
+    };
+    let ok = installed_ok && probe.as_ref().is_none_or(|p| p.is_ok());
 
     let data = json!({
         "userns_enabled": pf.userns_enabled,
@@ -326,30 +336,73 @@ fn cmd_doctor(out: &Output, paths: &Paths) -> Result<i32> {
         "ca_present": ca_present,
         "ready": ok,
         "missing": pf.missing_summary(),
+        "wsl": probe.as_ref().map(|p| p.wsl),
+        "sandbox_probe": probe.as_ref().map(|p| json!({
+            "ok": p.is_ok(),
+            "summary": p.summary(),
+            "steps": p.steps,
+            "remediation": p.remediation(),
+        })),
     });
 
     if out.json {
         println!("{}", Envelope::ok(data).to_json_line());
+        return Ok(if ok { 0 } else { 1 });
+    }
+
+    let yn = |b: bool| if b { "yes" } else { "NO" };
+    println!("burpwn doctor:");
+    println!("  unprivileged userns : {}", yn(pf.userns_enabled));
+    println!("  subuid entry        : {}", yn(pf.subuid_present));
+    println!("  bwrap               : {}", yn(pf.bwrap_present));
+    println!("  nft                 : {}", yn(pf.nft_present));
+    println!("  ip                  : {}", yn(pf.ip_present));
+    println!("  CA present          : {}", yn(ca_present));
+    if let Some(p) = &probe {
+        println!("  live sandbox probe  :");
+        for step in &p.steps {
+            let mark = if step.ok {
+                "ok"
+            } else if step.required {
+                "FAIL"
+            } else {
+                "degraded"
+            };
+            print!("    {:<14} {mark}", step.name);
+            if step.ok {
+                println!();
+            } else {
+                println!(" — {}", step.detail.trim().replace('\n', " "));
+            }
+        }
+        if p.wsl {
+            println!("  host                : WSL");
+        }
+    } else if args.quick {
+        println!("  live sandbox probe  : skipped (--quick)");
+    }
+
+    if ok {
+        println!("=> ready");
     } else {
-        let yn = |b: bool| if b { "yes" } else { "NO" };
-        println!("burpwn doctor:");
-        println!("  unprivileged userns : {}", yn(pf.userns_enabled));
-        println!("  subuid entry        : {}", yn(pf.subuid_present));
-        println!("  bwrap               : {}", yn(pf.bwrap_present));
-        println!("  nft                 : {}", yn(pf.nft_present));
-        println!("  ip                  : {}", yn(pf.ip_present));
-        println!("  CA present          : {}", yn(ca_present));
-        if ok {
-            println!("=> ready");
-        } else {
-            let mut missing = pf.missing_summary();
-            if !ca_present {
+        let mut missing = pf.missing_summary();
+        if !ca_present {
+            if !missing.is_empty() {
+                missing.push_str(", ");
+            }
+            missing.push_str("CA (run `burpwn ca init`)");
+        }
+        if let Some(p) = &probe {
+            if !p.is_ok() {
                 if !missing.is_empty() {
                     missing.push_str(", ");
                 }
-                missing.push_str("CA (run `burpwn ca init`)");
+                missing.push_str(&p.summary());
             }
-            println!("=> NOT ready: {missing}");
+        }
+        println!("=> NOT ready: {missing}");
+        for line in probe.as_ref().map(|p| p.remediation()).unwrap_or_default() {
+            println!("   - {line}");
         }
     }
     Ok(if ok { 0 } else { 1 })
@@ -846,7 +899,7 @@ pub async fn cmd_exec(
 
     let timeout = args.timeout.map(Duration::from_secs);
     let inherit_stdio = !json;
-    let result = exec::run_exec(
+    let result = match exec::run_exec(
         paths,
         &session,
         workspace_id,
@@ -855,12 +908,49 @@ pub async fn cmd_exec(
         timeout,
         inherit_stdio,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        // The sandbox never came up, so the command never ran captured. Say so
+        // plainly — and diagnose it live, because the usual cause is a kernel
+        // that cannot do what `ip`/`nft` are asking (WSL), which the user has no
+        // way to guess from the raw `ip`/`nft` error alone.
+        Err(e) => return Err(explain_sandbox_setup_failure(json, e)),
+    };
 
     if json {
         exec::write_json_envelope(&exec::exec_envelope(&result));
     }
     Ok(result.exit_code)
+}
+
+/// Enrich a failed `exec` with a live sandbox diagnosis when — and only when —
+/// the failure was the sandbox setup itself ([`SandboxError::Setup`]).
+///
+/// Any other error is returned untouched. In `--json` mode nothing extra is
+/// printed (the caller renders the error envelope); in human mode the
+/// remediation lines go to stderr, where they are actionable.
+fn explain_sandbox_setup_failure(json: bool, err: anyhow::Error) -> anyhow::Error {
+    let is_setup = err.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<SandboxError>(),
+            Some(SandboxError::Setup { .. })
+        )
+    });
+    if !is_setup || json {
+        return err;
+    }
+    let probe = deep_probe();
+    if !probe.is_ok() {
+        eprintln!(
+            "burpwn: the sandbox cannot be created on this host ({}).",
+            probe.summary()
+        );
+        for line in probe.remediation() {
+            eprintln!("  - {line}");
+        }
+    }
+    err.context("the command did NOT run captured — no traffic was intercepted")
 }
 
 /// Ensure a daemon answers `Status` on the session's control socket; spawn the

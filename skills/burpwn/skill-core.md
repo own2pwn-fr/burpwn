@@ -29,7 +29,8 @@ In any security-audit / pentest session that performs **remote operations**
   excludes the agent's LLM calls by construction (they stay outside the sandbox);
   only the target-facing tooling goes through `burpwn exec`.
 
-If `burpwn doctor` fails (missing namespaces/`bwrap`/`nft`), fix that before
+If `burpwn doctor` fails (missing namespaces/`bwrap`/`nft`, or a kernel that cannot
+create the sandbox — e.g. WSL), fix that before
 starting remote work rather than silently falling back to un-captured commands.
 
 **Confirm capture is actually working** (traffic silently escaping the sandbox is
@@ -47,7 +48,7 @@ network-facing exec with zero captured flows means the traffic bypassed burpwn.
 ## Setup (once)
 
 ```sh
-burpwn doctor                      # preflight: rootless namespaces + CA presence
+burpwn doctor                      # preflight + LIVE sandbox probe (--quick skips the probe)
 burpwn ca init                     # generate the CA if absent (idempotent)
 burpwn session new --name pentest  # create a session (DB + runtime files)
 burpwn session use pentest         # make it active
