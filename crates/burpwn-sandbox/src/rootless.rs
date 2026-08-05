@@ -400,6 +400,29 @@ pub fn netns_setup_commands(tcp_port: u16, dns_port: u16) -> (Vec<Vec<String>>, 
     (cmds, redirect_ruleset(tcp_port, dns_port))
 }
 
+/// The `/proc/sys` writes that let the OUTPUT `redirect` actually DELIVER to the
+/// in-netns loopback shim.
+///
+/// The nft NAT chain DNATs the workload's traffic to `127.0.0.1` (the acceptor /
+/// DNS shim). A freshly-created network namespace defaults
+/// `net.ipv4.conf.*.route_localnet=0`, under which the kernel treats a packet
+/// rerouted to `127.0.0.0/8` from a non-loopback path as *martian* and silently
+/// drops it — so the redirected SYN / DNS query never reaches the shim. The
+/// symptom is exactly "`burpwn doctor` is green but every `burpwn exec` resolves
+/// nothing and captures ZERO flows": the ruleset LOADS (what the probe checked)
+/// yet DELIVERS nothing (what it did not). Setting `route_localnet=1` on `all`
+/// (and `lo` for good measure) makes the loopback delivery legal.
+///
+/// Pure `(path, value)` list so it is unit-testable; callers write each entry
+/// best-effort (a write failure is logged, never fatal — the deep probe's
+/// end-to-end delivery step is the authoritative signal).
+pub fn route_localnet_writes() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("/proc/sys/net/ipv4/conf/all/route_localnet", "1"),
+        ("/proc/sys/net/ipv4/conf/lo/route_localnet", "1"),
+    ]
+}
+
 /// Production rootless runtime. Stateless: each [`SandboxRuntime::run`] creates
 /// and tears down its own namespaces. Teardown is RAII at the kernel level — when
 /// the forked child exits, the kernel reclaims its netns (and with it the nft
@@ -456,7 +479,7 @@ mod privileged {
     use crate::runtime::{ExecOutcome, ExecSpec, SandboxError};
     use crate::wire::{PassedConn, L4};
 
-    use super::{gid_map_line, netns_setup_commands, uid_map_line};
+    use super::{gid_map_line, netns_setup_commands, route_localnet_writes, uid_map_line};
 
     /// Run one command inside fresh namespaces and return its outcome. Blocking.
     ///
@@ -661,8 +684,24 @@ mod privileged {
         // and hand it to the host proxy ONCE — the host serves DNS over it (it
         // has real upstream connectivity; the netns has none). Keep our copy
         // open for the command's lifetime so the kernel socket stays alive.
-        let dns_sock = std::net::UdpSocket::bind(("127.0.0.1", spec.proxy_dns_port)).ok();
-        if let Some(ref udp) = dns_sock {
+        //
+        // Both the bind and the hand-off are REQUIRED, not best-effort: without a
+        // served DNS shim the sandboxed command cannot resolve anything, so every
+        // network command fails with "Could not resolve host" and the caller only
+        // sees the vague downstream "captured ZERO flows" warning. Surface it as
+        // an explicit setup failure instead (mirrors the acceptor-bind path).
+        let dns_sock = match std::net::UdpSocket::bind(("127.0.0.1", spec.proxy_dns_port)) {
+            Ok(udp) => udp,
+            Err(e) => {
+                report_setup_failure(&spec, "dns_bind", &SandboxError::Io(e.to_string()));
+                eprintln!(
+                    "burpwn __netns-agent: bind 127.0.0.1:{} (DNS shim) failed: {e}",
+                    spec.proxy_dns_port
+                );
+                return 121;
+            }
+        };
+        {
             let meta = PassedConn {
                 dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 dst_port: 53,
@@ -670,8 +709,10 @@ mod privileged {
                 workspace_id: spec.workspace_id,
                 exec_id: spec.exec_id.clone(),
             };
-            if let Err(e) = send_fd(udp.as_raw_fd(), meta, &spec.proxy_sock) {
+            if let Err(e) = send_fd(dns_sock.as_raw_fd(), meta, &spec.proxy_sock) {
+                report_setup_failure(&spec, "dns_handoff", &SandboxError::Io(e.to_string()));
                 eprintln!("burpwn __netns-agent: DNS socket hand-off failed: {e}");
+                return 121;
             }
         }
 
@@ -840,6 +881,19 @@ mod privileged {
         let (cmds, reject_ruleset) = netns_setup_commands(spec.proxy_tcp_port, spec.proxy_dns_port);
         for argv in &cmds {
             run_ok(argv)?;
+        }
+        // Make the OUTPUT redirect deliverable to the loopback shim (see
+        // `route_localnet_writes`). Best-effort: a fresh netns defaults this off
+        // and the DNAT'd-to-127.0.0.1 packet would otherwise be dropped as
+        // martian, silently starving the DNS shim / acceptor.
+        for (path, val) in route_localnet_writes() {
+            if let Err(e) = std::fs::write(path, val) {
+                tracing::warn!(
+                    path,
+                    error = %e,
+                    "route_localnet write failed; redirect-to-loopback may drop packets"
+                );
+            }
         }
         // Preferred: reject (nf_reject). On failure, fall back to drop so a
         // kernel without nf_reject does not take the whole sandbox down.
@@ -1340,6 +1394,25 @@ mod tests {
         assert_eq!(lines[4], "ip route add default via 10.99.0.1 dev burp0");
         // The ruleset is the redirect ruleset for these ports.
         assert!(ruleset.contains("meta l4proto tcp redirect to :8080"));
+    }
+
+    // Regression: the OUTPUT redirect DNATs to 127.0.0.1, which a fresh netns
+    // (route_localnet=0) drops as martian — starving the DNS shim/acceptor and
+    // producing the "resolves nothing, captures ZERO flows" symptom. We must
+    // enable route_localnet on `all` (the umbrella knob) with value "1".
+    #[test]
+    fn route_localnet_writes_enable_loopback_delivery() {
+        let writes = route_localnet_writes();
+        assert!(
+            writes
+                .iter()
+                .any(|(p, v)| *p == "/proc/sys/net/ipv4/conf/all/route_localnet" && *v == "1"),
+            "must enable route_localnet on `all`: {writes:?}"
+        );
+        assert!(
+            writes.iter().all(|(p, v)| p.ends_with("/route_localnet") && *v == "1"),
+            "every write must set a route_localnet knob to 1: {writes:?}"
+        );
     }
 
     #[test]

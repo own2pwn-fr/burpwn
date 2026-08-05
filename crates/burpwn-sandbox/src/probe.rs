@@ -133,6 +133,13 @@ impl ProbeReport {
                  nf_tables NAT/redirect support (nft_redir / nft_chain_nat)"
                     .into(),
             ),
+            "redirect_delivery" => out.push(
+                "the REDIRECT ruleset loads but a redirected packet never reaches the \
+                 loopback shim — the kernel drops the DNAT-to-127.0.0.1 packet \
+                 (missing nf_nat runtime, or route_localnet disabled). DNS resolution \
+                 fails inside the sandbox and every exec captures ZERO flows."
+                    .into(),
+            ),
             "userns" | "netns" => {
                 out.push("the host refuses to create an unprivileged user/network namespace".into())
             }
@@ -243,6 +250,13 @@ fn run_steps() -> Vec<ProbeStep> {
         }
     }
 
+    // Mirror production: make the OUTPUT redirect deliverable to loopback before
+    // we test delivery. Best-effort — if it does not take, the `redirect_delivery`
+    // step below is what actually reports the consequence.
+    for (path, val) in crate::rootless::route_localnet_writes() {
+        let _ = std::fs::write(path, val);
+    }
+
     // The `drop` variant is the MINIMUM viable ruleset (it still needs the
     // `redirect` expression, which is what actually matters); the `reject`
     // variant additionally needs nf_reject and is only a QUIC fail-fast nicety,
@@ -259,6 +273,21 @@ fn run_steps() -> Vec<ProbeStep> {
     match load_nft(&reject_rules) {
         Ok(()) => steps.push(ProbeStep::ok("nft_reject", false)),
         Err(e) => steps.push(ProbeStep::failed("nft_reject", false, e)),
+    }
+
+    // The step the old probe was missing: prove a redirected packet actually
+    // REACHES the loopback shim. The steps above only prove the ruleset LOADS;
+    // on a kernel/netns where the DNAT-to-127.0.0.1 delivery is dropped (a fresh
+    // netns' `route_localnet=0`, or a WSL kernel with no loadable nf_nat modules)
+    // the load succeeds while every real `burpwn exec` resolves nothing and
+    // captures ZERO flows. This end-to-end check turns that silent runtime
+    // failure into a red `burpwn doctor`.
+    match probe_redirect_delivery() {
+        Ok(()) => steps.push(ProbeStep::ok("redirect_delivery", true)),
+        Err(e) => {
+            steps.push(ProbeStep::failed("redirect_delivery", true, e));
+            return steps;
+        }
     }
 
     // Finally, bubblewrap must be able to start inside these namespaces.
@@ -295,6 +324,46 @@ fn step_name_for(argv: &[String]) -> &'static str {
         "netns_loopback"
     } else {
         "netns_link_up"
+    }
+}
+
+/// End-to-end redirect delivery check (the crux of the "green doctor, ZERO
+/// flows" gap). Binds a loopback UDP socket on the DNS redirect target, sends a
+/// datagram to an off-netns address on port 53, and asserts the nft OUTPUT
+/// `redirect` rule actually DNAT'd it onto the loopback listener. A timeout means
+/// the ruleset loads but the DNAT-to-127.0.0.1 packet is being dropped (martian /
+/// missing nf_nat runtime), which is the real cause of DNS failing inside the
+/// sandbox.
+fn probe_redirect_delivery() -> Result<(), String> {
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    let listener = UdpSocket::bind(("127.0.0.1", PROBE_DNS_PORT))
+        .map_err(|e| format!("bind loopback DNS target 127.0.0.1:{PROBE_DNS_PORT}: {e}"))?;
+    listener
+        .set_read_timeout(Some(Duration::from_millis(750)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+
+    let sender = UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| format!("bind probe sender: {e}"))?;
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): never a local address, so it routes out
+    // the default route (the dummy `burp0`) and hits the OUTPUT nat hook. The
+    // `dport 53` is what the `udp dport 53 redirect to :dns_port` rule matches.
+    const PROBE_PAYLOAD: &[u8] = b"burpwn-redirect-probe";
+    sender
+        .send_to(PROBE_PAYLOAD, ("192.0.2.1", 53))
+        .map_err(|e| format!("send probe datagram to 192.0.2.1:53: {e}"))?;
+
+    let mut buf = [0u8; 64];
+    match listener.recv_from(&mut buf) {
+        Ok((n, _)) if &buf[..n] == PROBE_PAYLOAD => Ok(()),
+        Ok((n, _)) => Err(format!(
+            "redirect target received {n} unexpected bytes (not the probe datagram)"
+        )),
+        Err(e) => Err(format!(
+            "nft redirect loaded but the UDP/53 datagram never reached the loopback \
+             shim ({e}) — the DNAT-to-127.0.0.1 packet is being dropped; this is why \
+             DNS fails and captures are empty inside the sandbox"
+        )),
     }
 }
 
@@ -466,6 +535,29 @@ mod tests {
         assert!(r.is_ok(), "an optional failure must not block the sandbox");
         assert!(r.summary().contains("degraded"));
         assert!(r.remediation().is_empty());
+    }
+
+    // Regression for the "green doctor, ZERO flows" gap: a redirect that LOADS
+    // but does not DELIVER must be a blocking failure whose remediation names the
+    // real cause (nf_nat runtime / route_localnet), not a green report.
+    #[test]
+    fn redirect_delivery_failure_blocks_and_explains_the_cause() {
+        let r = report(
+            vec![
+                ProbeStep::ok("nft_redirect", true),
+                ProbeStep::failed(
+                    "redirect_delivery",
+                    true,
+                    "nft redirect loaded but the UDP/53 datagram never reached the loopback shim",
+                ),
+            ],
+            false,
+        );
+        assert!(!r.is_ok(), "a redirect that never delivers must block");
+        assert_eq!(r.blocking_failure().unwrap().name, "redirect_delivery");
+        let advice = r.remediation().join("\n");
+        assert!(advice.contains("route_localnet"));
+        assert!(advice.contains("nf_nat"));
     }
 
     #[test]

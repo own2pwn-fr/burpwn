@@ -3,6 +3,31 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-08-05
+
+### Fixed — DNS/redirect delivery inside the sandbox (the "green doctor, ZERO flows" gap)
+On some hosts (notably WSL2) `burpwn exec -- curl …` failed with `Could not resolve host` or hung,
+then warned `captured ZERO flows`, even though `burpwn doctor` reported everything ready. Root
+cause: the sandbox's nftables OUTPUT `redirect` DNATs the workload's traffic to `127.0.0.1` (the
+in-netns DNS shim / TCP acceptor), but a freshly-created network namespace defaults
+`net.ipv4.conf.*.route_localnet=0` — under which the kernel drops the redirected-to-loopback packet
+as *martian*. The ruleset **loaded** (all the diagnostics checked) while it **delivered** nothing.
+- **`route_localnet` is now enabled** on the sandbox netns (`all` + `lo`) right after the interface
+  setup, so the OUTPUT redirect can actually reach the loopback shim/acceptor. Best-effort with a
+  warning on failure; shared with the deep probe so both exercise the identical path.
+- **The DNS socket hand-off is no longer silently best-effort.** A failed bind or SCM_RIGHTS
+  hand-off of the in-netns DNS socket now surfaces as an explicit `SandboxError::Setup`
+  (`dns_bind` / `dns_handoff`) instead of a stderr line swallowed behind the downstream
+  "captured ZERO flows" warning.
+- **The deep probe now tests end-to-end DELIVERY, not just ruleset loading.** A new required
+  `redirect_delivery` step sends a real UDP/53 datagram through the redirect and asserts it lands
+  on a loopback listener; on failure `burpwn doctor` now goes red and names the cause
+  (missing `nf_nat` runtime / `route_localnet` disabled) instead of printing `=> ready`.
+
+### Notes
+- IPv6 destinations inside the sandbox remain v4-only by design (the netns has no v6 route); this
+  release does not add v6 egress. It is unrelated to the DNS failure fixed here.
+
 ## [0.3.0] - 2026-07-29
 
 ### Added — every error is coded, actionable, and leaves a debug report
