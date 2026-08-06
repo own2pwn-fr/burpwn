@@ -184,18 +184,67 @@ pub async fn handle_explicit(req: Request<Incoming>, ctx: HttpContext) -> Respon
     handle(req, ctx).await
 }
 
+/// Header carrying the upstream failure cause on the synthetic 502, for clients
+/// that discard the body (`curl -o /dev/null`) and for agents parsing responses.
+const ERROR_HEADER: &str = "burpwn-error";
+
 /// The per-request handler shared by H1 and H2.
 async fn handle(req: Request<Incoming>, ctx: HttpContext) -> Response<ProxyBody> {
+    // Snapshot the target BEFORE `ctx` is consumed: the 502 has to name which
+    // origin failed, and by the time the error surfaces the context is gone.
+    let target = upstream_label(&ctx);
     match handle_inner(req, ctx).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(error = %e, "proxy request failed");
+            let body = upstream_error_body(&target, &e);
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(full_body(Bytes::from_static(b"burpwn: upstream error")))
+                .header(ERROR_HEADER, header_safe(&body))
+                .body(full_body(Bytes::from(body)))
                 .unwrap()
         }
     }
+}
+
+/// `host:port` of the origin this connection was aimed at, preferring the SNI /
+/// authority over the raw destination IP (what the user actually typed).
+fn upstream_label(ctx: &HttpContext) -> String {
+    let host = ctx.sni.clone().unwrap_or_else(|| ctx.dst_ip.clone());
+    format!("{host}:{}", ctx.dst_port)
+}
+
+/// Body of the synthetic 502.
+///
+/// A bare `burpwn: upstream error` was indistinguishable from a burpwn bug: a
+/// user (or an agent) hitting an origin that never answers saw 30 s of silence
+/// and then an opaque failure, with the actual cause — a labelled
+/// connect/handshake/header timeout, a DNS failure, a TLS error — visible only
+/// in the daemon's log. The whole anyhow chain goes into the response instead,
+/// so the failure explains itself where it is observed.
+fn upstream_error_body(target: &str, err: &anyhow::Error) -> String {
+    let mut cause = String::new();
+    for (i, e) in err.chain().enumerate() {
+        if i > 0 {
+            cause.push_str(": ");
+        }
+        cause.push_str(&e.to_string());
+    }
+    if cause.is_empty() {
+        cause.push_str("unknown error");
+    }
+    format!("burpwn: upstream error: {target}: {cause}\n")
+}
+
+/// Collapse a message to something legal in a header value (visible ASCII on a
+/// single line): an error string may carry newlines or non-ASCII from an origin
+/// certificate, and `Response::builder` would panic on an invalid value.
+fn header_safe(msg: &str) -> String {
+    let s: String = msg
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { ' ' })
+        .collect();
+    s.trim().chars().take(400).collect()
 }
 
 async fn handle_inner(
@@ -1295,6 +1344,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression for "burpwn: upstream error" telling nobody anything: an origin
+    // that never answers must produce a 502 body naming the target AND the
+    // labelled cause, not a bare sentence indistinguishable from a burpwn bug.
+    #[test]
+    fn upstream_error_body_names_the_target_and_the_cause() {
+        let err = anyhow::anyhow!("upstream connect timed out after 30s");
+        let body = upstream_error_body("ipconfig.me:443", &err);
+        assert!(body.contains("ipconfig.me:443"), "{body}");
+        assert!(
+            body.contains("upstream connect timed out after 30s"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn upstream_error_body_keeps_the_whole_cause_chain() {
+        let err = anyhow::anyhow!("connection refused").context("upstream connect");
+        let body = upstream_error_body("example.com:443", &err);
+        assert!(body.contains("upstream connect"), "{body}");
+        assert!(body.contains("connection refused"), "{body}");
+    }
+
+    // The message reaches a header too (clients that discard the body), so it
+    // must survive newlines / non-ASCII from an origin certificate error without
+    // panicking `Response::builder`.
+    #[test]
+    fn header_safe_strips_newlines_and_non_ascii() {
+        let safe = header_safe("bad cert:\n  CN=éxample\r\n");
+        assert!(!safe.contains('\n') && !safe.contains('\r'), "{safe}");
+        assert!(safe.is_ascii(), "{safe}");
+        assert!(HeaderValue::from_str(&safe).is_ok(), "{safe}");
+        assert!(safe.contains("bad cert"), "{safe}");
+    }
+
+    #[test]
+    fn header_safe_bounds_the_length() {
+        let safe = header_safe(&"x".repeat(4096));
+        assert!(safe.len() <= 400, "{}", safe.len());
+    }
 
     #[test]
     fn serialize_headers_is_order_preserving() {

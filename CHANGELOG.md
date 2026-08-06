@@ -3,6 +3,19 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed — the proxy's 502 now says WHAT failed
+An origin that never answered produced 30 s of silence followed by a bare
+`burpwn: upstream error` — indistinguishable, for a human or an agent, from a burpwn bug. The
+actual cause (a labelled connect/handshake/header timeout, a TLS error, a refused connection) only
+ever reached the daemon's log.
+- The synthetic 502 now carries the origin (`host:port`) and the full error chain, e.g.
+  `burpwn: upstream error: ipconfig.me:443: upstream connect timed out after 30s`, in the body AND
+  in a `burpwn-error` response header (for clients that discard bodies, like `curl -o /dev/null`).
+  The header value is sanitised to single-line ASCII and length-bounded, so an origin certificate
+  error carrying newlines/UTF-8 cannot break the response.
+
 ## [0.3.2] - 2026-08-06
 
 ### Fixed — the QUIC fail-fast guard was rejecting the sandbox's own DNS query
