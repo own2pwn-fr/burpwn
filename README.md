@@ -82,12 +82,14 @@ Linux-only (relies on user/network namespaces, nftables, bubblewrap). Install th
 first — Fedora/RHEL: `sudo dnf install bubblewrap nftables iproute`; Debian/Ubuntu:
 `sudo apt install bubblewrap nftables iproute2`.
 
-> **WSL is not supported.** The Microsoft WSL2 kernel ships **no loadable modules**, and the
-> features the sandbox needs are built as modules there (`CONFIG_DUMMY=m`, `CONFIG_NFT_REDIR=m`,
-> `CONFIG_NF_REJECT_IPV4=m`). `ip` and `nft` are installed and *look* fine, but `ip link add …
-> type dummy` and the nftables `redirect` expression fail at runtime, so nothing can be captured.
-> `burpwn doctor` detects this exactly (it really creates a throwaway sandbox) and says so. Use a
-> real Linux host/VM, or boot WSL on a custom kernel built with those options set to `=y`.
+> **WSL: it depends on your kernel — ask `burpwn doctor`.** The sandbox needs `dummy` and the
+> nftables `redirect` expression (`CONFIG_DUMMY`, `CONFIG_NFT_REDIR`, `CONFIG_NF_REJECT_IPV4`).
+> Recent WSL2 kernels ship them and burpwn works; older Microsoft kernels build them as modules
+> while shipping **no `/lib/modules`**, so `ip link add … type dummy` and the `redirect` expression
+> fail at runtime even though `ip`/`nft` are installed and *look* fine. `burpwn doctor` really
+> creates a throwaway sandbox, so it answers this exactly, per step. If it reports `dummy_device` /
+> `nft_redirect` failing, use a real Linux host/VM or boot WSL on a custom kernel built with those
+> options set to `=y`.
 
 ```sh
 # one-liner: download the prebuilt binary, install to ~/.local/bin, generate the CA, run preflight

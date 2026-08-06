@@ -3,6 +3,39 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-08-06
+
+### Fixed — the QUIC fail-fast guard was rejecting the sandbox's own DNS query
+`burpwn doctor` went red on **every** host with
+`redirect_delivery FAIL — send probe datagram to 192.0.2.1:53: Operation not permitted`, and any
+sandbox whose `/etc/resolv.conf` names a **non-loopback** nameserver (WSL's `10.255.255.254`, a
+LAN/router resolver, …) resolved nothing and captured ZERO flows. This was misdiagnosed as a WSL
+kernel limitation in 0.3.1; it reproduced identically on Fedora 43 / kernel 6.17.
+- **Root cause:** the `udpguard` chain (the QUIC/HTTP-3 fail-fast reject) sat at
+  `filter hook output priority 0`, i.e. **after** the NAT chain's `dstnat` (-100). By then the
+  redirect had rewritten the workload's DNS query to `127.0.0.1:<dns_port>` *while keeping the
+  `burp0` output interface*, so `oifname "burp0" udp dport != 53 reject` matched burpwn's own DNS
+  traffic and the kernel answered `sendto` with `EPERM`. The ruleset always **loaded** cleanly,
+  which is why every string-level test stayed green.
+- **Fix:** the guard now runs at `priority -150`, before the redirect, where the packet still
+  carries its original `dport 53` — DNS passes, a genuine QUIC datagram to UDP/443 is still
+  rejected immediately (verified live). A `udp dport <dns_port> accept` line guards the same
+  invariant belt-and-braces.
+- **Regression test:** new `--test redirect_delivery_real` (opt-in, `BURPWN_REAL_SANDBOX_TESTS=1`)
+  drives the real userns+netns probe end to end. It fails on the 0.3.1 ruleset and passes on this
+  one; unit tests additionally pin `udpguard`'s priority below the NAT chain's.
+
+### Fixed — the WSL verdict was printed even when the WSL kernel was fine
+`burpwn doctor` and `install.sh` claimed "the Microsoft kernel ships NO loadable modules, so the
+`=m` features above can never load … burpwn cannot capture traffic on a stock WSL kernel" under a
+report whose `dummy_device`, `nft_redirect` and `nft_reject` steps had all just **passed** — telling
+users to rebuild their kernel for a bug that was in burpwn.
+- The WSL blurb is now scoped to the steps that actually need a loadable module
+  (`dummy_device` / `nft_redirect` / `nft_reject`); other failures get advice matching what broke.
+- `install.sh` no longer prints its own blanket WSL verdict (the live doctor report is
+  authoritative), and the README now says WSL support depends on the kernel and points at
+  `burpwn doctor` instead of declaring WSL unsupported.
+
 ## [0.3.1] - 2026-08-05
 
 ### Fixed — DNS/redirect delivery inside the sandbox (the "green doctor, ZERO flows" gap)

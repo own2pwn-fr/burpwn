@@ -30,15 +30,38 @@
 //! to TCP/h2. To make the fallback deterministic, a second `filter hook output`
 //! chain (`udpguard`, policy **accept**) explicitly **rejects** non-DNS UDP that
 //! egresses the dummy `burp0` interface, so a QUIC attempt gets an immediate
-//! ICMP/ICMPv6 port-unreachable and the client falls back at once. The guard is
-//! scoped to `oifname "burp0"` on purpose: loopback traffic (the redirected DNS
-//! query, the DNS shim's replies, and the redirected TCP acceptor) all stay on
-//! `lo` and is therefore untouched — only real outbound UDP is rejected. On a
-//! kernel that lacks `nf_reject` the guard can instead `drop` (see
-//! [`UdpAction`]); the client then falls back only after its own timeout.
+//! ICMP/ICMPv6 port-unreachable and the client falls back at once. On a kernel
+//! that lacks `nf_reject` the guard can instead `drop` (see [`UdpAction`]); the
+//! client then falls back only after its own timeout.
+//!
+//! ### Why the guard runs BEFORE the NAT chain (priority [`UDPGUARD_PRIORITY`])
+//!
+//! The guard must see the packet the workload actually sent, not the DNAT'd one.
+//! A `filter hook output` chain at the default priority `0` runs *after* the NAT
+//! chain (`dstnat`, priority `-100`), so by then the redirected DNS query no
+//! longer looks like DNS: its destination has become `127.0.0.1:<dns_port>` — it
+//! matches `udp dport != 53` and the guard **rejects the sandbox's own DNS
+//! query**. Worse, the DNAT does not move the packet onto `lo` (it keeps the
+//! `burp0` output interface with source `10.99.0.1`), so the `oifname "burp0"`
+//! scoping does not save it either. The visible symptoms were `sendto` failing
+//! with `EPERM`, `Could not resolve host` inside `burpwn exec`, and the
+//! `redirect_delivery` probe step going red on every host — WSL or not.
+//!
+//! Running the guard at `-150` (before `dstnat`) fixes the ordering: DNS still
+//! carries `dport 53` and is left alone, while a genuine QUIC datagram to
+//! UDP/443 is rejected before the NAT chain ever sees it. The `dns_port` accept
+//! line below is belt-and-braces for the same invariant.
 
 /// The fixed nftables table name used inside the sandbox netns.
 pub const TABLE: &str = "burpwn";
+
+/// `filter hook output` priority of the QUIC fail-fast `udpguard` chain.
+///
+/// **Must stay below the NAT chain's `-100` (`dstnat`)**: the guard has to match
+/// the workload's ORIGINAL destination port, otherwise it rejects the sandbox's
+/// own DNS query after the redirect has rewritten it to `dns_port` (see the
+/// module docs).
+pub const UDPGUARD_PRIORITY: i32 = -150;
 
 /// How the `udpguard` chain handles non-DNS UDP egress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,14 +133,18 @@ pub fn redirect_ruleset_with(tcp_port: u16, dns_port: u16, udp_action: UdpAction
     // hands it an immediate ICMP port-unreachable so the client falls back to
     // TCP/h2 deterministically instead of hanging on a handshake timeout.
     //
-    // Scoping to `oifname "burp0"` is load-bearing: the redirected DNS query, the
-    // DNS shim's replies, and the redirected TCP acceptor connections all live on
-    // `lo` (127.0.0.1 / [::1]) and are therefore NOT matched — only genuine
-    // outbound UDP (routed via the default route out `burp0`) is rejected. The
-    // `udp dport != 53` term is a belt-and-braces exclusion of DNS (already
-    // redirected off `burp0` by the NAT chain, but never reject a DNS packet).
+    // The priority is load-bearing (see the module docs): at the default `0` this
+    // chain runs AFTER the NAT chain and rejects the sandbox's own DNS query,
+    // which the redirect has by then rewritten to `dns_port` on the very same
+    // `burp0` oif. `UDPGUARD_PRIORITY` (-150) puts it before `dstnat`, where the
+    // packet still carries its original `dport 53`.
     s.push_str("  chain udpguard {\n");
-    s.push_str("    type filter hook output priority 0; policy accept;\n");
+    s.push_str(&format!(
+        "    type filter hook output priority {UDPGUARD_PRIORITY}; policy accept;\n"
+    ));
+    // Belt-and-braces for the same invariant: never reject traffic aimed at the
+    // in-netns DNS shim, whatever hook ordering a future kernel/nft applies.
+    s.push_str(&format!("    udp dport {dns_port} accept\n"));
     s.push_str(&format!(
         "    oifname \"burp0\" udp dport != 53 {}\n",
         udp_action.keyword()
@@ -225,8 +252,56 @@ mod tests {
         // gets an ICMP port-unreachable so the client falls back to TCP/h2.
         let rs = redirect_ruleset(8080, 5353);
         assert!(rs.contains("chain udpguard {"));
-        assert!(rs.contains("type filter hook output priority 0; policy accept;"));
+        assert!(rs.contains("type filter hook output priority -150; policy accept;"));
         assert!(rs.contains("oifname \"burp0\" udp dport != 53 reject"));
+    }
+
+    // Regression for "green ruleset, EPERM on every DNS query": the guard used to
+    // sit at `filter hook output priority 0`, i.e. AFTER the nat chain's dstnat
+    // (-100). By then the redirected DNS query carries `dport <dns_port>` on the
+    // same `burp0` oif, so `udp dport != 53 reject` matched the sandbox's OWN DNS
+    // traffic — `sendto` returned EPERM, name resolution failed and every exec
+    // captured ZERO flows. The guard MUST be evaluated before the redirect.
+    #[test]
+    fn udp_guard_runs_before_the_nat_redirect() {
+        let rs = redirect_ruleset(8080, 5353);
+        let prio = |chain: &str| -> i32 {
+            let body = rs.split(chain).nth(1).expect("chain present");
+            let line = body
+                .lines()
+                .find(|l| l.contains("priority"))
+                .expect("priority line");
+            line.split("priority")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .trim()
+                .parse()
+                .expect("numeric priority")
+        };
+        let guard = prio("chain udpguard {");
+        let nat = prio("chain output {");
+        assert_eq!(guard, UDPGUARD_PRIORITY);
+        assert!(
+            guard < nat,
+            "udpguard ({guard}) must be evaluated before the nat chain ({nat}), \
+             otherwise it rejects the redirected DNS query"
+        );
+    }
+
+    #[test]
+    fn udp_guard_never_touches_the_dns_shim_port() {
+        // Belt-and-braces companion to the priority: whatever the hook ordering,
+        // traffic aimed at the in-netns DNS shim is accepted before the reject.
+        let rs = redirect_ruleset(8080, 5353);
+        let guard = rs.split("chain udpguard {").nth(1).unwrap();
+        let accept = guard
+            .find("udp dport 5353 accept")
+            .expect("shim accept line");
+        let reject = guard.find("reject").expect("reject line");
+        assert!(accept < reject, "the shim accept must precede the reject");
     }
 
     #[test]

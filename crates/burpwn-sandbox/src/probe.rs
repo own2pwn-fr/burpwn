@@ -146,7 +146,17 @@ impl ProbeReport {
             "bwrap" => out.push("bubblewrap cannot start inside the sandbox namespaces".into()),
             _ => {}
         }
-        if self.wsl {
+        // Only the steps below depend on a loadable kernel module. The WSL
+        // "no modules" blurb is reserved for THEM: printing it under a failure
+        // whose module-backed steps just passed (as `redirect_delivery` does —
+        // it runs after `dummy_device`/`nft_redirect`/`nft_reject` were all
+        // green) tells the user their kernel can never work when it demonstrably
+        // can, and sends them off building a custom kernel for nothing.
+        let module_backed = matches!(
+            failed.name.as_str(),
+            "dummy_device" | "nft_redirect" | "nft_reject"
+        );
+        if module_backed && self.wsl {
             out.push(
                 "this host is WSL: the Microsoft kernel ships NO loadable modules, so \
                  the `=m` features above (dummy, nft_redir, nf_reject) can never load. \
@@ -159,17 +169,26 @@ impl ProbeReport {
                  in a real Linux VM / on a Linux host."
                     .into(),
             );
+        } else if module_backed {
+            out.push(
+                "make sure the matching kernel modules are installed and loadable \
+                 (Debian/Ubuntu: `linux-modules-$(uname -r)`; then `sudo modprobe dummy \
+                 nft_redir`)."
+                    .into(),
+            );
         } else if failed.name == "userns" || failed.name == "netns" {
             out.push(
                 "check `sysctl kernel.unprivileged_userns_clone` (Debian) and, on \
                  Ubuntu 24.04+, `sysctl kernel.apparmor_restrict_unprivileged_userns=0`."
                     .into(),
             );
-        } else {
+        } else if failed.name == "redirect_delivery" {
+            // The module-backed steps passed, so the kernel HAS dummy/nft_redir:
+            // what is left is the delivery path itself.
             out.push(
-                "make sure the matching kernel modules are installed and loadable \
-                 (Debian/Ubuntu: `linux-modules-$(uname -r)`; then `sudo modprobe dummy \
-                 nft_redir`)."
+                "check that the sandbox netns can enable `net.ipv4.conf.all.route_localnet` \
+                 and that `nf_nat` is available at runtime; please report this with the \
+                 full `burpwn doctor` output."
                     .into(),
             );
         }
@@ -595,6 +614,29 @@ mod tests {
             !advice.contains("modprobe"),
             "modprobe advice is useless on WSL: {advice}"
         );
+    }
+
+    // The WSL "no loadable modules" verdict is only true of the steps that need
+    // a module. When `dummy_device`/`nft_redirect`/`nft_reject` have just passed
+    // and the *delivery* step is what failed, telling a WSL user to rebuild the
+    // kernel is actively wrong — their kernel already loaded everything.
+    #[test]
+    fn wsl_remediation_stays_silent_when_the_module_steps_passed() {
+        let r = report(
+            vec![
+                ProbeStep::ok("dummy_device", true),
+                ProbeStep::ok("nft_redirect", true),
+                ProbeStep::ok("nft_reject", false),
+                ProbeStep::failed("redirect_delivery", true, "EPERM"),
+            ],
+            true,
+        );
+        let advice = r.remediation().join("\n");
+        assert!(
+            !advice.contains("can never load") && !advice.contains(".wslconfig"),
+            "must not blame the WSL kernel for a non-module failure: {advice}"
+        );
+        assert!(advice.contains("route_localnet"));
     }
 
     #[test]

@@ -21,6 +21,10 @@ use std::path::PathBuf;
 
 use burpwn_sandbox::{doctor, ExecSpec, RootlessRuntime, SandboxRuntime};
 
+// The live end-to-end redirect check lives in its own harness-less target
+// (`tests/redirect_delivery_real.rs`) because the deep probe re-execs
+// `/proc/self/exe`, which libtest's generated main cannot serve.
+
 #[tokio::test]
 #[ignore = "creates real user+net namespaces; needs an unprivileged-userns host with bwrap/nft/ip"]
 async fn runs_true_inside_a_real_sandbox() {

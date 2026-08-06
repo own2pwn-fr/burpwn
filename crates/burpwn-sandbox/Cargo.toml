@@ -22,3 +22,10 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tempfile = "3.12"
+
+# Live redirect-delivery check: owns its `main` because the deep probe re-execs
+# `/proc/self/exe` with the `__netns-probe` marker (libtest's main would treat it
+# as a test filter). Opt-in via BURPWN_REAL_SANDBOX_TESTS=1; skips otherwise.
+[[test]]
+name = "redirect_delivery_real"
+harness = false

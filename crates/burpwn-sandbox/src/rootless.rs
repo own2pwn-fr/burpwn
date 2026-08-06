@@ -1410,7 +1410,9 @@ mod tests {
             "must enable route_localnet on `all`: {writes:?}"
         );
         assert!(
-            writes.iter().all(|(p, v)| p.ends_with("/route_localnet") && *v == "1"),
+            writes
+                .iter()
+                .all(|(p, v)| p.ends_with("/route_localnet") && *v == "1"),
             "every write must set a route_localnet knob to 1: {writes:?}"
         );
     }
