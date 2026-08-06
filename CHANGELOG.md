@@ -3,7 +3,7 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.3.3] - 2026-08-06
 
 ### Fixed — the proxy's 502 now says WHAT failed
 An origin that never answered produced 30 s of silence followed by a bare
