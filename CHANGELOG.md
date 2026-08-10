@@ -3,6 +3,24 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.4] - 2026-08-10
+
+### Fixed — an in-place upgrade kept serving traffic from the OLD daemon
+`install.sh` replaces the binary on disk, but the `burpwn proxy` daemon started before the upgrade
+keeps running from its now-deleted inode (`/proc/<pid>/exe -> … (deleted)`). It answers `Status`
+perfectly well, and `ensure_daemon` only ever checked **liveness**, so `exec` adopted it forever:
+every request kept being served by the previous build — with the previous build's bugs — under a
+`burpwn -V` reporting the new version. Symptom that surfaced this: a freshly installed 0.3.3 still
+returned the bare `burpwn: upstream error` that 0.3.3 had just fixed, and the only escape was to
+find and kill the process by hand.
+- `Status` now carries the **daemon's** version, and `exec` reuses a daemon only on an exact match.
+  A mismatched daemon is shut down (under the existing `daemon.lock`, waiting for its control
+  socket to stop answering) and respawned from the current binary, with a `WARN` naming both
+  versions. A daemon predating the handshake sends no version and reads as stale, so the very
+  daemons this bug leaves behind are the ones that get retired.
+- The MCP `status` tool reports the daemon version too, so an agent debugging odd behaviour can see
+  which build is actually serving its traffic.
+
 ## [0.3.3] - 2026-08-06
 
 ### Fixed — the proxy's 502 now says WHAT failed

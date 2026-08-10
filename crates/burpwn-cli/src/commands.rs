@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -1078,8 +1078,9 @@ pub async fn cmd_exec(
     Ok(result.exit_code)
 }
 
-/// Ensure a daemon answers `Status` on the session's control socket; spawn the
-/// hidden `burpwn proxy --session S` detached child and poll until ready.
+/// Ensure a daemon of OUR version answers `Status` on the session's control
+/// socket; spawn the hidden `burpwn proxy --session S` detached child and poll
+/// until ready.
 ///
 /// The whole check-then-spawn is serialized under an exclusive `flock` on
 /// `<run_dir>/daemon.lock` (Bug #3b): without it, two execs racing on a cold
@@ -1088,11 +1089,11 @@ pub async fn cmd_exec(
 /// daemon answers `Status` guarantees a single winner per session.
 async fn ensure_daemon(paths: &Paths, session: &str) -> Result<()> {
     let control = paths.control_sock(session);
-    // Fast path: a daemon is already answering — no need to take the lock.
-    if let Ok(mut client) = ControlClient::connect(&control).await {
-        if client.status().await.is_ok() {
-            return Ok(());
-        }
+    // Fast path: a daemon of our own version is already answering — no need to
+    // take the lock. A daemon of a DIFFERENT version falls through to the
+    // locked path, which retires it.
+    if matches!(probe_daemon(&control).await, DaemonProbe::Current) {
+        return Ok(());
     }
     let run_dir = paths.ensure_run_dir(session)?;
 
@@ -1103,9 +1104,18 @@ async fn ensure_daemon(paths: &Paths, session: &str) -> Result<()> {
 
     // Re-check under the lock: another exec may have won the race and already
     // brought a daemon up while we were blocked on the flock.
-    if let Ok(mut client) = ControlClient::connect(&control).await {
-        if client.status().await.is_ok() {
-            return Ok(());
+    match probe_daemon(&control).await {
+        DaemonProbe::Current => return Ok(()),
+        DaemonProbe::Absent => {}
+        DaemonProbe::Stale { version } => {
+            tracing::warn!(
+                daemon_version = %version,
+                our_version = %CURRENT_VERSION,
+                "retiring a daemon left over from a previous burpwn version"
+            );
+            retire_daemon(&control)
+                .await
+                .context("retiring the previous version's daemon")?;
         }
     }
 
@@ -1142,6 +1152,85 @@ async fn ensure_daemon(paths: &Paths, session: &str) -> Result<()> {
     // wakes next sees a live daemon on its own re-check.
     drop(lock);
     Ok(())
+}
+
+/// The version this binary was built as, compared against a live daemon's.
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long to wait for a retired daemon's control socket to stop answering.
+const DAEMON_RETIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What probing a session's control socket found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonProbe {
+    /// Nothing answered: a cold session, or a dead daemon's leftover socket.
+    Absent,
+    /// A daemon running our version answered — reuse it.
+    Current,
+    /// A daemon answered, but it is running a different build.
+    Stale {
+        /// Version it reported (`""` for a daemon predating the handshake).
+        version: String,
+    },
+}
+
+/// Probe the session's control socket for a reusable daemon.
+///
+/// Liveness alone is NOT enough to reuse one. `install.sh` upgrades burpwn by
+/// replacing the binary in place, which leaves any running daemon executing the
+/// PREVIOUS build from a now-deleted inode (`/proc/<pid>/exe → … (deleted)`).
+/// That daemon answers `Status` perfectly, so a liveness-only check adopted it
+/// forever: every request kept being served by the old build — with the old
+/// build's bugs — under a `burpwn -V` reporting the new version, and the only
+/// way out was for the user to find and kill the process by hand.
+async fn probe_daemon(control: &std::path::Path) -> DaemonProbe {
+    let Ok(mut client) = ControlClient::connect(control).await else {
+        return DaemonProbe::Absent;
+    };
+    let Ok(resp) = client.status().await else {
+        return DaemonProbe::Absent;
+    };
+    if crate::control::daemon_is_current(&resp, CURRENT_VERSION) {
+        return DaemonProbe::Current;
+    }
+    DaemonProbe::Stale {
+        version: crate::control::status_version(&resp)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// Shut a stale daemon down and wait until its control socket stops answering.
+///
+/// The wait matters: the old daemon unlinks the control socket and drops its
+/// listeners as it exits, so spawning the replacement first would race it into
+/// having ITS socket unlinked by the corpse of the one it replaced — the same
+/// failure the `daemon.lock` guards against for concurrent spawns.
+///
+/// This is called only under the lock, and only when the versions actually
+/// differ (once per upgrade). An `exec` running concurrently against the old
+/// daemon does lose its in-flight connections; serving the previous build
+/// silently and indefinitely is the worse of the two.
+async fn retire_daemon(control: &std::path::Path) -> Result<()> {
+    if let Ok(mut client) = ControlClient::connect(control).await {
+        // The daemon closes the connection as it tears down, so an unanswered
+        // `Shutdown` is a success signal, not an error: the check below is what
+        // decides whether it is really gone.
+        let _ = client.shutdown().await;
+    }
+    let deadline = Instant::now() + DAEMON_RETIRE_TIMEOUT;
+    while Instant::now() < deadline {
+        if probe_daemon(control).await == DaemonProbe::Absent {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(crate::coded!(
+        ErrorCode::DaemonProtocol,
+        "the previous version's daemon is still answering on {} after \
+         {DAEMON_RETIRE_TIMEOUT:?}; kill it and retry",
+        control.display()
+    ))
 }
 
 /// Spawn `burpwn proxy --session <session>` as a detached daemon: a new session
@@ -2074,6 +2163,133 @@ mod tests {
     use super::*;
     use burpwn_sandbox::{ExecOutcome, MockRuntime};
     use burpwn_store::model::{FlowStart, RequestData, ResponseData};
+
+    /// Serve `Status` replies on `sock` exactly like a daemon from `version`,
+    /// stopping when a `Shutdown` arrives (and unlinking the socket, as the real
+    /// `serve_control` does). `version: None` impersonates a daemon predating
+    /// the version handshake, which sends no `version` field at all.
+    ///
+    /// Hand-rolled rather than driven through `serve_control`, which can only
+    /// ever answer with the version this test binary was built as — and the
+    /// case that matters here is precisely a daemon of a DIFFERENT build.
+    fn fake_daemon(
+        sock: std::path::PathBuf,
+        version: Option<&'static str>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (r, mut w) = tokio::io::split(stream);
+                let mut lines = tokio::io::BufReader::new(r);
+                let mut line = String::new();
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                while lines.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let shutdown = line.contains("Shutdown");
+                    let reply = if shutdown {
+                        r#"{"type":"Ack"}"#.to_string()
+                    } else {
+                        let v = match version {
+                            Some(v) => format!(r#","version":"{v}""#),
+                            None => String::new(),
+                        };
+                        format!(
+                            r#"{{"type":"Status","running":true,"session":"t",
+                             "intercept_enabled":false,"pending":0,"dns_port":5353{v}}}"#
+                        )
+                        .replace('\n', "")
+                    };
+                    let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+                    let _ = w.flush().await;
+                    if shutdown {
+                        let _ = std::fs::remove_file(&sock);
+                        return;
+                    }
+                    line.clear();
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn no_socket_probes_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_daemon(&dir.path().join("control.sock")).await,
+            DaemonProbe::Absent
+        );
+    }
+
+    /// Regression for the upgrade that changed nothing: after `install.sh`
+    /// replaced the binary, the daemon started by the PREVIOUS version kept
+    /// answering `Status`, so `ensure_daemon`'s liveness-only check adopted it
+    /// and every request was still served by the old build — the user saw the
+    /// old build's bugs under the new `burpwn -V` with no way to tell.
+    #[tokio::test]
+    async fn a_daemon_from_another_version_is_stale_not_reusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = fake_daemon(sock.clone(), Some("0.0.1-old"));
+        // Give the listener a moment to bind before probing.
+        for _ in 0..40 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert_eq!(
+            probe_daemon(&sock).await,
+            DaemonProbe::Stale {
+                version: "0.0.1-old".into()
+            }
+        );
+        // …and retiring it leaves the socket free for the current build.
+        retire_daemon(&sock).await.unwrap();
+        assert_eq!(probe_daemon(&sock).await, DaemonProbe::Absent);
+        server.abort();
+    }
+
+    /// A daemon old enough to predate the handshake sends no `version`; it must
+    /// be treated as stale rather than crashing the probe on a decode error.
+    #[tokio::test]
+    async fn a_pre_handshake_daemon_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = fake_daemon(sock.clone(), None);
+        for _ in 0..40 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            probe_daemon(&sock).await,
+            DaemonProbe::Stale {
+                version: String::new()
+            }
+        );
+        server.abort();
+    }
+
+    /// The other half of the contract: a daemon running OUR build is reused, so
+    /// the version check cannot degenerate into respawning on every `exec`.
+    #[tokio::test]
+    async fn a_daemon_of_our_own_version_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = fake_daemon(sock.clone(), Some(CURRENT_VERSION));
+        for _ in 0..40 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(probe_daemon(&sock).await, DaemonProbe::Current);
+        server.abort();
+    }
 
     fn rustls_provider() {
         use std::sync::Once;
