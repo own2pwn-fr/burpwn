@@ -147,6 +147,7 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
             // pending count = still in the controller queue + already pulled.
             pending: state.intercept.pending().len() + state.parked.lock().await.len(),
             dns_port: state.dns_port,
+            version: env!("CARGO_PKG_VERSION").to_string(),
         },
         ControlRequest::InterceptEnable => {
             state.intercept.set_enabled(true);
@@ -656,12 +657,16 @@ mod tests {
                 intercept_enabled,
                 pending,
                 dns_port,
+                version,
             } => {
                 assert!(running);
                 assert_eq!(session, "default");
                 assert!(!intercept_enabled);
                 assert_eq!(pending, 0);
                 assert_eq!(dns_port, 5353);
+                // The daemon must report the build it is RUNNING, so `exec` can
+                // tell an in-place upgrade's leftover daemon from a current one.
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
             }
             other => panic!("unexpected: {other:?}"),
         }

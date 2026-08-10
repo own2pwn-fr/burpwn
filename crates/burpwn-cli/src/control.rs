@@ -141,6 +141,18 @@ pub enum ControlResponse {
         pending: usize,
         /// DNS port the daemon bound.
         dns_port: u16,
+        /// Version of the burpwn binary the *daemon* is running, which is not
+        /// necessarily the version of the CLI asking: an in-place upgrade
+        /// (`install.sh`) replaces the binary on disk while the old daemon keeps
+        /// serving from its now-deleted inode. `exec` compares this against its
+        /// own version and retires a mismatched daemon.
+        ///
+        /// `#[serde(default)]` for backward compatibility: a pre-0.3.4 daemon
+        /// omits the field, which decodes to `""` — a mismatch against any real
+        /// version, so exactly the daemons that predate this handshake are the
+        /// ones it retires.
+        #[serde(default)]
+        version: String,
     },
     /// Generic acknowledgement for a state change.
     Ack,
@@ -164,6 +176,29 @@ pub enum ControlResponse {
         /// Human-readable message.
         message: String,
     },
+}
+
+/// The version reported by a `Status` reply, or `None` for any other variant.
+///
+/// A pre-0.3.4 daemon has no `version` field and yields `Some("")`, which no
+/// real version equals — see [`daemon_is_current`].
+pub fn status_version(resp: &ControlResponse) -> Option<&str> {
+    match resp {
+        ControlResponse::Status { version, .. } => Some(version.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether a live daemon's `Status` reply came from the version we are running.
+///
+/// An in-place upgrade leaves the previous daemon running off a deleted inode:
+/// it answers `Status` perfectly well, so a liveness-only check reuses it and
+/// every fix in the new binary stays invisible (the user sees the OLD build's
+/// behaviour under the NEW `burpwn -V`). Anything that is not an exact match —
+/// including a reply that is not a `Status` at all — counts as stale, so the
+/// caller retires it rather than guessing about compatibility.
+pub fn daemon_is_current(resp: &ControlResponse, ours: &str) -> bool {
+    status_version(resp) == Some(ours)
 }
 
 /// Encode a request to a single newline-terminated JSON line.
@@ -432,6 +467,7 @@ mod tests {
                 intercept_enabled: false,
                 pending: 2,
                 dns_port: 5353,
+                version: "9.9.9".into(),
             },
             ControlResponse::Ack,
             ControlResponse::Intercepts {
@@ -454,6 +490,37 @@ mod tests {
             let back: ControlResponse = serde_json::from_str(line.trim_end()).unwrap();
             assert_eq!(back, r);
         }
+    }
+
+    /// Regression for the silent stale daemon: `install.sh` replaces the binary
+    /// in place, so the daemon started before an upgrade keeps serving the OLD
+    /// build from a deleted inode while answering `Status` normally. A daemon
+    /// predating this handshake sends no `version` at all, and that reply must
+    /// still decode (never breaking the upgrade path) while reading as stale.
+    #[test]
+    fn a_status_without_a_version_decodes_as_stale() {
+        let pre_handshake = r#"{"type":"Status","running":true,"session":"default",
+            "intercept_enabled":false,"pending":0,"dns_port":5353}"#;
+        let resp: ControlResponse = serde_json::from_str(pre_handshake).unwrap();
+        assert_eq!(status_version(&resp), Some(""));
+        assert!(!daemon_is_current(&resp, "0.3.4"));
+    }
+
+    #[test]
+    fn only_an_exact_version_match_is_current() {
+        let status = |v: &str| ControlResponse::Status {
+            running: true,
+            session: "default".into(),
+            intercept_enabled: false,
+            pending: 0,
+            dns_port: 5353,
+            version: v.into(),
+        };
+        assert!(daemon_is_current(&status("0.3.4"), "0.3.4"));
+        assert!(!daemon_is_current(&status("0.3.3"), "0.3.4"));
+        // A non-`Status` reply carries no version, so it can never be adopted.
+        assert!(!daemon_is_current(&ControlResponse::Ack, "0.3.4"));
+        assert_eq!(status_version(&ControlResponse::Ack), None);
     }
 
     #[test]

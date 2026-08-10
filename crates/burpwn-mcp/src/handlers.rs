@@ -271,12 +271,17 @@ fn control_value(resp: burpwn_cli::control::ControlResponse) -> Result<Value> {
             intercept_enabled,
             pending,
             dns_port,
+            version,
         } => Ok(json!({
             "running": running,
             "session": session,
             "intercept_enabled": intercept_enabled,
             "pending": pending,
             "dns_port": dns_port,
+            // The DAEMON's build, which an in-place upgrade can leave behind the
+            // CLI's — an agent debugging odd behaviour should see which one is
+            // actually serving its traffic.
+            "version": version,
         })),
         R::Ack => Ok(json!({ "ok": true })),
         R::Intercepts { items } => Ok(json!({ "intercepts": items })),
