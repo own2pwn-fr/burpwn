@@ -5013,6 +5013,873 @@ def fam_shell_offensive() -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
+# 0.3.x surface: flow groups, the portable session bundle, and the hook engine.
+#
+# All envelopes below were captured from the 0.3.4 debug binary run against a
+# seeded store in a throwaway XDG root. Three facts are worth teaching rather
+# than merely listing, because an agent that does not know them writes wrong
+# commands:
+#
+#   * `group new` is create-or-update — `created` flips to false on the second
+#     call and nothing errors — so an agent can call it unconditionally before
+#     each `group add` instead of branching on existence.
+#   * `session import` ALWAYS creates a new session. There is no merge and no
+#     overwrite; `--as` renames on the way in when the name is taken.
+#   * a hook's `add-header` action SYNTHESISES a header that is not there.
+#     match/replace only rewrites what already exists, so it cannot do this —
+#     this is the distinction that decides which of the two features to reach
+#     for, and it is the single most useful thing to teach about hooks.
+# --------------------------------------------------------------------------- #
+
+
+def fam_groups() -> list[dict[str, Any]]:
+    """`group new/add/list/show/rm-flow/rm` + `req list --group` / `export har
+    --group` — naming a scenario so it can be recalled and exported as a unit."""
+    out: list[dict[str, Any]] = []
+
+    grp_new = {"created": True, "description": "reconstructed login sequence",
+               "group_id": 1, "name": "auth-flow", "workspace_id": 1}
+    grp_add = {"flow_ids": [118, 119, 120], "group_id": 1, "name": "auth-flow"}
+
+    # Core: reconstruct an auth scenario and name it.
+    out.append(
+        cli_example(
+            tags=["group", "workflow", "auth", "evidence"],
+            turns=[
+                (
+                    "user",
+                    "I've finally pieced together the login sequence on shop.northwind."
+                    "example — the form GET, the POST /login and the redirect that sets "
+                    "the session cookie (flows 118, 119, 120). I don't want to lose which "
+                    "three they were.",
+                ),
+                (
+                    "assistant",
+                    "Name the collection, then attach the three flows:\n\n```\n"
+                    "burpwn --json group new auth-flow --description \"reconstructed login "
+                    "sequence\"\nburpwn --json group add auth-flow 118 119 120\n```\n\n"
+                    "```json\n" + _ok(grp_new) + "\n" + _ok(grp_add) + "\n```\n\n"
+                    "`created:true` means it did not exist yet. Useful property: `group "
+                    "new` is **create-or-update** — running it again just returns "
+                    "`created:false` and refreshes the description, so you can call it "
+                    "unconditionally before an `add` without checking first. The flows "
+                    "themselves are untouched; a group is only a label over them.",
+                ),
+                ("user", "How do I get just those three back later?"),
+                (
+                    "assistant",
+                    "Either the group view or `req list` filtered by group:\n\n```\n"
+                    "burpwn --json group show auth-flow\nburpwn --json req list --group "
+                    "auth-flow\n```\n\n`group show` returns `{group:{...},flows:[...],"
+                    "count:3}` — the group's metadata plus the same flow rows `req list` "
+                    "renders. `req list --group auth-flow` returns the bare array of rows "
+                    "alone, which is the one to pipe into other tooling.",
+                ),
+            ],
+        )
+    )
+
+    # Isolating a fuzzing campaign + exporting one scenario.
+    grp_fuzz = {"created": True, "description": "sniper run on the search param",
+                "group_id": 2, "name": "xss-search-fuzz", "workspace_id": 1}
+    out.append(
+        cli_example(
+            tags=["group", "fuzz", "export", "har", "scope"],
+            turns=[
+                (
+                    "user",
+                    "My fuzzing run buried the interesting traffic under 400 payload "
+                    "flows. Can I keep the campaign separate and hand just the login "
+                    "scenario to the client?",
+                ),
+                (
+                    "assistant",
+                    "Yes — put the campaign in its own group so it stops polluting your "
+                    "listings, and export the other group on its own:\n\n```\n"
+                    "burpwn --json group new xss-search-fuzz --description \"sniper run on "
+                    "the search param\"\nburpwn --json group add xss-search-fuzz 512 513 "
+                    "514\n```\n\n```json\n" + _ok(grp_fuzz) + "\n```\n\nThen export only "
+                    "the named scenario:\n\n```\nburpwn --json export har --group auth-flow "
+                    "-o auth-flow.har\n```\n\n```json\n"
+                    + _ok({"entries": 3, "path": "auth-flow.har"}) + "\n```\n\n`entries:3` "
+                    "— only the grouped flows made it into the HAR. `--group` takes the "
+                    "group **name** and is mutually exclusive with `--workspace` (the "
+                    "group already lives in one). Groups are labels, not moves: a flow can "
+                    "sit in several groups and still shows up in an unfiltered `req list`. "
+                    "If you want real isolation rather than a label, that's a workspace.",
+                ),
+            ],
+        )
+    )
+
+    # Pruning a group + deleting it: what actually gets destroyed.
+    out.append(
+        cli_example(
+            tags=["group", "rm", "rm-flow", "safety"],
+            turns=[
+                (
+                    "user",
+                    "Flow 120 doesn't belong in auth-flow after all, and once I've "
+                    "reported I want the group gone. Does removing it delete my captures?",
+                ),
+                (
+                    "assistant",
+                    "No — neither operation touches the flows.\n\n```\n"
+                    "burpwn --json group rm-flow auth-flow 120\nburpwn --json group rm "
+                    "auth-flow\n```\n\n```json\n"
+                    + _ok({"flow_ids": [120], "group_id": 1, "name": "auth-flow"}) + "\n"
+                    + _ok({"group_id": 1, "name": "auth-flow"}) + "\n```\n\n`rm-flow` "
+                    "detaches the flow from the group and `rm` deletes the grouping "
+                    "itself; in both cases the captured request/response stay in the "
+                    "session and keep their ids, tags and notes. Only the label goes away. "
+                    "(Deleting captures is `session rm`, which drops the whole session "
+                    "database.)",
+                ),
+            ],
+        )
+    )
+
+    # Listing groups.
+    out.append(
+        cli_example(
+            tags=["group", "list", "orientation"],
+            turns=[
+                ("user", "What named collections do I have in this session?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json group list\n```\n\n```json\n"
+                    + _ok({"groups": [
+                        {"created_at": 1786648237288,
+                         "description": "reconstructed login sequence", "flow_count": 3,
+                         "id": 1, "name": "auth-flow", "workspace_id": 1},
+                        {"created_at": 1786648291004,
+                         "description": "sniper run on the search param", "flow_count": 3,
+                         "id": 2, "name": "xss-search-fuzz", "workspace_id": 1},
+                    ]}) + "\n```\n\nTwo groups, with the prose you gave them and a live "
+                    "`flow_count`. Restrict to one workspace with `--workspace <name|id>`. "
+                    "Open either with `burpwn group show <name>`.",
+                ),
+            ],
+        )
+    )
+
+    # Shell-style: an agent grouping as it goes.
+    out.append(
+        shell_example(
+            tags=["shell", "group", "workflow", "auth", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Group the three login flows (118-120) under a name so we can "
+                            "find them again, then show me what's in it.",
+                    "steps": [
+                        {
+                            "preamble": "Create the group first — this is idempotent, so "
+                                        "it is safe even if it already exists.",
+                            "command": "burpwn --json group new auth-flow --description "
+                                       "\"reconstructed login sequence\"",
+                            "result": _ok(grp_new),
+                            "interp": "Group `auth-flow` created (`created:true`, id 1). "
+                                      "Attaching the flows.",
+                        },
+                        {
+                            "preamble": "Attach all three in one call.",
+                            "command": "burpwn --json group add auth-flow 118 119 120",
+                            "result": _ok(grp_add),
+                            "interp": "All three attached. Reading the group back.",
+                        },
+                        {
+                            "preamble": "Render the group's flows.",
+                            "command": "burpwn --json group show auth-flow",
+                            "result": _ok({
+                                "count": 3,
+                                "flows": [
+                                    _flow_row(120, _t("ecom"), "GET", "/account", 200),
+                                    _flow_row(119, _t("ecom"), "POST", "/login", 302),
+                                    _flow_row(118, _t("ecom"), "GET", "/login", 200),
+                                ],
+                                "group": {"created_at": 1786648237288,
+                                          "description": "reconstructed login sequence",
+                                          "id": 1, "name": "auth-flow", "workspace_id": 1},
+                            }),
+                            "interp": "The scenario reads end to end: `GET /login` (200) → "
+                                      "`POST /login` (302, the redirect that sets the "
+                                      "session cookie) → `GET /account` (200). "
+                                      "`burpwn export har --group auth-flow` hands exactly "
+                                      "these three to the report.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+    return out
+
+
+def fam_session_bundle() -> list[dict[str, Any]]:
+    """`export session` / `session import` — moving a whole engagement to another
+    machine, and being honest about what `--redact` does and does not cover."""
+    out: list[dict[str, Any]] = []
+
+    raw_warning = (
+        "this bundle holds the session exactly as captured: stored auth tokens and "
+        "login commands (credentials and all), plus every Authorization / Cookie / "
+        "Set-Cookie header recorded in the traffic. Anyone who opens it can replay "
+        "them — move it the way you would move the credentials themselves. "
+        "`--redact` drops the stored auth profiles and match/replace replacements."
+    )
+    redacted_warning = (
+        "--redact dropped the stored auth tokens, login commands and match/replace "
+        "replacements. It does NOT scrub credentials captured inside recorded "
+        "requests and responses (Authorization / Cookie headers, login bodies) — "
+        "those are still in this file."
+    )
+    exp_raw = {"bytes": 481203, "flows": 214, "path": "northwind.burpwn",
+               "redacted": False, "schema_version": 6, "session": "northwind",
+               "warning": raw_warning}
+    exp_red = {"bytes": 480914, "flows": 214, "path": "northwind.burpwn",
+               "redacted": True, "schema_version": 6, "session": "northwind",
+               "warning": redacted_warning}
+
+    out.append(
+        cli_example(
+            tags=["session", "export", "bundle", "portable"],
+            turns=[
+                (
+                    "user",
+                    "I need to continue this engagement on my other laptop. Can I move "
+                    "the whole session — captures, tags, notes, the lot?",
+                ),
+                (
+                    "assistant",
+                    "Yes, that's the session bundle:\n\n```\nburpwn --json export session "
+                    "-o northwind.burpwn\n```\n\n```json\n" + _ok(exp_raw) + "\n```\n\n"
+                    "One portable `.burpwn` file with every flow and its bodies, plus the "
+                    "groups, tags, notes, attacks and rules — 214 flows here. On the other "
+                    "machine:\n\n```\nburpwn --json session import northwind.burpwn --use\n"
+                    "```\n\nRead that `warning` before you move the file: an un-redacted "
+                    "bundle carries the stored auth tokens, the login commands and every "
+                    "`Authorization`/`Cookie` header that was captured. Treat it exactly "
+                    "as you'd treat the credentials themselves. Use `--force` to "
+                    "overwrite an existing output file; without it the export refuses "
+                    "rather than clobbering.",
+                ),
+            ],
+        )
+    )
+
+    # The honest --redact example: scope limits stated plainly.
+    out.append(
+        cli_example(
+            tags=["session", "export", "redact", "opsec", "limits"],
+            turns=[
+                (
+                    "user",
+                    "I have to send this bundle to the client. `--redact` makes it safe to "
+                    "hand over, right?",
+                ),
+                (
+                    "assistant",
+                    "Not safe to hand over — **less** dangerous, and the difference "
+                    "matters here.\n\n```\nburpwn --json export session -o northwind."
+                    "burpwn --redact --force\n```\n\n```json\n" + _ok(exp_red) + "\n```\n\n"
+                    "What `--redact` actually drops is narrow: the stored auth profiles' "
+                    "`token` and `login_cmd`, and the `replacement` field of your "
+                    "match/replace rules. That's it.\n\nWhat stays in the file:\n\n"
+                    "* every `Authorization:` and `Cookie:` header **captured in the "
+                    "recorded traffic**\n"
+                    "* every `Set-Cookie` the target sent back\n"
+                    "* login request bodies — the username and password you actually "
+                    "posted\n"
+                    "* anything sensitive in a response body (tokens, PII, keys)\n\n"
+                    "Notice the size barely moved (`481203` → `480914` bytes): the "
+                    "credentials live in the traffic, and the traffic is the point of the "
+                    "bundle. `--redact` protects against leaking your *tooling's* stored "
+                    "secrets, not against leaking the target's. For an external "
+                    "handover, export the specific evidence instead — `export har --group "
+                    "<name>` for one reviewed scenario — or treat the bundle as a "
+                    "credential-bearing artifact and move it over a channel you'd trust "
+                    "with the password itself.",
+                ),
+            ],
+        )
+    )
+
+    imp = {
+        "active": True, "attacks": 2, "flows": 214,
+        "from": {"burpwn_version": "0.3.4",
+                 "ca_sha256": "45b325297a75293d07a019d5962304db7749662a35830ce96199874e0c62b410",
+                 "exported_at": 1786648302621, "schema_version": 6,
+                 "session": "northwind"},
+        "groups": 3, "migrated_from": None, "notes": 7, "redacted": False,
+        "session": "northwind-2", "tags": 11, "warning": raw_warning,
+    }
+    out.append(
+        cli_example(
+            tags=["session", "import", "bundle", "no-merge"],
+            turns=[
+                (
+                    "user",
+                    "I already have a session called `northwind` on this machine. If I "
+                    "import the bundle, does it merge into it or overwrite it?",
+                ),
+                (
+                    "assistant",
+                    "Neither — **`session import` always creates a new session.** It never "
+                    "merges into an existing one and never overwrites one. Since the name "
+                    "is taken, give it another with `--as`:\n\n```\nburpwn --json session "
+                    "import northwind.burpwn --as northwind-2 --use\n```\n\n```json\n"
+                    + _ok(imp) + "\n```\n\nYour existing `northwind` is untouched. The "
+                    "import reports what came across (214 flows, 3 groups, 11 tags, 7 "
+                    "notes, 2 attacks) and `from` records the provenance: which session it "
+                    "was exported from, by which burpwn version, when, and the CA "
+                    "fingerprint. `--use` switched the active session to the imported one; "
+                    "drop it to import without switching (`active:false`). If you genuinely "
+                    "want the two sets of captures in one place, import and then compare "
+                    "them side by side — there is no merge operation.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_hooks() -> list[dict[str, Any]]:
+    """`hook add/list/test/rm` — the pre-request/post-response action engine. The
+    load-bearing lesson is `add-header` synthesising an absent header, which
+    match/replace structurally cannot do."""
+    out: list[dict[str, Any]] = []
+
+    hook_add = {"hook_id": 1, "name": "force-csrf"}
+    hook_row = {
+        "action": {"action": "add-header", "name": "X-CSRF-Token",
+                   "value": "probe-value"},
+        "created_at": 1786648290831, "enabled": True, "id": 1, "name": "force-csrf",
+        "order": 0, "phase": "pre-request",
+        "scope": {"host": "shop.northwind.example", "method": "", "path": "",
+                  "status": None},
+        "timeout_ms": 10000, "ttl_ms": 300000,
+    }
+
+    # THE distinction: add-header synthesises; match/replace only rewrites.
+    out.append(
+        cli_example(
+            tags=["hook", "match-replace", "add-header", "distinction"],
+            turns=[
+                (
+                    "user",
+                    "I set up a match/replace rule to add an `X-CSRF-Token` header to my "
+                    "requests and it does nothing. The rule looks right.",
+                ),
+                (
+                    "assistant",
+                    "The rule is right; it just cannot do that job. **match/replace "
+                    "rewrites what is already in the message** — it matches an existing "
+                    "header and substitutes it. If the request never carried "
+                    "`X-CSRF-Token`, there is nothing for the pattern to match, so the "
+                    "rule correctly does nothing.\n\nSynthesising a header that is absent "
+                    "is a hook's `add-header` action:\n\n```\nburpwn --json hook add "
+                    "force-csrf --action add-header --header \"X-CSRF-Token: probe-value\" "
+                    "--host shop.northwind.example\n```\n\n```json\n" + _ok(hook_add)
+                    + "\n```\n\nThat's the whole distinction, and it's the one that "
+                    "decides which feature to reach for:\n\n"
+                    "* **match/replace** — the header/pattern is already there and you "
+                    "want it changed.\n"
+                    "* **hook `add-header`** — the header is not there and you want it "
+                    "to exist.\n"
+                    "* **hook `set-header`** — either way: replace it if present, create "
+                    "it if not.\n\nUse `--inject-if-absent` on a hook if you want it to "
+                    "defer to a header the client already set rather than overwrite it.",
+                ),
+            ],
+        )
+    )
+
+    # hook test: verify before trusting it on live traffic.
+    out.append(
+        cli_example(
+            tags=["hook", "test", "verify", "dry-run"],
+            turns=[
+                (
+                    "user",
+                    "Before I turn that hook loose on live traffic, can I check it "
+                    "actually matches and does what I think?",
+                ),
+                (
+                    "assistant",
+                    "Yes — replay it against a flow you already captured. No live traffic "
+                    "is sent:\n\n```\nburpwn --json hook test 1 --flow 119\n```\n\n"
+                    "```json\n" + _ok({
+                        "after": {"headers": "Authorization: Bearer eyJhbGciOi…\r\n"
+                                             "X-CSRF-Token: probe-value\r\n",
+                                  "url": "/login"},
+                        "before": {"headers": "Authorization: Bearer eyJhbGciOi…\r\n",
+                                   "url": "/login"},
+                        "changed": True, "dropped": False, "exec": None, "flow_id": 119,
+                        "hook_id": 1, "matched": True, "phase": "pre-request",
+                    }) + "\n```\n\nRead it as: `matched:true` (the scope selected this "
+                    "flow), `changed:true`, and the `before`/`after` header blocks show "
+                    "the synthesised `X-CSRF-Token` line that was not there before. "
+                    "`dropped:false` means the hook let the request through. `exec:null` "
+                    "just means this is a declarative hook with no command to run.\n\n"
+                    "A `matched:false` almost always means the scope is too narrow — "
+                    "check `--host`/`--path`/`--method` with `burpwn hook show 1`.",
+                ),
+            ],
+        )
+    )
+
+    # exec hook: renew a token and inject it before the request leaves.
+    exec_hook = {"hook_id": 4, "name": "refresh-token"}
+    out.append(
+        cli_example(
+            tags=["hook", "exec", "auth", "token", "workflow"],
+            turns=[
+                (
+                    "user",
+                    "My bearer token expires every 15 minutes and my whole scan dies with "
+                    "401s halfway through. I don't want to babysit it.",
+                ),
+                (
+                    "assistant",
+                    "Give the hook engine the login command and let it re-mint the token "
+                    "in-line, before each matching request leaves:\n\n```\n"
+                    "burpwn --json hook add refresh-token \\\n  --action exec \\\n"
+                    "  --cmd 'curl -s -X POST https://shop.northwind.example/api/login "
+                    "-d @creds.json' \\\n  --extract '\"access_token\":\"([^\"]+)\"' \\\n"
+                    "  --inject-header 'Authorization: Bearer {}' \\\n"
+                    "  --host shop.northwind.example \\\n  --ttl 600000\n```\n\n```json\n"
+                    + _ok(exec_hook) + "\n```\n\nHow the pieces fit: `--cmd` runs as "
+                    "`sh -c` **in the sandbox** (so its own traffic is captured too, and "
+                    "is never itself re-hooked), `--extract` is a regex with exactly one "
+                    "capture group applied to that command's stdout, and "
+                    "`--inject-header` places the captured value where `{}` sits.\n\n"
+                    "`--ttl 600000` is the part that keeps this cheap: the extracted "
+                    "token is reused for 10 minutes before the command runs again. "
+                    "`--ttl 0` would run your login on *every* matching request — one "
+                    "sandbox per request. Note the failure mode is **fail-open**: if the "
+                    "command exceeds `--timeout` (default 10000 ms) the request goes "
+                    "through un-hooked rather than being blocked, so you'd see the 401 "
+                    "rather than a stall.\n\nVerify the regex still matches before you "
+                    "rely on it — `burpwn hook test 4 --flow <id>` actually runs the "
+                    "command and reports `exec:{ok:true,...,extracted:\"…\"}`.",
+                ),
+            ],
+        )
+    )
+
+    # Listing / ordering / disabling.
+    out.append(
+        cli_example(
+            tags=["hook", "list", "order", "disable"],
+            turns=[
+                ("user", "What hooks are live right now, and how do I mute one?"),
+                (
+                    "assistant",
+                    "```\nburpwn --json hook list\n```\n\n```json\n"
+                    + _ok({"hooks": [hook_row, {
+                        "action": {"action": "remove-header",
+                                   "name": "Strict-Transport-Security"},
+                        "created_at": 1786648290856, "enabled": True, "id": 2,
+                        "name": "strip-hsts", "order": 10, "phase": "post-response",
+                        "scope": {"host": "", "method": "", "path": "", "status": 200},
+                        "timeout_ms": 10000, "ttl_ms": 300000,
+                    }]}) + "\n```\n\nThey are listed in application order: within a phase, "
+                    "ascending `order` (set with `--order`). Hook 1 fires `pre-request` on "
+                    "`shop.northwind.example`; hook 2 fires `post-response` but only on "
+                    "`200`s (`scope.status`), and an empty `host`/`method`/`path` means "
+                    "'any'.\n\nTo mute without losing the definition:\n\n```\n"
+                    "burpwn --json hook disable 2\n```\n\n```json\n"
+                    + _ok({"enabled": False, "id": 2}) + "\n```\n\n`hook enable 2` brings "
+                    "it back; `hook rm 2` → `{\"removed\":2}` deletes it for good. Create "
+                    "a hook already muted with `--disabled`.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_mcp_groups_hooks() -> list[dict[str, Any]]:
+    """MCP tool-calling for the 0.3.x tools: group_*, hook_*, session_export.
+    Several of these results differ from the CLI's for the same operation."""
+    out: list[dict[str, Any]] = []
+
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "group_new", "group_add", "group_rm", "idempotent",
+                  "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Save flows 118, 119 and 120 as the reconstructed login "
+                            "scenario.",
+                    "steps": [
+                        {
+                            "preamble": "Create the group. This is create-or-update, so "
+                                        "no need to check whether it exists first.",
+                            "tool": "group_new",
+                            "args": {"name": "auth-flow",
+                                     "description": "reconstructed login sequence"},
+                            "result": {"created": True, "group_id": 1,
+                                       "name": "auth-flow", "workspace_id": 1},
+                            "interp": "Created (`created:true`, id 1). Attaching the "
+                                      "flows.",
+                        },
+                        {
+                            "preamble": "Attach all three ids in one call.",
+                            "tool": "group_add",
+                            "args": {"flow_ids": [118, 119, 120], "name": "auth-flow"},
+                            "result": {"added": [118, 119, 120], "flow_count": 3,
+                                       "group_id": 1, "name": "auth-flow"},
+                            "interp": "All three attached; `flow_count:3` is the group's "
+                                      "size after the add. Adding a flow twice is a "
+                                      "no-op, and `group_new` is create-or-update, so "
+                                      "this whole pair is safe to repeat without "
+                                      "checking anything first.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Actually scrap that group — but I still need the captures.",
+                    "steps": [
+                        {
+                            "tool": "group_rm", "args": {"name": "auth-flow"},
+                            "result": {"deleted": True, "group_id": 1,
+                                       "name": "auth-flow"},
+                            "interp": "Group deleted (`deleted:true`). Only the grouping "
+                                      "went away — flows 118, 119 and 120 are still "
+                                      "captured, still carry their tags and notes, and "
+                                      "still show up in `req_list`. A group is a label "
+                                      "over flows, never a container that owns them.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "group_list", "group_show", "nulls", "prune-nulls", "envelope",
+                  "multi-turn"],
+            exchanges=[
+                {
+                    "user": "What groups exist in this session?",
+                    "steps": [{
+                        "tool": "group_list", "args": {},
+                        # group_list is deliberately NOT null-pruned:
+                        # description:null is emitted for a group created without one.
+                        "result": {"count": 2, "groups": [
+                            {"created_at": 1786648237288,
+                             "description": "reconstructed login sequence",
+                             "flow_count": 3, "id": 1, "name": "auth-flow",
+                             "workspace_id": 1},
+                            {"created_at": 1786648291004, "description": None,
+                             "flow_count": 3, "id": 2, "name": "xss-search-fuzz",
+                             "workspace_id": 1},
+                        ]},
+                        "interp": "Two groups. `auth-flow` (3 flows) is described; "
+                                  "`xss-search-fuzz` has `description:null` because it "
+                                  "was created without one — `group_list` is not "
+                                  "null-pruned, so the member is present and null rather "
+                                  "than absent. Give it prose by calling `group_new` "
+                                  "again with the same name and a `description`.",
+                    }],
+                },
+                {
+                    "user": "Open auth-flow.",
+                    "steps": [{
+                "tool": "group_show", "args": {"name": "auth-flow"},
+                # group_show IS null-pruned: absent members, not nulls.
+                "result": {"count": 3, "flows": [
+                    {"authority": "shop.northwind.example", "dst_ip": "198.51.100.66",
+                     "dst_port": 443, "id": 120, "intercepted": False, "method": "GET",
+                     "path": "/account", "protocol": "h2", "scheme": "https",
+                     "sni": "shop.northwind.example", "status": 200,
+                     "ts_end": 1786648003120, "ts_start": 1786648003000,
+                     "workspace_id": 1},
+                    {"authority": "shop.northwind.example", "dst_ip": "198.51.100.66",
+                     "dst_port": 443, "id": 119, "intercepted": False, "method": "POST",
+                     "path": "/login", "protocol": "h2", "scheme": "https",
+                     "sni": "shop.northwind.example", "status": 302,
+                     "ts_end": 1786648002120, "ts_start": 1786648002000,
+                     "workspace_id": 1},
+                ], "group": {"created_at": 1786648237288,
+                             "description": "reconstructed login sequence", "id": 1,
+                             "name": "auth-flow", "workspace_id": 1}},
+                "interp": "The scenario in order: `POST /login` → 302 (the redirect that "
+                         "sets the session cookie) then `GET /account` → 200. Unlike "
+                         "`group_list`, `group_show` is null-pruned — a flow with no SNI "
+                         "or no response simply omits those members rather than showing "
+                         "them as null, so test with `in` rather than `is None`.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "hook_add", "hook_test", "add-header", "distinction",
+                  "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Add an X-CSRF-Token header to my requests to "
+                            "shop.northwind.example — the requests don't currently have "
+                            "one. I tried match_replace_add and nothing happened.",
+                    "steps": [{
+                        "preamble": "match_replace_add cannot do this: it substitutes "
+                                    "into what the message already contains. Synthesising "
+                                    "an absent header is a hook's add-header action.",
+                        "tool": "hook_add",
+                        "args": {"action": "add-header",
+                                 "header": "X-CSRF-Token: probe-value",
+                                 "host": "shop.northwind.example", "name": "force-csrf"},
+                        "result": {"hook_id": 1, "name": "force-csrf"},
+                        "interp": "That's why the rule did nothing: **match/replace "
+                                  "rewrites an existing header**, so with no "
+                                  "`X-CSRF-Token` in the request there was nothing for it "
+                                  "to match. A hook's `add-header` action **creates** the "
+                                  "header. Hook 1 is now live and will synthesise "
+                                  "`X-CSRF-Token: probe-value` on every request to that "
+                                  "host. Rule of thumb: `match_replace_add` when it is "
+                                  "already there and you want it changed, `hook_add "
+                                  "add-header` when it is not there and you want it to "
+                                  "exist, `set-header` when you want either.",
+                    }],
+                },
+                {
+                    "user": "Check it does what you say before it touches live traffic.",
+                    "steps": [{
+                        "tool": "hook_test", "args": {"flow_id": 119, "id": 1},
+                        "result": {
+                            "after": {"headers": "Authorization: Bearer eyJhbGciOi…\r\n"
+                                                 "X-CSRF-Token: probe-value\r\n",
+                                      "url": "/login"},
+                            "before": {"headers": "Authorization: Bearer eyJhbGciOi…\r\n",
+                                       "url": "/login"},
+                            "changed": True, "dropped": False, "exec": None,
+                            "flow_id": 119, "hook_id": 1, "matched": True,
+                            "phase": "pre-request",
+                        },
+                        "interp": "Confirmed against captured flow 119, with no live "
+                                  "traffic sent: `matched:true` (the scope selected it), "
+                                  "`changed:true`, and the `after` header block carries "
+                                  "the synthesised `X-CSRF-Token` line that `before` does "
+                                  "not. `dropped:false` means the request still goes "
+                                  "through, and `exec:null` just means this hook runs no "
+                                  "command. Note the argument is `flow_id` here, where "
+                                  "`req_show` takes `id` and `fuzz` takes `flow`.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "hook_test", "hook_rm", "exec", "auth", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Does hook 4 still extract the token correctly? Test it "
+                            "against flow 119.",
+                    "steps": [{
+                        "tool": "hook_test", "args": {"flow_id": 119, "id": 4},
+                        "result": {
+                            "after": {"headers": "Authorization: Bearer eyJhbGciOi…\r\n",
+                                      "url": "/api/orders"},
+                            "before": {"headers": "Authorization: Bearer STALE…\r\n",
+                                       "url": "/api/orders"},
+                            "changed": True, "dropped": False,
+                            "exec": {"extracted": "eyJh…Zg", "ok": True,
+                                     "stdout_bytes": 412},
+                            "flow_id": 119, "hook_id": 4, "matched": True,
+                            "phase": "pre-request",
+                        },
+                        "interp": "Still working. `exec.ok:true` with a non-empty "
+                                  "`extracted` means the login command actually ran (in "
+                                  "the sandbox) and the `--extract` regex still matched "
+                                  "its 412 bytes of stdout; `before`/`after` show the "
+                                  "stale bearer replaced by the fresh one. Had the target "
+                                  "changed its login response shape you'd see "
+                                  "`exec.ok:false` with `\"the --extract regex did not "
+                                  "match the command output\"` — which is the whole point "
+                                  "of running this dry.",
+                    }],
+                },
+                {
+                    "user": "Good. The engagement is over — remove it, I don't want that "
+                            "login command sitting in the session.",
+                    "steps": [{
+                        "tool": "hook_rm", "args": {"id": 4},
+                        "result": {"removed": 4},
+                        "interp": "Hook 4 is gone, and with it the stored `--cmd` "
+                                  "(credentials included) and the cached token. Worth "
+                                  "knowing: had you exported this session **before** "
+                                  "removing it, `session_export` would have carried that "
+                                  "login command into the bundle unless you passed "
+                                  "`redact:true`.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "hook_list", "hook_set_enabled", "cli-parity", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "List the hooks and mute the post-response one.",
+                    "steps": [
+                {
+                    "tool": "hook_list", "args": {},
+                    # hook_list takes no arguments and returns no count.
+                    "result": {"hooks": [
+                        {"action": {"action": "add-header", "name": "X-CSRF-Token",
+                                    "value": "probe-value"},
+                         "created_at": 1786648290831, "enabled": True, "id": 1,
+                         "name": "force-csrf", "order": 0, "phase": "pre-request",
+                         "scope": {"host": "shop.northwind.example", "method": "",
+                                   "path": ""},
+                         "timeout_ms": 10000, "ttl_ms": 300000},
+                        {"action": {"action": "remove-header",
+                                    "name": "Strict-Transport-Security"},
+                         "created_at": 1786648290856, "enabled": True, "id": 2,
+                         "name": "strip-hsts", "order": 10, "phase": "post-response",
+                         "scope": {"host": "", "method": "", "path": "", "status": 200},
+                         "timeout_ms": 10000, "ttl_ms": 300000},
+                    ]},
+                    "interp": "Two hooks, in application order — within a phase they "
+                             "apply by ascending `order`. Hook 1 fires `pre-request` on "
+                             "`shop.northwind.example`; hook 2 is the `post-response` "
+                             "one, scoped to `200`s. Note `hook_list` takes no arguments "
+                             "and returns no `count`, and that it is null-pruned — hook 1 "
+                             "has no `scope.status` member at all, where hook 2 carries "
+                             "`status:200`. An empty `host`/`method`/`path` means 'any'.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Mute the post-response one — but I'll want it back tomorrow.",
+                    "steps": [
+                        {
+                            "preamble": "Disable it rather than removing it, so the "
+                                        "definition survives.",
+                            "tool": "hook_set_enabled",
+                            "args": {"enabled": False, "id": 2},
+                            "result": {"enabled": False, "id": 2},
+                            "interp": "Hook 2 is muted but still defined — call "
+                                      "`hook_set_enabled` with `enabled:true` to bring it "
+                                      "back tomorrow. One tool covers both directions "
+                                      "over MCP, where the CLI splits it into `hook "
+                                      "enable` and `hook disable`. `hook_rm` is the "
+                                      "destructive one and would have lost the "
+                                      "definition.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "session_export", "bundle", "opsec", "redact", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Export this session so I can carry it to another machine.",
+                    "steps": [{
+                        "tool": "session_export", "args": {"output": "northwind.burpwn"},
+                        # MCP's session_export result is leaner than the CLI's data,
+                        # and `warning` appears only when redacted is false.
+                        "result": {"bytes": 481203, "flows": 214,
+                                   "path": "northwind.burpwn", "redacted": False,
+                                   "warning": "raw bundle: stored auth tokens/login "
+                                              "commands and captured Authorization/Cookie "
+                                              "headers are inside"},
+                        "interp": "Wrote `northwind.burpwn` — 214 flows with their bodies, "
+                                  "plus the groups, tags, notes, attacks and rules. "
+                                  "`redacted:false` and the `warning` member say what you "
+                                  "are carrying: stored auth tokens, login commands and "
+                                  "every captured `Authorization`/`Cookie` header. Move it "
+                                  "like a credential. Open it elsewhere with `burpwn "
+                                  "session import <file>`, which always creates a new "
+                                  "session rather than merging into one.",
+                    }],
+                },
+                {
+                    "user": "It's going to the client, so redact it.",
+                    "steps": [{
+                        "tool": "session_export",
+                        "args": {"force": True, "output": "northwind.burpwn",
+                                 "redact": True},
+                        "result": {"bytes": 480914, "flows": 214,
+                                   "path": "northwind.burpwn", "redacted": True},
+                        "interp": "Done — and the `warning` member is gone, because "
+                                  "`redacted:true`. But be careful what you conclude from "
+                                  "that: `redact` drops the **stored** auth profiles' "
+                                  "tokens and login commands and your match/replace "
+                                  "replacements, and nothing else. Every "
+                                  "`Authorization`/`Cookie`/`Set-Cookie` header captured "
+                                  "in the recorded traffic, and every login body you "
+                                  "posted, is still in the file — see the size, which "
+                                  "barely moved (481203 → 480914 bytes). For an external "
+                                  "handover I'd send `export har --group <name>` for the "
+                                  "reviewed scenario instead, and still treat this bundle "
+                                  "as credential-bearing.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # Multi-turn: fuzz campaign → group it → export just that group.
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "group", "fuzz", "export", "multi-turn", "workflow"],
+            exchanges=[
+                {
+                    "user": "Keep the payload flows from my fuzzing run out of my main "
+                            "listing.",
+                    "steps": [
+                        {
+                            "tool": "group_new",
+                            "args": {"description": "sniper run on the search param",
+                                     "name": "xss-search-fuzz"},
+                            "result": {"created": True, "group_id": 2,
+                                       "name": "xss-search-fuzz", "workspace_id": 1},
+                            "interp": "Group `xss-search-fuzz` created. Which flow ids "
+                                      "belong to the campaign?",
+                        },
+                    ],
+                },
+                {
+                    "user": "Flows 512 through 514.",
+                    "steps": [
+                        {
+                            "tool": "group_add",
+                            "args": {"flow_ids": [512, 513, 514],
+                                     "name": "xss-search-fuzz"},
+                            "result": {"added": [512, 513, 514], "flow_count": 3,
+                                       "group_id": 2, "name": "xss-search-fuzz"},
+                            "interp": "Labelled. Worth being clear about what this does "
+                                      "and does not do: a group is a label, not a move — "
+                                      "those flows still appear in an unfiltered "
+                                      "`req_list`. What it buys you is recall: "
+                                      "`req_list` with `{\"group\":\"xss-search-fuzz\"}` "
+                                      "from the CLI, or `group_show`, returns exactly "
+                                      "these three. If you need them genuinely out of the "
+                                      "way, that's a workspace, not a group.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 0.2.0 integration surface: `burpwn skill install/list/uninstall` (drop the
 # agent-workflow instructions into a framework's native format) and
 # `burpwn mcp register` (write the stdio MCP server into a host's MCP config).
@@ -5611,6 +6478,11 @@ FAMILIES = [
     fam_mcp_offensive,
     fam_mcp_offensive_convos,
     fam_shell_offensive,
+    # 0.3.x surface: groups, session bundle, hooks.
+    fam_groups,
+    fam_session_bundle,
+    fam_hooks,
+    fam_mcp_groups_hooks,
     # 0.2.0 integration surface: skill install / mcp register.
     fam_skill_install,
     fam_mcp_register,
