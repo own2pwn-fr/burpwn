@@ -51,12 +51,12 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-**1,518** deduplicated examples by default (`541 cli`, `317 mcp`, `660 shell`), of
+**1,532** deduplicated examples by default (`546 cli`, `326 mcp`, `660 shell`), of
 which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
-(split 1,442 train / 76 validation). The split is a deterministic,
+(split 1,456 train / 76 validation). The split is a deterministic,
 **style-stratified** 95/5 split (all three styles appear in each split). The
 default emitted set is balanced to ~50% multi-turn by deterministically
-subsampling single-turn records; the **full corpus is 3,345 examples**
+subsampling single-turn records; the **full corpus is 3,352 examples**
 (`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
@@ -189,13 +189,36 @@ The 42 MCP tools are: `session_list`, `session_current`, `session_stats`,
 `intercept_scope`, `intercept_drop`, `exec`, `fuzz`, `fuzz_list`,
 `fuzz_results`, `compare`, `encode`, `decode`.
 
-All 42 appear as real tool calls in the *families* (the generator's full,
-pre-subsample output). The emitted `dataset.jsonl` is a deterministic
-subsample of that — the multi-turn balancer drops single-turn records to hit
-`--multiturn-frac` — so a given run's file need not exercise every tool. Raise
-`--target` / lower `--multiturn-frac` if you need broader per-tool coverage in
-the emitted split. (This count is only as trustworthy as `eval/surface.py
---check`; see "Grounding / accuracy" below.)
+All 42 appear as real tool calls in the emitted `dataset.jsonl` **and** in
+`dataset.train.jsonl` — `python generate.py --validate` fails if any is missing,
+and prints the count it measured (`42/42 MCP tools exercised`). Only
+`dataset.validation.jsonl` is partial (12/42), which is expected of a 5% held-out
+sample and is therefore exempt from the check.
+
+That guarantee is recent, and it is worth knowing what it replaced. The emitted
+file is a deterministic subsample of the families, and both subsampling stages
+(the multi-turn balancer and the `--target` cap) pick single-turn records by a
+uniform per-style raffle. A tool demonstrated by only one or two single-turn
+records had a ~70% chance of being drawn out entirely: **15 of the 42 were
+missing** from the emitted split (`encode`, `decode`, `session_list`,
+`session_stats`, `tag_list`, `workspace_list`, `workspace_new`,
+`match_replace_list`, `fuzz_list`, `intercept_disable`, `intercept_drop`,
+`intercept_scope` and the three `session_auth_*`) while the README claimed only
+that the *families* covered them. The fix is `COVERAGE_MIN_PER_TOOL` in
+`generate.py`: a coverage floor that reserves records for each tool *before* the
+raffle, and counts them against the same budget so the emitted size and the
+multi-turn fraction are unchanged. `split_dataset` applies the same idea to the
+train/validation cut, so a tool's last demonstration cannot be drawn into
+validation and leave the model with nothing to learn it from.
+
+Depth is a separate axis from coverage: several tools are still demonstrated by
+only two or three records (see `fam_mcp_housekeeping_convos`, added to give the
+housekeeping half of the surface a second, realistic demonstration each). A
+floor guarantees a tool is *present*; it does not make a thin tool
+well-taught.
+
+(The tool list itself is only as trustworthy as `eval/surface.py --check`; see
+"Grounding / accuracy" below.)
 
 ## Grounding / accuracy
 
@@ -322,6 +345,19 @@ flags and phrasings, then deduplicated):
   path-traversal, JWT `alg:none`) driven entirely through real `Bash` tool calls.
 * **Multi-turn MCP conversations**: several user turns over the MCP tools
   (orientation → search → show, probe → inspect → tag).
+* **MCP housekeeping workflows** (`fam_mcp_housekeeping_convos`): the state-and-
+  bookkeeping half of the surface, chained the way an operator actually uses it —
+  picking up someone else's session and scoping new captures to a workspace;
+  auditing capture completeness with `session_stats` (including that `nmap -sn`
+  is a *false positive* in `network_zero_flow_execs`, since a ping sweep has no
+  HTTP for the proxy to capture, and that re-running an escaped command does not
+  retroactively clear the old entry); rolling tagged evidence up into a group;
+  scoping interception *before* enabling it, then dropping a beacon that the
+  substring match caught by mistake; forging a JWT payload with `encode`/`decode`
+  and reporting the `401 invalid signature` as a real negative result that rules
+  out a class; and diagnosing a 401 wall as an expired injected token via
+  `match_replace_list` + `session_auth_*` (where `refresh` supersedes the stale
+  rule rather than deleting it).
 * **Framework integration** (CLI-only admin): `skill install`/`list`/`uninstall`
   (drop the burpwn agent-workflow skill into Claude Code, Cursor, Cline, Gemini,
   Codex, Copilot, … in each one's native format, at `--project`/`--global` scope,
@@ -336,8 +372,8 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (1,518 records, ~50% multi-turn)
-python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,325 records)
+python generate.py                     # writes dataset.jsonl + splits (1,532 records, ~50% multi-turn)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,352 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
 python generate.py --seed 7            # change the deterministic RNG seed
@@ -348,6 +384,11 @@ python generate.py --stdout > out.jsonl
 deterministically subsampling single-turn records (it never drops multi-turn, and
 keeps the per-style mix); the families remain the source of truth, so the full
 single-turn corpus is always one flag (`--multiturn-frac 0`) away.
+
+Both this and `--target` are constrained by `COVERAGE_MIN_PER_TOOL`: every MCP
+tool keeps at least that many demonstrations (or all of them, where the families
+provide fewer), so no setting of these flags can silently drop a tool off the
+emitted surface. Full coverage holds down to `--target 400`.
 
 The generator is deterministic (no network, stdlib only, fixed default seed) so
 regeneration is **byte-identical** and the diff is reviewable.
@@ -367,8 +408,9 @@ exchanges of `user` then `assistant(tool_calls) → tool → assistant(interp)`
 rounds, single tool call per round, matching `tool_call_id`/`name`, JSON-parseable
 `arguments`); `shell` calls target the `Bash` tool with a non-empty `command`;
 `mcp` calls target a **known** MCP tool with a JSON-encoded tool result; only
-known burpwn subcommands/flags appear in emitted commands; and **no
-near-duplicates** (normalized-content hash). Exit code is non-zero on any
+known burpwn subcommands/flags appear in emitted commands; **no near-duplicates**
+(normalized-content hash); and — for `dataset.jsonl` and `dataset.train.jsonl` —
+that all 42 MCP tools actually appear as tool calls. Exit code is non-zero on any
 problem.
 
 ## Intended use (SFT for tool-use)
