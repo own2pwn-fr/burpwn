@@ -373,6 +373,19 @@ pub enum SessionAction {
         /// Session name.
         name: String,
     },
+    /// Import a session bundle written by `burpwn export session`, as a NEW
+    /// session. Never merges into and never overwrites an existing one.
+    Import {
+        /// The `.burpwn` bundle file.
+        file: String,
+        /// Name to import under (defaults to the name the bundle was exported
+        /// from). Use it when that name is already taken here.
+        #[arg(long = "as", value_name = "NAME")]
+        as_name: Option<String>,
+        /// Switch the active session to the imported one.
+        #[arg(long = "use")]
+        use_session: bool,
+    },
     /// Capture-completeness stats for a session (execs vs captured flows; flags
     /// network-facing execs that captured ZERO flows — traffic likely escaped).
     Stats {
@@ -778,6 +791,32 @@ pub enum ExportAction {
         /// Output file (defaults to stdout).
         #[arg(short, long)]
         output: Option<String>,
+    },
+    /// Export the WHOLE session as one portable file (`<name>.burpwn`): every
+    /// flow with its bodies, plus the groups, tags, notes, attacks and rules.
+    /// `burpwn session import <file>` opens it on another machine.
+    ///
+    /// By default the bundle is RAW — it carries the stored auth tokens, the
+    /// login commands and the Authorization / Cookie headers captured in the
+    /// traffic, so that the session replays identically. `--redact` drops the
+    /// stored credentials; it does NOT scrub the ones captured inside recorded
+    /// requests and responses.
+    Session {
+        /// Session to export (defaults to the active session).
+        #[arg(long)]
+        session: Option<String>,
+        /// Output file (defaults to `<session>.burpwn` in the current directory).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Drop the stored auth tokens, login commands and match/replace
+        /// replacements. Credentials captured INSIDE recorded requests and
+        /// responses (Authorization / Cookie headers, login bodies) stay in the
+        /// bundle — see the command help.
+        #[arg(long)]
+        redact: bool,
+        /// Overwrite the output file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
     /// Export a pcap (not yet implemented — errors clearly).
     Pcap {

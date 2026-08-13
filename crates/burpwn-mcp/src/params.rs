@@ -92,6 +92,23 @@ pub struct NoteAddParams {
     pub body: String,
 }
 
+/// `session_export` — write the whole session out as one portable file.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SessionExportParams {
+    /// Output path. Defaults to `<session>.burpwn` in the server's working
+    /// directory.
+    #[serde(default)]
+    pub output: Option<String>,
+    /// Drop the stored auth tokens, login commands and match/replace
+    /// replacements. Credentials captured inside recorded requests/responses
+    /// (Authorization / Cookie headers, login bodies) are NOT scrubbed.
+    #[serde(default)]
+    pub redact: bool,
+    /// Overwrite the output file if it already exists.
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// `group_new` — create (or re-describe) a named collection of flows.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GroupNewParams {
@@ -412,6 +429,19 @@ mod tests {
         .unwrap();
         assert_eq!(p.mode, "cluster-bomb");
         assert_eq!(p.positions, vec!["3:4"]);
+    }
+
+    #[test]
+    fn session_export_params_default_to_a_raw_bundle_next_to_the_agent() {
+        let p: SessionExportParams = serde_json::from_str("{}").unwrap();
+        assert!(p.output.is_none());
+        assert!(!p.redact, "raw by default: fidelity over convenience");
+        assert!(!p.force);
+        let p: SessionExportParams =
+            serde_json::from_str(r#"{"output":"/tmp/x.burpwn","redact":true,"force":true}"#)
+                .unwrap();
+        assert_eq!(p.output.as_deref(), Some("/tmp/x.burpwn"));
+        assert!(p.redact && p.force);
     }
 
     #[test]

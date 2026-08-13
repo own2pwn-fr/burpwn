@@ -231,7 +231,22 @@ burpwn req list --workspace recon
 burpwn tag add <flow_id> sqli-candidate
 burpwn note add <flow_id> 'reflected param `q`'
 burpwn export har -o /tmp/session.har      # HAR 1.2 (stdout if no -o); export pcap is not implemented
+burpwn export session -o /tmp/acme.burpwn  # the WHOLE session in one portable file
 ```
+
+A **session bundle** (`burpwn export session`) is the way to hand a session to
+someone else, or to park it and come back to it on another machine: one file
+holding every flow with its bodies, plus the workspaces, groups, tags, notes,
+attacks and rules. `burpwn session import /tmp/acme.burpwn [--as name] [--use]`
+opens it as a NEW session — it never merges into or overwrites an existing one,
+so a name collision is an error you resolve with `--as`.
+
+⚠️ **The bundle is raw by default**: it carries the stored auth tokens, the login
+commands and the `Authorization` / `Cookie` headers captured in the traffic, so
+the session replays identically. `--redact` drops the stored auth profiles and
+match/replace replacements, but it does **not** scrub credentials captured inside
+recorded requests and responses. Move a bundle the way you would move the
+credentials it contains.
 
 `burpwn workspace use <name>` only records the choice in config — you must still
 pass `--workspace` on `exec`/`req` to actually scope.
@@ -260,13 +275,15 @@ flows.
 ## CLI vs MCP
 
 - **CLI / hook (default):** use the commands above, or rely on the `init` hook.
-- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 36 tools
+- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 37 tools
   over stdio — the full loop is usable MCP-only, no shell needed. Session/query:
   `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
   `req_search`, `workspace_list`, `workspace_new`, `tag_list`, `tag_add`,
   `note_add`, `match_replace_list`, `match_replace_add`, `exec`. Organize:
   `group_new`, `group_add`, `group_list`, `group_show`, `group_rm` (named
-  collections of flows: a reconstructed auth scenario, one fuzzing campaign).
+  collections of flows: a reconstructed auth scenario, one fuzzing campaign),
+  and `session_export` to archive the whole session as one portable file (there
+  is no import tool — opening a file from elsewhere is an operator decision).
   Repeater/Intruder:
   `req_replay` (Repeater parity — replay/edit stored flows), `fuzz`, `fuzz_list`,
   `fuzz_results`. Analysis: `compare`, `encode`, `decode`. Auth: `session_auth_set`,

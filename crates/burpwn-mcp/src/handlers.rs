@@ -54,6 +54,42 @@ pub fn session_current(paths: &Paths) -> Result<Value> {
     Ok(json!({ "active": active, "db_exists": exists }))
 }
 
+/// `session_export` — pack the session into one portable file.
+///
+/// The reply is deliberately terse (path, size, counts): it is context the
+/// agent pays for on every subsequent turn, and there is nothing to say about a
+/// file beyond where it is and how big it is. The one exception is the warning
+/// on a raw bundle — an agent that hands the file to someone must know it is
+/// carrying live credentials.
+pub fn session_export(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::SessionExportParams,
+) -> Result<Value> {
+    let outcome = burpwn_cli::bundle::export_session(
+        paths,
+        &burpwn_cli::bundle::ExportRequest {
+            session: session.to_string(),
+            output: params.output.as_ref().map(std::path::PathBuf::from),
+            redact: params.redact,
+            force: params.force,
+        },
+    )?;
+    let mut view = json!({
+        "path": outcome.path.display().to_string(),
+        "bytes": outcome.bytes,
+        "flows": outcome.manifest.flow_count,
+        "redacted": outcome.manifest.redacted,
+    });
+    if !outcome.manifest.redacted {
+        view["warning"] = json!(
+            "raw bundle: stored auth tokens/login commands and captured \
+             Authorization/Cookie headers are inside"
+        );
+    }
+    Ok(view)
+}
+
 // --- query -----------------------------------------------------------------
 
 /// `req_list` — flow rows matching the filter, newest first.
@@ -1033,6 +1069,62 @@ mod tests {
         assert_eq!(v["active"], "default");
         let v = session_current(&paths).unwrap();
         assert_eq!(v["active"], "default");
+    }
+
+    /// The agent-facing archive path: one compact result, an explicit warning
+    /// when the bundle is raw, and no warning to pay for when it is not.
+    #[tokio::test]
+    async fn session_export_writes_a_bundle_and_flags_raw_secrets() {
+        let (dir, paths, s) = temp_session().await;
+        seed_one_flow(&paths, &s).await;
+
+        let raw = dir.path().join("archive.burpwn");
+        let v = session_export(
+            &paths,
+            &s,
+            &crate::params::SessionExportParams {
+                output: Some(raw.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(v["path"], raw.display().to_string());
+        assert_eq!(v["flows"], 1);
+        assert_eq!(v["redacted"], false);
+        assert!(v["bytes"].as_u64().unwrap() > 0);
+        assert!(v["warning"].as_str().unwrap().contains("raw bundle"));
+        assert!(raw.is_file());
+
+        // Redacted: nothing to warn about beyond what the tool description says,
+        // so the field is absent rather than empty.
+        let clean = dir.path().join("clean.burpwn");
+        let v = session_export(
+            &paths,
+            &s,
+            &crate::params::SessionExportParams {
+                output: Some(clean.display().to_string()),
+                redact: true,
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(v["redacted"], true);
+        assert!(v.get("warning").is_none());
+
+        // Re-exporting over an existing file needs force.
+        let err = session_export(
+            &paths,
+            &s,
+            &crate::params::SessionExportParams {
+                output: Some(clean.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            burpwn_cli::diag::diagnose(&err).code,
+            ErrorCode::InputFileExists
+        );
     }
 
     #[tokio::test]
