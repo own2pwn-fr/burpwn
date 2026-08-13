@@ -43,6 +43,14 @@ Usage::
 The generator is fully deterministic: no network, stdlib only, a fixed default
 seed, and a stable emission order — so regeneration is byte-identical on re-run.
 
+The emitted set is a *subsample* of the families (see ``build_dataset``), and
+that subsample is constrained by ``COVERAGE_MIN_PER_TOOL``: every one of the 42
+MCP tools is guaranteed to survive into ``dataset.jsonl`` and
+``dataset.train.jsonl`` as a real tool call, whatever ``--target`` /
+``--multiturn-frac`` are set to. ``--validate`` enforces this. Before that floor
+existed the raffle silently culled 15 of the 42 — coverage of the tool surface
+is a property worth asserting, not one to leave to chance.
+
 CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
 
   CLI ``--json`` wraps everything in ``{ok,data,error}``.
@@ -6614,12 +6622,101 @@ def _subsample_by_style(
     return [r for r in unique if id(r) in keep]
 
 
+# Minimum number of emitted records that must exercise each MCP tool as a real
+# tool call. Both subsampling stages below honour this floor.
+#
+# Why it exists: the balancer and the --target cap select single-turn records by
+# a *uniform* per-style raffle. A tool demonstrated by only one or two
+# single-turn records therefore had a ~70% chance of vanishing from the emitted
+# file even though the families cover all 42 — a measured 15 tools (encode,
+# decode, session_list, tag_list, workspace_*, session_auth_*, session_stats,
+# fuzz_list, match_replace_list, intercept_{disable,drop,scope}) were culled
+# that way. Coverage of the tool surface is a property of the dataset, not
+# something to leave to a raffle, so it is now a constraint on the raffle.
+COVERAGE_MIN_PER_TOOL = 2
+
+
+def _record_mcp_tools(rec: dict[str, Any]) -> set[str]:
+    """The MCP tool names a record actually calls (empty for cli/shell records —
+    `shell` drives the generic `Bash` tool, `cli` has no tool calls at all)."""
+    names: set[str] = set()
+    for m in rec["messages"]:
+        for tc in m.get("tool_calls") or []:
+            name = tc.get("function", {}).get("name")
+            if name in MCP_TOOL_NAMES:
+                names.add(name)
+    return names
+
+
+def _coverage_floor_ids(
+    pool: list[dict[str, Any]], already: Iterable[dict[str, Any]], minimum: int
+) -> set[int]:
+    """Ids of records to force-keep from ``pool`` so that every MCP tool reaches
+    ``minimum`` occurrences, counting what ``already`` (the records kept
+    unconditionally) contributes.
+
+    Deterministic: tools are visited in sorted order and ``pool`` is scanned in
+    its stable family order, so the result depends only on the family output —
+    not on the RNG, and not on iteration order of any set.
+    """
+    counts: dict[str, int] = {}
+    for rec in already:
+        for tool in _record_mcp_tools(rec):
+            counts[tool] = counts.get(tool, 0) + 1
+    picked: set[int] = set()
+    for tool in sorted(MCP_TOOL_NAMES):
+        for rec in pool:
+            if counts.get(tool, 0) >= minimum:
+                break
+            if id(rec) in picked:
+                continue
+            tools = _record_mcp_tools(rec)
+            if tool not in tools:
+                continue
+            picked.add(id(rec))
+            # A record often demonstrates several tools; credit them all so we
+            # don't over-select.
+            for other in tools:
+                counts[other] = counts.get(other, 0) + 1
+    return picked
+
+
+def _raffle_by_style(
+    groups: dict[str, list[dict[str, Any]]],
+    quotas: dict[str, int],
+    keep: set[int],
+    rng: random.Random,
+) -> None:
+    """Top each style's kept count up to its quota by drawing from a shuffled
+    group, skipping records already in ``keep`` (the coverage floor). Mutates
+    ``keep`` in place.
+
+    Records pre-kept by the floor count *against* the quota, so the overall
+    emitted size (and hence the multi-turn fraction / target) is preserved.
+    """
+    for style in sorted(groups):
+        group = groups[style]
+        rng.shuffle(group)
+        kept_here = sum(1 for r in group if id(r) in keep)
+        for rec in group:
+            if kept_here >= quotas.get(style, 0):
+                break
+            if id(rec) in keep:
+                continue
+            keep.add(id(rec))
+            kept_here += 1
+
+
 def build_dataset(
     target: int | None, seed: int, multiturn_frac: float | None = None
 ) -> list[dict[str, Any]]:
     """Generate all family records, dedup, optionally balance the multi-turn
     fraction, and (optionally) cap to ~target with a deterministic, style-balanced
-    selection."""
+    selection.
+
+    Both subsampling stages are constrained by ``COVERAGE_MIN_PER_TOOL``: every
+    MCP tool keeps at least that many demonstrations in the emitted set (or all
+    of them, if the families provide fewer)."""
     records: list[dict[str, Any]] = []
     for fam in FAMILIES:
         records.extend(fam())
@@ -6649,12 +6746,15 @@ def build_dataset(
                 for r in single:
                     by_style.setdefault(r["style"], []).append(r)
                 keep: set[int] = set(id(r) for r in multi)
+                # Coverage floor before the raffle: a tool whose only
+                # demonstrations are single-turn must not be raffled away.
+                keep |= _coverage_floor_ids(single, multi, COVERAGE_MIN_PER_TOOL)
                 total_single = len(single)
-                for st in sorted(by_style):
-                    group = by_style[st]
-                    rng.shuffle(group)
-                    n_keep = int(round(keep_single * len(group) / total_single))
-                    keep |= set(id(r) for r in group[:n_keep])
+                quotas = {
+                    st: int(round(keep_single * len(g) / total_single))
+                    for st, g in by_style.items()
+                }
+                _raffle_by_style(by_style, quotas, keep, rng)
                 unique = _subsample_by_style(unique, keep)
 
     # If a smaller target is requested, deterministically subsample while keeping
@@ -6666,16 +6766,19 @@ def build_dataset(
         for r in unique:
             by_style2.setdefault(r["style"], []).append(r)
         frac = target / len(unique)
-        keep2: set[int] = set()
         styles = sorted(by_style2)
+        quotas2: dict[str, int] = {}
         allocated = 0
         for idx, st in enumerate(styles):
             group = by_style2[st]
-            rng.shuffle(group)
             n = (target - allocated) if idx == len(styles) - 1 else round(len(group) * frac)
             n = max(0, min(n, len(group)))
             allocated += n
-            keep2 |= set(id(r) for r in group[:n])
+            quotas2[st] = n
+        # Same floor as above: a --target cap must not be able to cull a tool
+        # off the emitted surface either.
+        keep2: set[int] = _coverage_floor_ids(unique, [], COVERAGE_MIN_PER_TOOL)
+        _raffle_by_style(by_style2, quotas2, keep2, rng)
         unique = _subsample_by_style(unique, keep2)
 
     return unique
@@ -6685,7 +6788,8 @@ def split_dataset(
     records: list[dict[str, Any]], seed: int, val_frac: float = 0.05
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Deterministic train/validation split, stratified by style so every style
-    (cli/mcp/shell) appears in both files."""
+    (cli/mcp/shell) appears in both files, and constrained so that every MCP tool
+    is demonstrated at least once in the *train* half."""
     rng = random.Random(seed + 1)
     train: list[dict[str, Any]] = []
     val: list[dict[str, Any]] = []
@@ -6697,6 +6801,24 @@ def split_dataset(
         val_idx = set(idx[:n_val])
         for i, r in enumerate(group):
             (val if i in val_idx else train).append(r)
+
+    # Coverage floor, again — this time for the *train* file. A tool with only
+    # one surviving demonstration can have that record drawn into the 5%
+    # validation sample, which would leave the model with nothing to learn the
+    # tool from. Held-out sampling is supposed to measure the training set, not
+    # remove capabilities from it, so any tool that ends up absent from `train`
+    # gets one of its validation records handed back (deterministically: the
+    # first in stable order).
+    train_tools: set[str] = set()
+    for rec in train:
+        train_tools |= _record_mcp_tools(rec)
+    for tool in sorted(MCP_TOOL_NAMES - train_tools):
+        for rec in val:
+            if tool in _record_mcp_tools(rec):
+                val.remove(rec)
+                train.append(rec)
+                train_tools |= _record_mcp_tools(rec)
+                break
     # Preserve a stable order within each split (by normalized key) for a
     # reviewable, byte-identical diff.
     train.sort(key=_normalized_key)
@@ -6936,6 +7058,7 @@ def run_validate(path: str) -> int:
     n_multi = 0
     keys: dict[str, int] = {}
     dupes = 0
+    tools_seen: set[str] = set()
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -6950,6 +7073,7 @@ def run_validate(path: str) -> int:
             by_style[rec.get("style")] = by_style.get(rec.get("style"), 0) + 1
             if is_multiturn(rec):
                 n_multi += 1
+            tools_seen |= _record_mcp_tools(rec)
             k = _normalized_key(rec)
             if k in keys:
                 dupes += 1
@@ -6958,6 +7082,20 @@ def run_validate(path: str) -> int:
                 )
             else:
                 keys[k] = idx
+
+    # Tool-surface coverage. The combined dataset and the train split must
+    # exercise every MCP tool as a real tool call — the generator's families
+    # always did, but the subsampling stages used to raffle thin tools away
+    # (15 of 42 were missing before COVERAGE_MIN_PER_TOOL existed). This turns
+    # that silent regression into a failed validation. The validation split is
+    # exempt: it is 5% of the data and is not expected to be exhaustive.
+    missing_tools = sorted(MCP_TOOL_NAMES - tools_seen)
+    must_cover = os.path.basename(path) in {"dataset.jsonl", "dataset.train.jsonl"}
+    if missing_tools and must_cover:
+        problems.append(
+            f"{len(missing_tools)} MCP tool(s) never appear as a tool call: "
+            + ", ".join(missing_tools)
+        )
 
     total = sum(by_style.values())
     breakdown = ", ".join(f"{by_style[s]} {s}" for s in sorted(by_style))
@@ -6973,7 +7111,8 @@ def run_validate(path: str) -> int:
         return 1
     print(
         f"OK: {src} — {total} records ({breakdown}; {n_multi} multi-turn = {pct}%), "
-        f"0 dupes, schema {SCHEMA_VERSION}",
+        f"0 dupes, {len(tools_seen)}/{len(MCP_TOOL_NAMES)} MCP tools exercised, "
+        f"schema {SCHEMA_VERSION}",
         file=sys.stderr,
     )
     return 0
