@@ -148,9 +148,17 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       the per-row ``attack_id`` was REMOVED (it repeated the caller's own
       argument on every row).
     * compare → same object as CLI ``compare`` data (flow_a/flow_b/status/
-      headers/body+reflected). No output cap: ``body.only_in_a``/``only_in_b``
-      and ``headers.added/removed/changed`` are unbounded, and there is no
-      truncation field as of 0.3.4.
+      headers/body+reflected), but CAPPED on the MCP side only: the per-side
+      body line lists ``body.only_in_a``/``only_in_b`` are truncated to 200
+      lines each by default. ``max_lines`` changes the ceiling; absent or ``0``
+      means the 200 default, and a NEGATIVE value lifts the cap entirely (so
+      "I didn't think about it" and "give me everything" are never the same
+      request). When a side is actually cut the reply carries
+      ``body.truncated:{only_in_a:{shown,total},only_in_b:{...}}`` — only the
+      sides that lost lines, and the whole ``truncated`` object is ABSENT when
+      nothing was cut, so its presence always means "there is more". The CLI
+      ``burpwn compare`` is deliberately uncapped: a human who asked for the
+      diff wants all of it. ``headers.added/removed/changed`` is never capped.
     * encode → {scheme,encoded}; decode → {scheme,decoded,bytes?} or the jwt
       object {alg,header,claims,signature,verified:false}.
     * session_stats → {session,total_execs,total_flows,network_execs,
@@ -203,7 +211,7 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     req_replay.{id,set_headers:[{name,value}],set_body?,method?},
     fuzz.{flow,positions:[":"],payloads:[...],mode,concurrency?,delay_ms?,marker?,
     name?}, fuzz_list.{workspace?}, fuzz_results.{attack_id,sort?,limit?},
-    compare.{flow_a,flow_b,what?}, encode/decode.{scheme,value},
+    compare.{flow_a,flow_b,what?,max_lines?}, encode/decode.{scheme,value},
     session_auth_set.{login,extract,header,host?}, session_auth_refresh.{host?},
     group_new.{name,description?,workspace?(numeric id)},
     group_add.{name,flow_ids:[...]}, group_list.{workspace?}, group_show.{name},
@@ -5499,6 +5507,88 @@ def fam_hooks() -> list[dict[str, Any]]:
     return out
 
 
+def fam_compare_cap() -> list[dict[str, Any]]:
+    """The MCP `compare` body-diff cap. An agent that does not notice
+    `body.truncated` will reason confidently about a body it never saw, so the
+    marker is taught as something to *look for*, not just a field that exists."""
+    out: list[dict[str, Any]] = []
+
+    truncated_body = {
+        "identical": False, "len_a": 48210, "len_b": 51044,
+        "only_in_a": ["<div class=\"banner\">Welcome back, analyst</div>",
+                      "<li><a href=\"/account/orders\">Your orders</a></li>"],
+        "only_in_b": ["<div class=\"banner\">Welcome back, admin</div>",
+                      "<li><a href=\"/admin/users\">Manage users</a></li>"],
+        "reflected": [],
+        "truncated": {"only_in_a": {"shown": 200, "total": 1840},
+                      "only_in_b": {"shown": 200, "total": 2013}},
+    }
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "compare", "truncated", "max_lines", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Diff flows 30 and 31 — the two dashboard renders — and tell "
+                            "me everything that differs.",
+                    "steps": [{
+                        "tool": "compare", "args": {"flow_a": 30, "flow_b": 31},
+                        "result": {"body": truncated_body, "flow_a": 30, "flow_b": 31,
+                                   "headers": {"added": [], "changed": [], "removed": []},
+                                   "status": {"a": 200, "b": 200, "changed": False}},
+                        "interp": "Careful — I am **not** looking at the whole diff, and "
+                                  "the reply says so. `body.truncated` reports "
+                                  "`only_in_a: 200 of 1840` and `only_in_b: 200 of 2013`, "
+                                  "so I have the first 200 lines a side out of nearly four "
+                                  "thousand. That marker only appears when lines were "
+                                  "actually cut, so its presence is the signal.\n\nFrom "
+                                  "what I can see: both `200`, headers identical, and the "
+                                  "admin render swaps the banner and exposes an "
+                                  "`/admin/users` link the analyst render does not. That "
+                                  "is suggestive but I cannot yet say it is *everything* "
+                                  "that differs. Want me to pull the full diff?",
+                    }],
+                },
+                {
+                    "user": "Yes, all of it.",
+                    "steps": [{
+                        "preamble": "A negative max_lines lifts the cap entirely.",
+                        "tool": "compare",
+                        "args": {"flow_a": 30, "flow_b": 31, "max_lines": -1},
+                        "result": {"body": {
+                            "identical": False, "len_a": 48210, "len_b": 51044,
+                            "only_in_a": [
+                                "<div class=\"banner\">Welcome back, analyst</div>",
+                                "<li><a href=\"/account/orders\">Your orders</a></li>"],
+                            "only_in_b": [
+                                "<div class=\"banner\">Welcome back, admin</div>",
+                                "<li><a href=\"/admin/users\">Manage users</a></li>",
+                                "<li><a href=\"/admin/keys\">API keys</a></li>"],
+                            "reflected": []},
+                            "flow_a": 30, "flow_b": 31,
+                            "headers": {"added": [], "changed": [], "removed": []},
+                            "status": {"a": 200, "b": 200, "changed": False}},
+                        "interp": "Now `body.truncated` is absent, which is how I know "
+                                  "this is the complete diff. The full listing turns up "
+                                  "an `/admin/keys` link that the capped view had cut — "
+                                  "exactly the kind of finding that gets missed by "
+                                  "treating a truncated diff as the whole picture.\n\n"
+                                  "On the cap itself: the MCP tool trims each side to 200 "
+                                  "lines by default because a diff of two HTML pages runs "
+                                  "to thousands of lines and its size is set by the "
+                                  "target, not by what you asked for. `max_lines: 500` "
+                                  "raises it; a **negative** value lifts it (`0` and "
+                                  "absent both mean the 200 default, so an unconsidered "
+                                  "call can never accidentally request the firehose). The "
+                                  "`burpwn compare` CLI is uncapped — a human who asked "
+                                  "for a diff gets all of it.",
+                    }],
+                },
+            ],
+        )
+    )
+    return out
+
+
 def fam_mcp_groups_hooks() -> list[dict[str, Any]]:
     """MCP tool-calling for the 0.3.x tools: group_*, hook_*, session_export.
     Several of these results differ from the CLI's for the same operation."""
@@ -6482,6 +6572,7 @@ FAMILIES = [
     fam_groups,
     fam_session_bundle,
     fam_hooks,
+    fam_compare_cap,
     fam_mcp_groups_hooks,
     # 0.2.0 integration surface: skill install / mcp register.
     fam_skill_install,

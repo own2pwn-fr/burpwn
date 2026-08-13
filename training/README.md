@@ -51,12 +51,12 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-**1,516** deduplicated examples by default (`541 cli`, `315 mcp`, `660 shell`), of
+**1,518** deduplicated examples by default (`541 cli`, `317 mcp`, `660 shell`), of
 which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
-(split 1,440 train / 76 validation). The split is a deterministic,
+(split 1,442 train / 76 validation). The split is a deterministic,
 **style-stratified** 95/5 split (all three styles appear in each split). The
 default emitted set is balanced to ~50% multi-turn by deterministically
-subsampling single-turn records; the **full corpus is 3,344 examples**
+subsampling single-turn records; the **full corpus is 3,345 examples**
 (`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
@@ -269,9 +269,12 @@ Notable grounded facts encoded:
 * **A hook's `add-header` synthesises a header that is absent**, which
   match/replace structurally cannot do (it only substitutes into what is already
   there) — the distinction that decides which of the two to reach for.
-* `compare` has **no output cap and no truncation field** as of 0.3.4;
-  `body.only_in_a`/`only_in_b` and `headers.added/removed/changed` are
-  unbounded.
+* **The MCP `compare` body diff is capped** at 200 lines per side; `max_lines`
+  changes the ceiling (absent or `0` = the default, a **negative** value lifts
+  it). A side that was cut is declared in
+  `body.truncated:{only_in_a:{shown,total},...}`, and the object is absent when
+  nothing was cut — so its presence is the signal that there is more. The
+  `burpwn compare` **CLI is uncapped**. `headers.*` is never capped.
 
 ## Coverage
 
@@ -310,6 +313,8 @@ flags and phrasings, then deduplicated):
   existing one), `hook test` as a dry-run against a captured flow, and the `exec`
   hook that re-mints an expiring token and injects it before the request leaves
   (with `--ttl` caching and the fail-open `--timeout` behaviour).
+* **Capped `compare` diffs**: noticing `body.truncated` and re-asking with a
+  negative `max_lines`, so a truncated diff is never mistaken for the whole one.
 * **`Bash` tool-call (style `shell`)**: single-turn recon (`exec` a tool, read
   stdout, point at the capture) and **multi-turn engagements** — session → recon →
   `req list` → `req show` → tag/note/export — plus multi-turn vuln workflows
@@ -331,7 +336,7 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (1,516 records, ~50% multi-turn)
+python generate.py                     # writes dataset.jsonl + splits (1,518 records, ~50% multi-turn)
 python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,325 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
