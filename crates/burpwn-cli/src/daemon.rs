@@ -700,6 +700,17 @@ mod tests {
     use super::*;
     use crate::control::{ControlClient, HeaderEdit};
 
+    /// Deadline for "this must resolve rather than hang forever" assertions.
+    ///
+    /// These resolve in well under a millisecond when they pass, so the number
+    /// only has to sit below the stall being guarded against — the 5-minute
+    /// intercept timeout — while leaving room for scheduling delay. It was 2 s,
+    /// tight enough to read as a latency assertion, which is not what it is:
+    /// a failure here should mean "the resolve never came", never "the machine
+    /// was busy". Widening it does not weaken the check, it just stops the
+    /// deadline from being the thing under test.
+    const HANG_DETECT: Duration = Duration::from_secs(60);
+
     fn ctrl_state() -> ControlState {
         ControlState::new("default", 5353, InterceptController::new())
     }
@@ -959,8 +970,12 @@ mod tests {
             .expect_err("park must be refused while disabled");
         let _ = returned.reply.send(InterceptDecision::Forward(None));
 
-        // The handler proceeds with Forward(None) — no 5-min stall.
-        let decision = tokio::time::timeout(Duration::from_secs(2), handler)
+        // The handler proceeds with Forward(None) — no 5-min stall. The deadline
+        // is a hang detector, not a latency assertion: the resolve it waits on is
+        // sub-millisecond, and the failure it guards against is the 5-minute
+        // intercept timeout. Keep it far above any scheduling delay — a tight
+        // bound here fails under a loaded machine without a bug in sight.
+        let decision = tokio::time::timeout(HANG_DETECT, handler)
             .await
             .expect("handler must not hang after a disabled-park")
             .unwrap();
@@ -1135,7 +1150,7 @@ mod tests {
 
         // Client B's Status must return promptly despite A holding a connection.
         let mut b = ControlClient::connect(&sock).await.unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(2), b.status())
+        let status = tokio::time::timeout(HANG_DETECT, b.status())
             .await
             .expect("Status must not block behind the long-poll")
             .unwrap();
@@ -1199,8 +1214,14 @@ mod tests {
         // Connect and send an `InterceptAwait` while NOTHING is parked yet, so
         // the daemon blocks in `take_next`.
         let mut client = UnixStream::connect(&sock).await.unwrap();
+        // The long-poll must still be running when the intercept is parked below,
+        // otherwise this tests nothing: the daemon would have already returned
+        // "timed out, none parked", left the loop, and the park would sit there
+        // until the intercept's own 5-minute timeout with nobody polling. The
+        // sleeps that sequence this are wall-clock, so on a loaded machine they
+        // stretch — hence a window far wider than they can plausibly drift.
         let req =
-            crate::control::encode_request(&ControlRequest::InterceptAwait { timeout_secs: 5 });
+            crate::control::encode_request(&ControlRequest::InterceptAwait { timeout_secs: 300 });
         client.write_all(req.as_bytes()).await.unwrap();
         client.flush().await.unwrap();
 
@@ -1230,7 +1251,7 @@ mod tests {
 
         // The handler must resolve to Forward(None) (resolve-on-write-failure),
         // not hang forever.
-        let decision = tokio::time::timeout(Duration::from_secs(2), handler)
+        let decision = tokio::time::timeout(HANG_DETECT, handler)
             .await
             .expect("handler must not hang when client disconnects")
             .unwrap();
