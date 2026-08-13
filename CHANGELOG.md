@@ -5,6 +5,76 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — hooks: do something to every request, not just rewrite one
+Everything burpwn could do to traffic in flight, it did by *substitution*. A match/replace rule
+rewrites text that is already in the message, which leaves two holes big enough to walk through.
+It cannot **add** — `User-Agent: .*` matches nothing on a client that never sent a User-Agent, and
+the session-auth login macro says so in its own source: it can refresh a stale `Authorization`
+header but cannot put one on a request that lacks it. And it cannot **run anything**: the one
+scenario every authenticated API test needs — mint a token, put it on the request that is waiting,
+then let it go — had no expression at all.
+- **`burpwn hook add <name> --action <action> [scope] [params]`** installs one action applied by the
+  proxy to every message matching its scope, on one phase (`pre-request` or `post-response`). The
+  scope is richer than a rule's bare host substring: `--host`, `--method`, `--path` and, on the
+  response side, `--status`. The declarative actions are `add-header` (only if absent — the missing
+  primitive), `set-header` (add-or-replace), `remove-header`, `set-query-param` and `drop`, and they
+  cost exactly what a few string operations cost: no process, no I/O, nothing to schedule.
+- **`--action exec`** is the other half: the command runs in the same rootless sandbox as
+  `burpwn exec` and the login macro, a one-capture-group `--extract` regex pulls the value out of
+  its stdout, and `--inject-header 'Authorization: Bearer {}'` (or `--inject-param`) puts it on the
+  waiting request. `--ttl` (default 5 min) reuses the value instead of re-running the command,
+  because a sandbox is a whole network namespace and one per request is not a thing anyone wants.
+- **A hook can never break the traffic it hooks.** Every `exec` hook has a hard `--timeout` (default
+  10 s) and **fails open**: on timeout, on a command that errors, on an `--extract` that does not
+  match, the request goes upstream un-hooked and the failure is logged at `WARN`. This is the same
+  contract as the blocking intercept's park timeout, and for the same reason — the proxy is on the
+  critical path of someone's engagement.
+- **The recursion problem is solved twice.** A hook's command talks to the network, so its traffic
+  comes back through this proxy and would hit the hook that spawned it. First, the command runs
+  under an `exec_id` prefixed `hook:`, which the sandbox front-end stamps into the wire header of
+  every connection it opens: any flow carrying it bypasses the engine entirely — every hook, both
+  phases. That is a property of the connection, not a timing window, so it cannot be raced. Second,
+  as a backstop for the case where the marker is somehow absent, **at most one hook command runs at
+  a time for the whole proxy**: a request that would need to start another one is forwarded
+  un-hooked *immediately* rather than parked behind it, because waiting is exactly what turns a
+  recursion into a stall. That invariant doubles as the single-flight the TTL cache wants — a burst
+  of requests on a cold cache mints one value, not one sandbox each. An end-to-end test drives a
+  hook whose command makes a real HTTP request through the very proxy running it, and asserts the
+  command runs once and the whole thing finishes in milliseconds rather than at the timeout.
+- **Response hooks see streamed bodies.** The proxy streams a response straight through whenever
+  nothing is in scope to rewrite it, which is what makes SSE and chunked endpoints work; a
+  post-response hook now counts as "something in scope", so it actually runs on those instead of
+  silently never firing.
+- **`burpwn hook test <id> --flow <id>`** replays a hook against a *captured* flow and reports
+  `matched` / `changed` / `dropped` with the before and after — no live traffic, no target touched.
+  A hook that does not fire is almost always a scope that does not match, and this is how you see
+  that instead of inferring it from captures. For an `exec` hook the command really runs, so it also
+  answers "does the extraction regex still match what the command prints today".
+- **Repeater and Intruder apply the declarative hooks too.** `req replay` and `fuzz` never went
+  through the proxy's pipeline, so a hook keeping a token fresh would have been invisible to the two
+  commands most likely to be re-sending a request that has gone stale. `exec` hooks are deliberately
+  skipped there: those paths have no sandbox, and a 500-request attack must not be 500 commands.
+- **Hooks and match/replace coexist, and neither is deprecated.** A rule rewrites what is there; a
+  hook does everything else, including putting it there. Hooks run *after* the rules and *before*
+  the intercept on both phases, so an operator holding a flow sees exactly what is about to leave.
+  The login macro still generates a match/replace rule and is untouched by this change.
+- The hook set lives in the daemon as ONE shared engine refreshed every 2 s, so a hook added
+  mid-session applies to keep-alive connections that are already open — unlike match/replace rules,
+  which are still snapshotted once per connection (now documented where it can be seen).
+- **Cost when you have no hooks: one relaxed atomic load.** The whole engine is behind it. Nothing
+  allocates, locks, awaits or reads the store on a proxy with no hook configured, and a test pins
+  that an empty engine returns without touching the message or reporting a change.
+- schema v6: the `hooks` table (phase, host/method/path/status scope, action + JSON parameters,
+  order, timeout, TTL). A v5 file migrates in place, touching nothing that was already there. A
+  stored hook this build cannot decode fails the whole read (`BW-STORE-006`) instead of being
+  skipped: running *part* of a hook set nobody configured is worse than refusing to run it.
+- **MCP `hook_add`, `hook_list`, `hook_set_enabled`, `hook_rm`, `hook_test` — 42 tools** now. Their
+  descriptions say when to reach for a hook rather than for a one-off edit, and lead with the two
+  things a rule cannot do, because that distinction is the whole reason the tool exists.
+- New codes `BW-INPUT-013` (no such hook) and `BW-STORE-006` (a stored hook this burpwn cannot
+  read). `export session --redact` now also blanks an `exec` hook's command, which carries
+  credentials in its argv exactly like a login command does.
+
 ### Added — a session fits in one file, and that file opens on another machine
 Everything a pentester learns about a target lived in exactly one place: `~/.local/share/burpwn/
 sessions/<name>/session.db` on the machine that captured it. There was no way to hand a finished

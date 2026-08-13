@@ -246,6 +246,7 @@ name = "burpwn-cli"
 version = "0.3.4"
 dependencies = [
  "anyhow",
+ "async-trait",
  "burpwn-error",
  "burpwn-proxy",
  "burpwn-sandbox",

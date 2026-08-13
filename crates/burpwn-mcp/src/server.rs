@@ -249,6 +249,67 @@ impl BurpwnServer {
 
     // --- groups (named collections of flows) ------------------------------
 
+    // --- hooks ------------------------------------------------------------
+
+    #[tool(
+        description = "Install a HOOK: one action applied to every request (or response) matching a scope, by the proxy itself. Reach for it when something must be true of ALL traffic rather than of one request you are about to send. Two things match/replace cannot do: hook_add(name='ua', action='add-header', header='User-Agent: burpwn') puts in a header the client never sent (a rule can only rewrite one that is already there), and action='exec' runs a command in the sandbox before the request goes out and injects what it prints — the way to keep a bearer token fresh: hook_add(name='token', action='exec', host='api.target.com', cmd='./mint-token.sh', extract='\"access_token\":\"([^\"]+)\"', inject_header='Authorization: Bearer {}', ttl_ms=300000). Set ttl_ms or the command runs on every matching request (one sandbox each). A failing or slow exec hook FAILS OPEN — the traffic goes through un-hooked — so a hook never blocks an engagement. Other actions: set-header, remove-header, set-query-param, drop."
+    )]
+    async fn hook_add(
+        &self,
+        Parameters(params): Parameters<HookAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::hook_add(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "List the hooks installed on the proxy, in the order they are applied. Read it when traffic does not look like what you sent (a header you did not add, a request refused with 403 'dropped by hook'), and before adding a hook that may already exist."
+    )]
+    async fn hook_list(&self) -> Result<CallToolResult, McpError> {
+        handlers::hook_list(self.paths(), self.session())
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Enable or disable a hook by id, keeping its definition. Use it to isolate a hook's effect on a target (disable, re-send, compare) instead of deleting and re-adding it."
+    )]
+    async fn hook_set_enabled(
+        &self,
+        Parameters(params): Parameters<HookSetEnabledParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::hook_set_enabled(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(description = "Delete a hook by id. Captured flows are untouched.")]
+    async fn hook_rm(
+        &self,
+        Parameters(params): Parameters<HookRmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::hook_rm(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Replay a hook against a CAPTURED flow and report what it would do — does it match, what does it change — without sending any live traffic. This is how you debug a hook that seems not to fire (usually a scope that does not match) instead of guessing from the captures. For an exec hook the command really runs, so it also tells you whether the extraction regex still matches the command's output."
+    )]
+    async fn hook_test(
+        &self,
+        Parameters(params): Parameters<HookTestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::hook_test(self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
     #[tool(
         description = "Create a NAMED, described collection of flows (a 'group' — the equivalent of a Burp highlight). Use it the moment you understand something worth keeping: once you have worked out how the target authenticates, create group_new(name='auth-flow', description='login form -> POST /login -> redirect + Set-Cookie session') and add the flows that prove it; do the same to isolate one campaign (name='xss-fuzz-search-param'). The description is for your future self and for the report — say what the sequence MEANS, not that it exists. Idempotent: re-creating an existing name returns the same group and just updates its description."
     )]
@@ -518,7 +579,10 @@ impl ServerHandler for BurpwnServer {
                  encode/decode (base64/url/hex/jwt). Findings are kept as named \
                  collections (group_new/group_add/group_list/group_show/group_rm), \
                  tags and notes, and a finished session can be archived whole with \
-                 session_export. Tools operate on the active session unless the \
+                 session_export. Policy applied to ALL traffic goes in hooks \
+                 (hook_add/hook_list/hook_test): adding a header the client never \
+                 sent, or running a command before a request and injecting what it \
+                 prints (a token refresh). Tools operate on the active session unless the \
                  server was started with --session."
                     .into(),
             ),

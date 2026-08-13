@@ -175,6 +175,10 @@ pub async fn fuzz_run(
         scheme: detail.flow.scheme.clone(),
         sni: host,
         addr,
+        // The session's declarative hooks apply to every request of the attack
+        // (see `HttpReplaySender::hooks`): an Intruder run that carries a token
+        // the hooks keep fresh is the whole point of having them.
+        hooks: Arc::new(reader.list_hooks()?),
     });
 
     let config = FuzzConfig {

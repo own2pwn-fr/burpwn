@@ -12,8 +12,9 @@ use crate::blob::get_blob;
 use crate::error::Result;
 use crate::model::{
     Attack, AttackResult, AuthProfile, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow,
-    Group, Intercept, InterceptState, MatchKind, MatchReplaceRule, Note, Protocol, RequestData,
-    ResponseData, Tag, Workspace, WsDirection, WsMessage,
+    Group, Hook, HookAction, HookPhase, HookScope, Intercept, InterceptState, MatchKind,
+    MatchReplaceRule, Note, Protocol, RequestData, ResponseData, Tag, Workspace, WsDirection,
+    WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -584,6 +585,102 @@ impl Reader {
             })
         })?;
         collect(rows)
+    }
+
+    /// List every hook in APPLICATION order (`ord`, then id) — the order the
+    /// proxy applies them in, so the snapshot it loads needs no re-sorting.
+    ///
+    /// A row whose phase or action this build does not understand fails the
+    /// WHOLE call rather than being skipped: the caller (the proxy's hook
+    /// refresher, the CLI) then keeps its previous snapshot and says so, instead
+    /// of quietly running a partial hook set the operator never configured.
+    pub fn list_hooks(&self) -> Result<Vec<Hook>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, enabled, name, phase, host, method, path, status, action, params,
+                    ord, timeout_ms, ttl_ms, created_at
+             FROM hooks ORDER BY ord, id",
+        )?;
+        // Two stages: rusqlite's mapper can only fail with a `rusqlite::Error`,
+        // while decoding phase/action yields a `StoreError`. Pull the raw columns
+        // first, then decode.
+        type HookRow = (
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+            ))
+        })?;
+        let raw: Vec<HookRow> = collect(rows)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (
+            id,
+            enabled,
+            name,
+            phase,
+            host,
+            method,
+            path,
+            status,
+            action,
+            params,
+            order,
+            timeout_ms,
+            ttl_ms,
+            created_at,
+        ) in raw
+        {
+            out.push(Hook {
+                id,
+                enabled: enabled != 0,
+                name,
+                phase: HookPhase::from_db(&phase)?,
+                scope: HookScope {
+                    host,
+                    method,
+                    path,
+                    status: status.map(|s| s as u16),
+                },
+                action: HookAction::from_db(&action, &params)?,
+                order,
+                timeout_ms,
+                ttl_ms,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// One hook by id, or `None` if it does not exist.
+    pub fn get_hook(&self, id: i64) -> Result<Option<Hook>> {
+        Ok(self.list_hooks()?.into_iter().find(|h| h.id == id))
     }
 
     /// List all match/replace rules.

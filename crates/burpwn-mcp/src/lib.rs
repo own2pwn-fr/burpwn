@@ -6,12 +6,18 @@
 //! Query (read the session SQLite via [`burpwn_store::Reader`], no daemon needed):
 //! `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
 //! `req_search`, `workspace_list`, `tag_list`, `group_list`, `group_show`,
-//! `match_replace_list`, `session_auth_status`.
+//! `match_replace_list`, `hook_list`, `session_auth_status`.
 //!
 //! Mutation (write via the store): `match_replace_add`, `tag_add`, `note_add`,
 //! `workspace_new`, and the flow groups — `group_new`, `group_add`, `group_rm`
 //! — which pin a named, described subset of the capture (a reconstructed auth
 //! scenario, one fuzzing campaign) to a handle the agent can come back to.
+//!
+//! Pipeline policy: `hook_add` / `hook_set_enabled` / `hook_rm` / `hook_test`
+//! install and debug HOOKS — an action the proxy applies to every message
+//! matching a scope, including the two things a match/replace rule cannot do
+//! (add a header that is not there, and run a command whose output is injected,
+//! e.g. a token mint).
 //!
 //! Archival: `session_export` packs the whole session into one portable
 //! `.burpwn` bundle. There is deliberately NO import tool — loading a file that

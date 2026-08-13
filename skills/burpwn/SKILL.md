@@ -227,6 +227,32 @@ burpwn match-replace list
 burpwn match-replace disable <id>          # also: enable <id>, rm <id>
 ```
 
+## Hooks (act on every request / response)
+
+A rule REWRITES what is already in a message. A hook can add what is not there,
+take it out, refuse the flow, or run a command and inject what it prints.
+
+```sh
+# a User-Agent on every request, including the ones that never sent one
+burpwn hook add ua --action add-header --header 'User-Agent: burpwn'
+
+# keep a bearer token fresh: run the mint command in the sandbox before the
+# request, inject what it prints, and reuse it for 5 minutes
+burpwn hook add token --action exec --host api.target.com \
+  --cmd './mint-token.sh' --extract '"access_token":"([^"]+)"' \
+  --inject-header 'Authorization: Bearer {}' --ttl 300000
+
+burpwn hook list
+burpwn hook test <id> --flow <flow_id>     # does it match? what does it change?
+burpwn hook disable <id>                   # also: enable <id>, rm <id>
+```
+
+Scope with `--host/--method/--path` (and `--status` on `--phase post-response`);
+`--action` is `add-header|set-header|remove-header|set-query-param|drop|exec`. A
+slow or failing `exec` hook FAILS OPEN — the traffic goes through un-hooked — and
+only one hook command runs at a time, so a hook whose command talks to the target
+cannot trigger itself. `req replay` and `fuzz` apply the declarative hooks only.
+
 ## Organize: workspaces, groups, tags, notes, export
 
 ```sh
@@ -280,7 +306,7 @@ flows.
 ## CLI vs MCP
 
 - **CLI / hook (default):** use the commands above, or rely on the `init` hook.
-- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 37 tools
+- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 42 tools
   over stdio — the full loop is usable MCP-only, no shell needed. Session/query:
   `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
   `req_search`, `workspace_list`, `workspace_new`, `tag_list`, `tag_add`,

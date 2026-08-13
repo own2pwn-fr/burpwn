@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::blob::BlobStore;
 use crate::error::{Result, StoreError};
 use crate::model::{
-    FlowStart, InterceptState, NewAttack, NewAttackResult, NewAuthProfile, NewExecRecord,
+    FlowStart, InterceptState, NewAttack, NewAttackResult, NewAuthProfile, NewExecRecord, NewHook,
     NewMatchReplaceRule, RequestData, ResponseData, WsDirection,
 };
 
@@ -189,6 +189,29 @@ pub enum WriteOp {
         rule: NewMatchReplaceRule,
         /// Reply with the rule id.
         reply: IdReply,
+    },
+    /// Insert a hook; replies with its id.
+    AddHook {
+        /// Hook definition.
+        hook: NewHook,
+        /// Reply with the hook id.
+        reply: IdReply,
+    },
+    /// Enable/disable a hook.
+    SetHookEnabled {
+        /// Hook id.
+        id: i64,
+        /// New enabled flag.
+        enabled: bool,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
+    },
+    /// Delete a hook.
+    DeleteHook {
+        /// Hook id.
+        id: i64,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
     },
     /// Enable/disable a match/replace rule.
     SetMatchReplaceEnabled {
@@ -595,6 +618,37 @@ impl WriteHandle {
         recv_ids(rx).await
     }
 
+    /// Insert a hook, awaiting its id. The action's parameters are serialized
+    /// here, so a hook that cannot be represented never reaches the table.
+    pub async fn add_hook(&self, hook: NewHook) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::AddHook { hook, reply }).await?;
+        recv_id(rx).await
+    }
+
+    /// Enable/disable a hook, awaiting ack.
+    pub async fn set_hook_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::SetHookEnabled {
+            id,
+            enabled,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
+    /// Delete a hook, awaiting ack.
+    pub async fn delete_hook(&self, id: i64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::DeleteHook {
+            id,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
     /// Delete a match/replace rule, awaiting ack.
     pub async fn delete_match_replace(&self, id: i64) -> Result<()> {
         let (reply, rx) = oneshot::channel();
@@ -881,6 +935,24 @@ fn handle_op(conn: &Connection, op: WriteOp) {
         WriteOp::AddMatchReplace { rule, reply } => {
             let _ = reply.send(do_add_match_replace(conn, &rule));
         }
+        WriteOp::AddHook { hook, reply } => {
+            let _ = reply.send(do_add_hook(conn, &hook));
+        }
+        WriteOp::SetHookEnabled { id, enabled, reply } => ack(
+            reply,
+            conn.execute(
+                "UPDATE hooks SET enabled = ?1 WHERE id = ?2",
+                rusqlite::params![enabled as i64, id],
+            )
+            .map(|_| ())
+            .map_err(Into::into),
+        ),
+        WriteOp::DeleteHook { id, reply } => ack(
+            reply,
+            conn.execute("DELETE FROM hooks WHERE id = ?1", [id])
+                .map(|_| ())
+                .map_err(Into::into),
+        ),
         WriteOp::SetMatchReplaceEnabled { id, enabled, reply } => ack(
             reply,
             conn.execute(
@@ -1182,6 +1254,41 @@ fn do_add_match_replace(conn: &Connection, r: &NewMatchReplaceRule) -> Result<i6
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+fn do_add_hook(conn: &Connection, h: &NewHook) -> Result<i64> {
+    // Serialize the action FIRST: a hook whose parameters cannot be represented
+    // must not land half-written in a table the proxy reads on the hot path.
+    let params = h.action.params_json()?;
+    conn.execute(
+        "INSERT INTO hooks(enabled, name, phase, host, method, path, status, action, params,
+                           ord, timeout_ms, ttl_ms, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        rusqlite::params![
+            h.enabled as i64,
+            h.name,
+            h.phase.as_str(),
+            h.scope.host,
+            h.scope.method,
+            h.scope.path,
+            h.scope.status.map(i64::from),
+            h.action.kind(),
+            params,
+            h.order,
+            h.timeout_ms,
+            h.ttl_ms,
+            now_millis(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Wall-clock unix millis, for rows the writer stamps itself.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn do_insert_ws_message(

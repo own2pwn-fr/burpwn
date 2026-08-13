@@ -68,6 +68,7 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::Req { action } => cmd_req(&out, paths, action).await,
         Command::Intercept { action } => cmd_intercept(&out, paths, action).await,
         Command::MatchReplace { action } => cmd_match_replace(&out, paths, action).await,
+        Command::Hook { action } => cmd_hook(&out, paths, action).await,
         Command::Workspace { action } => cmd_workspace(&out, paths, action).await,
         Command::Tag { action } => cmd_tag(&out, paths, action).await,
         Command::Note { action } => cmd_note(&out, paths, action).await,
@@ -1810,6 +1811,150 @@ async fn cmd_match_replace(out: &Output, paths: &Paths, action: MatchReplaceActi
                 format!("disabled rule {id}"),
                 json!({ "id": id, "enabled": false }),
             );
+        }
+    }
+    Ok(0)
+}
+
+// --- hooks -----------------------------------------------------------------
+
+/// Resolve a hook id or fail with a branchable code.
+fn resolve_hook(store: &Store, id: i64) -> Result<burpwn_store::model::Hook> {
+    match store.reader().get_hook(id)? {
+        Some(h) => Ok(h),
+        None => crate::fail!(ErrorCode::InputNoSuchHook, "no such hook: {id}"),
+    }
+}
+
+async fn cmd_hook(out: &Output, paths: &Paths, action: HookAction) -> Result<i32> {
+    // Only `hook test` takes an explicit session (it is the one the MCP server
+    // shells out to); everything else edits the active session, like `match-replace`.
+    let session = match &action {
+        HookAction::Test {
+            session: Some(s), ..
+        } => s.clone(),
+        _ => paths.active_session(),
+    };
+    let store = open_store(paths, &session)?;
+    match action {
+        HookAction::Add(args) => {
+            // Validate BEFORE writing: a hook is applied to live traffic with
+            // nobody watching, so a broken one must never reach the table.
+            let spec = crate::hooks::HookSpec {
+                name: args.name.clone(),
+                phase: args.phase,
+                action: args.action,
+                host: args.host,
+                method: args.method,
+                path: args.path,
+                status: args.status,
+                header: args.header,
+                param: args.param,
+                cmd: args.cmd,
+                extract: args.extract,
+                inject_header: args.inject_header,
+                inject_param: args.inject_param,
+                inject_only_if_absent: args.inject_if_absent,
+                order: args.order,
+                timeout_ms: args.timeout_ms,
+                ttl_ms: args.ttl_ms,
+                disabled: args.disabled,
+            };
+            let hook = crate::hooks::build_hook(&spec)?;
+            let id = store.writer().add_hook(hook).await?;
+            out.ok(
+                format!("added hook {id} ({})", args.name),
+                json!({ "hook_id": id, "name": args.name }),
+            );
+        }
+        HookAction::List => {
+            let hooks = store.reader().list_hooks()?;
+            if out.json {
+                let rows: Vec<Value> = hooks.iter().map(crate::hooks::to_json).collect();
+                println!("{}", Envelope::ok(json!({ "hooks": rows })).to_json_line());
+            } else if hooks.is_empty() {
+                println!("(no hooks)");
+            } else {
+                for h in &hooks {
+                    println!("{}", crate::hooks::describe(h));
+                }
+            }
+        }
+        HookAction::Show { id } => {
+            let hook = resolve_hook(&store, id)?;
+            if out.json {
+                println!(
+                    "{}",
+                    Envelope::ok(crate::hooks::to_json(&hook)).to_json_line()
+                );
+            } else {
+                println!("{}", crate::hooks::describe(&hook));
+                println!("     name       {}", hook.name);
+                println!("     timeout_ms {}", hook.timeout_ms);
+                println!("     ttl_ms     {}", hook.ttl_ms);
+            }
+        }
+        HookAction::Rm { id } => {
+            resolve_hook(&store, id)?;
+            store.writer().delete_hook(id).await?;
+            out.ok(format!("removed hook {id}"), json!({ "removed": id }));
+        }
+        HookAction::Enable { id } => {
+            resolve_hook(&store, id)?;
+            store.writer().set_hook_enabled(id, true).await?;
+            out.ok(
+                format!("enabled hook {id}"),
+                json!({ "id": id, "enabled": true }),
+            );
+        }
+        HookAction::Disable { id } => {
+            resolve_hook(&store, id)?;
+            store.writer().set_hook_enabled(id, false).await?;
+            out.ok(
+                format!("disabled hook {id}"),
+                json!({ "id": id, "enabled": false }),
+            );
+        }
+        HookAction::Test { id, flow, .. } => {
+            let hook = resolve_hook(&store, id)?;
+            let Some(detail) = store.reader().get_flow(flow)? else {
+                crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {flow}");
+            };
+            // An `exec` hook's command runs in the sandbox, which needs the
+            // session daemon (it is what owns the proxy socket the sandbox hands
+            // connections to). Declarative hooks need none of that.
+            let runner = if hook.action.is_declarative() {
+                None
+            } else {
+                ensure_daemon(paths, &session).await?;
+                Some(crate::hooks::SandboxHookRunner::new(
+                    paths.clone(),
+                    session.clone(),
+                ))
+            };
+            let report = crate::hooks::test_hook(
+                &hook,
+                &detail,
+                runner.as_ref().map(|r| r as &dyn burpwn_proxy::HookRunner),
+            )
+            .await?;
+            if out.json {
+                println!("{}", Envelope::ok(report).to_json_line());
+            } else {
+                println!(
+                    "hook {id} on flow {flow}: matched={} changed={} dropped={}",
+                    report["matched"], report["changed"], report["dropped"]
+                );
+                if let Some(exec) = report["exec"].as_object() {
+                    println!("  exec: {}", Value::Object(exec.clone()));
+                }
+                println!("  before: {}", report["before"]["url"]);
+                println!("  after:  {}", report["after"]["url"]);
+                println!(
+                    "{}",
+                    report["after"]["headers"].as_str().unwrap_or_default()
+                );
+            }
         }
     }
     Ok(0)

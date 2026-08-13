@@ -143,6 +143,9 @@ pub enum ErrorCode {
     StoreBlobTooLarge,
     /// The store's writer task is gone, so nothing more can be persisted.
     StoreWriterGone,
+    /// A stored hook is not one this build understands (unknown phase or
+    /// action), so the hook set cannot be read at all.
+    StoreHookUnreadable,
 
     // --- tls / CA (exit 73) ------------------------------------------------
     /// The MITM CA could not be generated.
@@ -197,6 +200,8 @@ pub enum ErrorCode {
     InputNoSuchIntercept,
     /// The output file already exists and `--force` was not given.
     InputFileExists,
+    /// The referenced hook id does not exist.
+    InputNoSuchHook,
 
     // --- agent integration (exit 76) ---------------------------------------
     /// The named agent / framework / MCP host is not one burpwn knows.
@@ -231,9 +236,8 @@ impl ErrorCode {
             | SandboxRuntime => ErrorClass::Sandbox,
             DaemonNotReady | DaemonUnreachable | DaemonProtocol | DaemonRejected
             | DaemonRuntimeDir => ErrorClass::Daemon,
-            StoreOpen | StoreSqlite | StoreSchemaTooNew | StoreBlobTooLarge | StoreWriterGone => {
-                ErrorClass::Store
-            }
+            StoreOpen | StoreSqlite | StoreSchemaTooNew | StoreBlobTooLarge | StoreWriterGone
+            | StoreHookUnreadable => ErrorClass::Store,
             TlsCaInit | TlsCaLoad | TlsCaMalformed | TlsLeafMint => ErrorClass::Tls,
             SessionInvalidName | SessionNotFound | WorkspaceNotFound | SessionNoDataDir
             | GroupNotFound | SessionBundleInvalid | SessionExists => ErrorClass::Session,
@@ -248,7 +252,8 @@ impl ErrorCode {
             | InputNothingToDo
             | InputBadRegex
             | InputNoSuchIntercept
-            | InputFileExists => ErrorClass::Input,
+            | InputFileExists
+            | InputNoSuchHook => ErrorClass::Input,
             AgentUnknown | AgentConfigShape | AgentRefusedOverwrite => ErrorClass::Agent,
             NetworkReplayFailed | NetworkAuthRefreshFailed => ErrorClass::Network,
             Internal => ErrorClass::Internal,
@@ -278,6 +283,7 @@ impl ErrorCode {
             StoreSchemaTooNew => 3,
             StoreBlobTooLarge => 4,
             StoreWriterGone => 5,
+            StoreHookUnreadable => 6,
 
             TlsCaInit => 1,
             TlsCaLoad => 2,
@@ -304,6 +310,7 @@ impl ErrorCode {
             InputBadRegex => 10,
             InputNoSuchIntercept => 11,
             InputFileExists => 12,
+            InputNoSuchHook => 13,
 
             AgentUnknown => 1,
             AgentConfigShape => 2,
@@ -349,6 +356,7 @@ impl ErrorCode {
             StoreSchemaTooNew => "the capture database is from a newer burpwn",
             StoreBlobTooLarge => "a stored body is larger than the safety limit",
             StoreWriterGone => "the capture writer has shut down",
+            StoreHookUnreadable => "a stored hook is not one this burpwn understands",
 
             TlsCaInit => "the MITM certificate authority could not be generated",
             TlsCaLoad => "the MITM certificate authority could not be loaded",
@@ -375,6 +383,7 @@ impl ErrorCode {
             InputBadRegex => "the regex is invalid for this use",
             InputNoSuchIntercept => "no such parked intercept",
             InputFileExists => "the output file already exists",
+            InputNoSuchHook => "no such hook",
 
             AgentUnknown => "unknown agent / framework / MCP host",
             AgentConfigShape => "the agent config file is not a shape burpwn can edit",
@@ -456,6 +465,14 @@ impl ErrorCode {
                  intact, only that body is refused",
             ],
             StoreWriterGone => vec!["the session daemon shut down mid-write — re-run the command"],
+            StoreHookUnreadable => vec![
+                "the whole hook set is refused rather than partly applied, so the proxy never \
+                 runs a hook nobody configured",
+                "this is usually a session written by a NEWER burpwn (upgrade), or a hook whose \
+                 parameters were redacted by `export session --redact`",
+                "`burpwn hook list --json` names the offending row; remove it with \
+                 `burpwn hook rm <id>`",
+            ],
 
             TlsCaInit => vec![
                 "check that the CA directory is writable, then `burpwn ca init`",
@@ -515,6 +532,7 @@ impl ErrorCode {
             InputFileExists => vec![
                 "pass `--force` to overwrite it deliberately, or choose another `-o <file>`",
             ],
+            InputNoSuchHook => vec!["list them with `burpwn hook list`"],
 
             AgentUnknown => vec!["the supported names are listed in the message above"],
             AgentConfigShape => vec![
@@ -557,6 +575,7 @@ impl ErrorCode {
         ErrorCode::StoreSchemaTooNew,
         ErrorCode::StoreBlobTooLarge,
         ErrorCode::StoreWriterGone,
+        ErrorCode::StoreHookUnreadable,
         ErrorCode::TlsCaInit,
         ErrorCode::TlsCaLoad,
         ErrorCode::TlsCaMalformed,
@@ -580,6 +599,7 @@ impl ErrorCode {
         ErrorCode::InputBadRegex,
         ErrorCode::InputNoSuchIntercept,
         ErrorCode::InputFileExists,
+        ErrorCode::InputNoSuchHook,
         ErrorCode::AgentUnknown,
         ErrorCode::AgentConfigShape,
         ErrorCode::AgentRefusedOverwrite,
@@ -619,7 +639,7 @@ mod tests {
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(*code, back);
         }
-        assert_eq!(ErrorCode::ALL.len(), 46, "register new codes in ALL");
+        assert_eq!(ErrorCode::ALL.len(), 48, "register new codes in ALL");
     }
 
     #[test]

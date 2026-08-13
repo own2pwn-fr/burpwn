@@ -236,8 +236,57 @@ pub async fn replay_flow(
             "flow {id} has no recorded request to replay"
         );
     };
-    let req = apply_edits(base, method, headers, body);
+    let mut req = apply_edits(base, method, headers, body);
+    // The session's DECLARATIVE hooks apply here too. A replay does not go
+    // through the proxy pipeline, so without this a `set-header` hook that keeps
+    // a token fresh would be invisible to the one command whose whole job is
+    // re-sending a request that has gone stale. `exec` hooks are skipped: the
+    // Repeater has no sandbox and an operator hammering `req replay` must not be
+    // spawning namespaces.
+    let hooks = store.reader().list_hooks()?;
+    apply_hooks(&hooks, &detail, &mut req)?;
     replay(&detail, &req).await
+}
+
+/// Apply the declarative `pre-request` hooks to a rebuilt request in place.
+fn apply_hooks(
+    hooks: &[burpwn_store::model::Hook],
+    detail: &FlowDetail,
+    req: &mut RequestData,
+) -> Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+    let host = replay_host(detail, req);
+    let mut msg = burpwn_proxy::matchreplace::Message {
+        host: host.clone(),
+        url: req.path.clone(),
+        headers: std::mem::take(&mut req.headers),
+        body: std::mem::take(&mut req.body),
+    };
+    let ctx = burpwn_proxy::MatchCtx {
+        host: &host,
+        method: &req.method,
+        path: &req.path,
+        status: None,
+    };
+    let out = burpwn_proxy::hooks::apply_declarative(
+        hooks,
+        burpwn_store::model::HookPhase::PreRequest,
+        &ctx,
+        &mut msg,
+    );
+    if out.dropped {
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "a burpwn hook drops this request, so there is nothing to replay \
+             (disable it with `burpwn hook disable <id>`)"
+        );
+    }
+    req.headers = msg.headers;
+    req.body = msg.body;
+    req.path = msg.url;
+    Ok(())
 }
 
 /// Reassemble a [`burpwn_proxy::ReplayResponse`] into raw HTTP-ish bytes (status

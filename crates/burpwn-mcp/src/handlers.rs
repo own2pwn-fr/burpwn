@@ -283,6 +283,115 @@ fn resolve_group(
     }
 }
 
+// --- hooks ------------------------------------------------------------------
+
+/// `hook_add` — install a hook. Validated exactly like the CLI (same builder),
+/// so an agent gets the same refusals for a hook that could never work.
+pub async fn hook_add(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::HookAddParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let spec = burpwn_cli::hooks::HookSpec {
+        name: params.name.clone(),
+        phase: params
+            .phase
+            .clone()
+            .unwrap_or_else(|| "pre-request".to_string()),
+        action: params.action.clone(),
+        host: params.host.clone().unwrap_or_default(),
+        method: params.method.clone().unwrap_or_default(),
+        path: params.path.clone().unwrap_or_default(),
+        status: params.status,
+        header: params.header.clone(),
+        param: params.param.clone(),
+        cmd: params.cmd.clone(),
+        extract: params.extract.clone(),
+        inject_header: params.inject_header.clone(),
+        inject_param: params.inject_param.clone(),
+        inject_only_if_absent: false,
+        order: params.order.unwrap_or(0),
+        timeout_ms: params
+            .timeout_ms
+            .unwrap_or(burpwn_cli::hooks::DEFAULT_TIMEOUT_MS),
+        ttl_ms: params.ttl_ms.unwrap_or(burpwn_cli::hooks::DEFAULT_TTL_MS),
+        disabled: false,
+    };
+    let hook = burpwn_cli::hooks::build_hook(&spec)?;
+    let id = store.writer().add_hook(hook).await?;
+    Ok(json!({ "hook_id": id, "name": params.name }))
+}
+
+/// `hook_list` — every hook in application order.
+pub fn hook_list(paths: &Paths, session: &str) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let hooks: Vec<Value> = store
+        .reader()
+        .list_hooks()?
+        .iter()
+        .map(burpwn_cli::hooks::to_json)
+        .collect();
+    Ok(json!({ "hooks": hooks }))
+}
+
+/// Resolve a hook id or fail with a code the agent can branch on.
+fn resolve_hook(store: &Store, id: i64) -> Result<burpwn_store::model::Hook> {
+    match store.reader().get_hook(id)? {
+        Some(h) => Ok(h),
+        None => Err(burpwn_cli::coded!(
+            ErrorCode::InputNoSuchHook,
+            "no such hook: {id}"
+        )),
+    }
+}
+
+/// `hook_set_enabled` — turn a hook on/off.
+pub async fn hook_set_enabled(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::HookSetEnabledParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    resolve_hook(&store, params.id)?;
+    store
+        .writer()
+        .set_hook_enabled(params.id, params.enabled)
+        .await?;
+    Ok(json!({ "id": params.id, "enabled": params.enabled }))
+}
+
+/// `hook_rm` — delete a hook.
+pub async fn hook_rm(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::HookRmParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    resolve_hook(&store, params.id)?;
+    store.writer().delete_hook(params.id).await?;
+    Ok(json!({ "removed": params.id }))
+}
+
+/// `hook_test` — replay a hook against a captured flow.
+///
+/// Shelled out to the CLI rather than run in-process: an `exec` hook's command
+/// needs the session daemon and the sandbox, which `burpwn hook test` already
+/// knows how to bring up.
+pub async fn hook_test(session: &str, params: &crate::params::HookTestParams) -> Result<Value> {
+    run_burpwn_json(&[
+        "--json".to_string(),
+        "hook".to_string(),
+        "test".to_string(),
+        params.id.to_string(),
+        "--flow".to_string(),
+        params.flow_id.to_string(),
+        "--session".to_string(),
+        session.to_string(),
+    ])
+    .await
+}
+
 /// `group_new` — create (or re-describe) a named collection of flows.
 pub async fn group_new(
     paths: &Paths,
@@ -1372,6 +1481,100 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no burpwn proxy daemon"));
+    }
+
+    #[tokio::test]
+    async fn hook_tools_round_trip_and_refuse_a_broken_hook() {
+        let (_dir, paths, s) = temp_session().await;
+
+        let added = hook_add(
+            &paths,
+            &s,
+            &crate::params::HookAddParams {
+                name: "ua".into(),
+                action: "add-header".into(),
+                phase: None,
+                host: Some("example.com".into()),
+                method: None,
+                path: None,
+                status: None,
+                header: Some("User-Agent: burpwn".into()),
+                param: None,
+                cmd: None,
+                extract: None,
+                inject_header: None,
+                inject_param: None,
+                order: None,
+                timeout_ms: None,
+                ttl_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let id = added["hook_id"].as_i64().unwrap();
+
+        let listed = hook_list(&paths, &s).unwrap();
+        assert_eq!(listed["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["hooks"][0]["phase"], "pre-request");
+        assert_eq!(listed["hooks"][0]["enabled"], true);
+
+        hook_set_enabled(
+            &paths,
+            &s,
+            &crate::params::HookSetEnabledParams { id, enabled: false },
+        )
+        .await
+        .unwrap();
+        let listed = hook_list(&paths, &s).unwrap();
+        assert_eq!(listed["hooks"][0]["enabled"], false);
+
+        // An unknown id comes back branchable, not as a silent no-op.
+        let err = hook_rm(&paths, &s, &crate::params::HookRmParams { id: 999 })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            burpwn_cli::diag::diagnose(&err).code.id(),
+            ErrorCode::InputNoSuchHook.id()
+        );
+
+        hook_rm(&paths, &s, &crate::params::HookRmParams { id })
+            .await
+            .unwrap();
+        assert!(hook_list(&paths, &s).unwrap()["hooks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // A hook that could never work is refused at add time, so it never
+        // reaches the table the proxy reads on the hot path.
+        let broken = hook_add(
+            &paths,
+            &s,
+            &crate::params::HookAddParams {
+                name: "tok".into(),
+                action: "exec".into(),
+                phase: None,
+                host: None,
+                method: None,
+                path: None,
+                status: None,
+                header: None,
+                param: None,
+                cmd: Some("mint".into()),
+                extract: Some(r#""token":"[^"]+""#.into()), // no capture group
+                inject_header: Some("Authorization: Bearer {}".into()),
+                inject_param: None,
+                order: None,
+                timeout_ms: None,
+                ttl_ms: None,
+            },
+        )
+        .await;
+        assert!(broken.is_err());
+        assert!(hook_list(&paths, &s).unwrap()["hooks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

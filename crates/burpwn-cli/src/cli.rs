@@ -86,6 +86,13 @@ pub enum Command {
         action: MatchReplaceAction,
     },
 
+    /// Hooks: run an action before a request / after a response.
+    Hook {
+        /// Hook subcommand.
+        #[command(subcommand)]
+        action: HookAction,
+    },
+
     /// Workspace management.
     Workspace {
         /// Workspace subcommand.
@@ -669,6 +676,127 @@ pub enum MatchReplaceAction {
     Disable {
         /// Rule id.
         id: i64,
+    },
+}
+
+/// `hook add` arguments.
+#[derive(Debug, Args)]
+pub struct HookAddArgs {
+    /// Name for this hook (free text, for `hook list`).
+    pub name: String,
+    /// When it fires: `pre-request` (default) or `post-response`.
+    #[arg(long, default_value = "pre-request")]
+    pub phase: String,
+    /// What it does: `add-header`, `set-header`, `remove-header`,
+    /// `set-query-param`, `drop` or `exec`.
+    #[arg(long)]
+    pub action: String,
+    /// Only for hosts containing this (empty = every host; `*.example.com`
+    /// also accepted).
+    #[arg(long, default_value = "")]
+    pub host: String,
+    /// Only for this request method (case-insensitive; empty = any).
+    #[arg(long, default_value = "")]
+    pub method: String,
+    /// Only for request targets containing this (empty = any).
+    #[arg(long, default_value = "")]
+    pub path: String,
+    /// Only for this response status (`post-response` hooks only).
+    #[arg(long)]
+    pub status: Option<u16>,
+    /// `Name: value` for the header actions — or a bare `Name` for
+    /// `remove-header`.
+    #[arg(long)]
+    pub header: Option<String>,
+    /// `name=value`, for `set-query-param`.
+    #[arg(long)]
+    pub param: Option<String>,
+    /// The command to run, for `exec` (run as `sh -c` IN THE SANDBOX, so
+    /// its own traffic is captured — and never re-hooked).
+    #[arg(long)]
+    pub cmd: Option<String>,
+    /// Regex with ONE capture group, applied to the command's stdout to
+    /// pull out the value (e.g. `"access_token":"([^"]+)"`).
+    #[arg(long)]
+    pub extract: Option<String>,
+    /// Where the extracted value goes: `Name: prefix {}` (the `{}` is
+    /// replaced by the value).
+    #[arg(long)]
+    pub inject_header: Option<String>,
+    /// Where the extracted value goes, as a query parameter: `name={}`.
+    #[arg(long, conflicts_with = "inject_header")]
+    pub inject_param: Option<String>,
+    /// Inject the header only when the message does not already carry one
+    /// (default: replace an existing one).
+    #[arg(long)]
+    pub inject_if_absent: bool,
+    /// Application order within the phase (ascending).
+    #[arg(long, default_value_t = 0)]
+    pub order: i64,
+    /// Hard budget for an `exec` command, in milliseconds. On expiry the
+    /// hook FAILS OPEN: the request goes through un-hooked.
+    #[arg(long = "timeout", default_value_t = crate::hooks::DEFAULT_TIMEOUT_MS)]
+    pub timeout_ms: i64,
+    /// How long an extracted value is reused before the command runs again,
+    /// in milliseconds. `0` runs it on every matching request — one sandbox
+    /// per request.
+    #[arg(long = "ttl", default_value_t = crate::hooks::DEFAULT_TTL_MS)]
+    pub ttl_ms: i64,
+    /// Create it disabled.
+    #[arg(long)]
+    pub disabled: bool,
+}
+
+/// `hook` subcommands.
+///
+/// A hook applies ONE action to every message matching its scope, on one phase.
+/// Where a match/replace rule rewrites text that is already in the message, a
+/// hook can put in what is not there (`add-header`), take it out, refuse the
+/// flow (`drop`), or park the request behind a command whose output it injects
+/// (`exec` — a token mint, a request signer).
+// `Add` carries every flag of the richest command in the tree; boxing it to
+// even out the variants would cost an allocation on a one-shot CLI parse for
+// nothing, and clap's derive wants the args by value.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Subcommand)]
+pub enum HookAction {
+    /// Add a hook.
+    Add(HookAddArgs),
+    /// List hooks in application order.
+    List,
+    /// Show one hook in full.
+    Show {
+        /// Hook id.
+        id: i64,
+    },
+    /// Remove a hook by id.
+    Rm {
+        /// Hook id.
+        id: i64,
+    },
+    /// Enable a hook by id.
+    Enable {
+        /// Hook id.
+        id: i64,
+    },
+    /// Disable a hook by id.
+    Disable {
+        /// Hook id.
+        id: i64,
+    },
+    /// Replay a hook against a CAPTURED flow and show what it would do: does it
+    /// match, what does it change. No live traffic is sent. For an `exec` hook
+    /// the command DOES run (in the sandbox), so this is also how you check that
+    /// the extraction regex still matches.
+    Test {
+        /// Hook id.
+        id: i64,
+        /// Flow to test it against.
+        #[arg(long)]
+        flow: i64,
+        /// Session to operate on (defaults to the active session).
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 

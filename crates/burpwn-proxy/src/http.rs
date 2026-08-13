@@ -41,6 +41,7 @@ use burpwn_store::model::{FlowStart, Protocol, RequestData, ResponseData, WsDire
 use burpwn_store::{WriteHandle, WriteOp};
 
 use crate::decode::decode_body;
+use crate::hooks::{HookEngine, MatchCtx};
 use crate::intercept::{InterceptController, InterceptData, InterceptDecision, InterceptKind};
 use crate::matchreplace::{apply_request, apply_response, host_in_scope, Message};
 use crate::util::now_millis;
@@ -119,7 +120,15 @@ pub struct HttpContext {
     /// Session-auth auto-refresh trigger (inert unless the daemon armed it).
     pub auth: crate::auth::AuthWatcher,
     /// Match/replace rules, snapshotted for the life of the connection.
+    ///
+    /// ⚠️ A rule added while a keep-alive connection is open does not apply to
+    /// it: the snapshot is taken once, per connection. Hooks deliberately do NOT
+    /// work this way — [`HttpContext::hooks`] is the daemon's single shared
+    /// engine, refreshed in place, so a hook applies to connections that are
+    /// already open.
     pub rules: Arc<Vec<burpwn_store::model::MatchReplaceRule>>,
+    /// The hook engine, shared with the daemon (not a per-connection snapshot).
+    pub hooks: HookEngine,
     /// Default workspace id.
     pub workspace_id: i64,
     /// Optional exec correlation id.
@@ -299,6 +308,23 @@ async fn handle_inner(
     };
     let _ = apply_request(&ctx.rules, &mut msg);
 
+    // --- pre-request hooks ---
+    // After match/replace (so a hook sees the rewritten message) and BEFORE the
+    // intercept, so an operator holding a flow reads exactly what is about to
+    // leave, and the persisted request below records the same. Free when no hook
+    // is configured: one relaxed atomic load inside `pre_request`.
+    let hook_out = ctx
+        .hooks
+        .pre_request(ctx.exec_id.as_deref(), &method, &mut msg)
+        .await;
+    if hook_out.dropped {
+        tracing::info!(host = %msg.host, path = %msg.url, "request dropped by hook");
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(full_body(Bytes::from_static(b"burpwn: dropped by hook")))
+            .unwrap());
+    }
+
     // --- intercept (request) ---
     let mut idata = InterceptData {
         host: msg.host.clone(),
@@ -415,12 +441,18 @@ async fn handle_inner(
     }
 
     // --- HYBRID streaming decision ---
-    // When NO match/replace rule targets this host AND intercept is disabled, we
-    // never need the full body: stream it through chunk-by-chunk (fixing SSE /
-    // chunked / long-poll, which otherwise stall until EOF or the upstream
-    // timeout) while tee-ing a size-capped copy to the store. Otherwise we must
-    // buffer the whole body to rewrite / hold it.
-    if should_stream(&ctx, &msg.host) {
+    // When NO match/replace rule and NO post-response hook targets this flow AND
+    // intercept is disabled, we never need the full body: stream it through
+    // chunk-by-chunk (fixing SSE / chunked / long-poll, which otherwise stall
+    // until EOF or the upstream timeout) while tee-ing a size-capped copy to the
+    // store. Otherwise we must buffer the whole body to rewrite / hold it.
+    let resp_match = MatchCtx {
+        host: &msg.host,
+        method: &method,
+        path: &msg.url,
+        status: Some(resp_parts.status.as_u16()),
+    };
+    if should_stream(&ctx, &resp_match) {
         return Ok(stream_response(
             resp_parts, resp_body, up_guard, &ctx, flow_id, started, version,
         ));
@@ -456,7 +488,32 @@ async fn handle_inner(
         headers: raw_resp_headers.clone(),
         body: decoded_for_store.clone(),
     };
-    let resp_changed = apply_response(&ctx.rules, &mut resp_msg);
+    let mut resp_changed = apply_response(&ctx.rules, &mut resp_msg);
+
+    // --- post-response hooks ---
+    // Same placement as the request side: after match/replace, before the
+    // intercept. A dropped response answers 403 downstream (the flow stays
+    // recorded — what the origin said is evidence).
+    let resp_hook = ctx
+        .hooks
+        .post_response(
+            ctx.exec_id.as_deref(),
+            &method,
+            resp_parts.status.as_u16(),
+            &mut resp_msg,
+        )
+        .await;
+    resp_changed |= resp_hook.changed;
+    if resp_hook.dropped {
+        tracing::info!(host = %msg.host, path = %msg.url, "response dropped by hook");
+        let _ = ctx.writer.flow_end(flow_id, now_millis()).await;
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(full_body(Bytes::from_static(
+                b"burpwn: response dropped by hook",
+            )))
+            .unwrap());
+    }
 
     // --- intercept (response) ---
     let resp_idata = InterceptData {
@@ -548,16 +605,23 @@ fn sanitize_downstream_headers(hdrs: &mut hyper::HeaderMap) {
 }
 
 /// Whether the response body for this flow can be streamed straight through
-/// (tee-ing a capped copy) rather than buffered: true when interception is off
-/// AND no enabled match/replace rule targets this host, so we never need the full
-/// body to rewrite or hold it.
-fn should_stream(ctx: &HttpContext, host: &str) -> bool {
+/// (tee-ing a capped copy) rather than buffered: true when interception is off,
+/// no enabled match/replace rule targets this host, AND no enabled post-response
+/// hook matches this flow — so we never need the full body to rewrite or hold it.
+///
+/// The hook clause is not an optimisation, it is correctness: a streamed
+/// response is forwarded frame by frame and never reassembled, so a response
+/// hook on an SSE or chunked endpoint would otherwise never run at all.
+fn should_stream(ctx: &HttpContext, m: &MatchCtx) -> bool {
     if ctx.intercept.is_enabled() {
+        return false;
+    }
+    if ctx.hooks.has_post_response_for(m) {
         return false;
     }
     !ctx.rules
         .iter()
-        .any(|r| r.enabled && host_in_scope(&r.scope, host))
+        .any(|r| r.enabled && host_in_scope(&r.scope, m.host))
 }
 
 /// gRPC message framing: `application/grpc*` bodies are a sequence of
