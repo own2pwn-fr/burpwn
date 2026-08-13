@@ -15,9 +15,9 @@ executes inside a rootless Linux sandbox whose **entire** network (HTTP/HTTPS/DN
 through a built-in intercepting proxy. The agent can then go back through history, search and filter
 the decrypted request/response flows, replay and edit them (Repeater), fuzz them with a native
 Intruder, diff responses, encode/decode tokens, keep itself authenticated with a login macro, apply
-match/replace rules, block and rewrite traffic in flight, and organize flows into workspaces and
-named groups — all from a scriptable CLI or over MCP (36 tools). It is at once a Burp and a tshark,
-but driven by an agent.
+match/replace rules, block and rewrite traffic in flight, organize flows into workspaces and named
+groups, and pack a whole session into one portable file to hand to someone else — all from a
+scriptable CLI or over MCP (37 tools). It is at once a Burp and a tshark, but driven by an agent.
 
 > **Status:** early development. See the milestones below.
 
@@ -76,6 +76,8 @@ burpwn group new auth-flow \
   --description 'login form -> POST /login -> redirect + Set-Cookie'  # name a scenario
 burpwn group add auth-flow 3 5 9               # …and pin the flows that prove it
 burpwn group show auth-flow                    # replay it later; `export har --group auth-flow`
+burpwn export session -o engagement-1.burpwn   # the whole session in one file (raw: see below)
+burpwn session import engagement-1.burpwn --as from-colleague  # …and open it on another machine
 burpwn session stats                           # capture-completeness: flags execs that captured nothing
 burpwn init --check                            # verify each agent hook really rewrites to `burpwn exec`
 ```
@@ -110,6 +112,29 @@ make install                # PREFIX=/usr/local make install  (may need sudo); `
 
 The `curl | sh` path downloads the release binary for your architecture (x86_64 / aarch64 Linux) and
 verifies its checksum; if none matches it falls back to a `cargo` source build.
+
+## Sessions travel: `export session` / `session import`
+
+A session is self-contained — every request and response body lives in the session's SQLite store,
+there is no external payload directory — so a whole engagement fits in one file:
+
+```sh
+burpwn export session -o engagement-1.burpwn          # or --redact; --force to overwrite
+burpwn session import engagement-1.burpwn --as review # …anywhere else, --use to switch to it
+```
+
+The bundle is a `VACUUM INTO` snapshot (so it is consistent and complete even while the daemon is
+still writing — a plain `cp session.db` silently loses whatever is still in the WAL), plus a
+manifest saying where it came from, zstd-compressed behind a `BURPWNBUNDLE` header. Import creates a
+**new** session: it never merges into and never overwrites an existing one, an older bundle is
+migrated on the way in, and one from a newer burpwn is refused rather than half-read.
+
+> ⚠️ **A bundle is a credential store.** By default it holds the session exactly as captured: the
+> stored auth tokens and login commands, and every `Authorization` / `Cookie` header recorded in the
+> traffic — that is what makes the session replayable. `--redact` drops the stored auth profiles and
+> match/replace replacements; it does **not** scrub credentials captured inside recorded requests and
+> responses. Bundles are written `0600`; move them the way you would move the credentials inside.
+> The CA private key is never included.
 
 ## Errors, exit codes and debug reports
 

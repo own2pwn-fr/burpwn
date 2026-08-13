@@ -177,6 +177,9 @@ fn classify(err: &anyhow::Error) -> Option<ErrorCode> {
         if let Some(e) = link.downcast_ref::<StoreError>() {
             return Some(e.code());
         }
+        if let Some(e) = link.downcast_ref::<burpwn_store::bundle::BundleError>() {
+            return Some(e.code());
+        }
         if let Some(e) = link.downcast_ref::<TlsError>() {
             return Some(e.code());
         }

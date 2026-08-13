@@ -81,6 +81,8 @@ produce it — the JSON envelope disambiguates.
 | `BW-SESSION-003` | no such workspace |
 | `BW-SESSION-004` | burpwn cannot determine where to store its data |
 | `BW-SESSION-005` | no such flow group |
+| `BW-SESSION-006` | this file is not a burpwn session bundle |
+| `BW-SESSION-007` | a session by that name already exists |
 
 **INPUT** — exit code `75`
 
@@ -97,6 +99,7 @@ produce it — the JSON envelope disambiguates.
 | `BW-INPUT-009` | there is nothing to act on |
 | `BW-INPUT-010` | the regex is invalid for this use |
 | `BW-INPUT-011` | no such parked intercept |
+| `BW-INPUT-012` | the output file already exists |
 
 **AGENT** — exit code `76`
 
@@ -149,6 +152,12 @@ cannot use them (WSL). `--quick` skips the live probe.
 - `burpwn session list [--json]`
 - `burpwn session use <NAME> [--json]` — switch the active session.
 - `burpwn session rm <NAME> [--json]` — remove a session (its DB and runtime files).
+- `burpwn session import <FILE> [--as <NAME>] [--use] [--json]` — open a bundle written by
+  `burpwn export session` as a NEW session (never merges into, never overwrites an existing one;
+  a name collision errors and is resolved with `--as`). An older bundle is migrated on the way in,
+  one from a newer burpwn is refused (`BW-STORE-003`). `--use` also switches the active session.
+  Prints what landed (flows / workspaces / groups / tags / notes / attacks) and warns when the
+  bundle was exported without `--redact`.
 
 ## exec
 `burpwn exec [--workspace <WORKSPACE>] [--timeout <SECS>] [--session <SESSION>] [--json] -- <CMD>...`
@@ -219,16 +228,30 @@ workspace and every subcommand takes the NAME, not an id.
 
 ## export
 - `burpwn export har [--workspace <WORKSPACE>] [--group <GROUP>] [-o <OUTPUT>] [--json]` — HAR 1.2 (stdout if no `-o`). `--group <NAME>` exports one named scenario; it is exclusive with `--workspace`.
+- `burpwn export session [--session <NAME>] [-o <OUTPUT>] [--redact] [--force] [--json]` — the WHOLE
+  session as one portable file (default `<session>.burpwn` in the current directory, created `0600`,
+  never overwritten without `--force`): every flow with its bodies, plus workspaces, groups, tags,
+  notes, attacks and rules. `burpwn session import` opens it on another machine.
+  **The bundle is RAW by default**: it carries the stored auth tokens, the login commands (argv
+  credentials included) and the Authorization / Cookie headers captured in the traffic, so that the
+  session replays identically. `--redact` drops the stored auth tokens, login commands and
+  match/replace replacements — it does **not** scrub credentials captured inside recorded requests
+  and responses. Treat a bundle like the credentials it contains.
 - `burpwn export pcap` — not yet implemented (errors clearly).
 
 ## mcp (stdio server)
 `burpwn mcp [--session <n>]` — start the MCP server over stdio. It does not print
 `--help`; running it starts the server (it exits when the stdio connection
-closes). Exposes 36 tools: `session_list`, `session_current`, `session_stats`,
-`session_auth_set`, `session_auth_refresh`, `session_auth_status`, `req_list`,
+closes). Exposes 37 tools: `session_list`, `session_current`, `session_stats`,
+`session_export`, `session_auth_set`, `session_auth_refresh`,
+`session_auth_status`, `req_list`,
 `req_show`, `req_search`, `req_replay`, `workspace_list`, `workspace_new`,
 `tag_list`, `tag_add`, `note_add`, `group_new`, `group_add`, `group_list`,
 `group_show`, `group_rm`, `match_replace_list`, `match_replace_add`,
 `intercept_enable`, `intercept_disable`, `intercept_list`, `intercept_scope`,
 `await_intercept`, `intercept_forward`, `intercept_drop`, `exec`, `fuzz`,
 `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.
+
+There is deliberately no `session_import` tool: loading a session file that came
+from somewhere else is an operator decision (`burpwn session import`), not
+something an agent should do on its own say-so.

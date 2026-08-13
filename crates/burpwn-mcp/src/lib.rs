@@ -13,6 +13,11 @@
 //! — which pin a named, described subset of the capture (a reconstructed auth
 //! scenario, one fuzzing campaign) to a handle the agent can come back to.
 //!
+//! Archival: `session_export` packs the whole session into one portable
+//! `.burpwn` bundle. There is deliberately NO import tool — loading a file that
+//! arrived from somewhere else is an operator decision (`burpwn session import`),
+//! not something an agent should be able to do on its own say-so.
+//!
 //! Offensive (Repeater / Intruder / utilities): `req_replay` (replay a stored
 //! flow with edits), `fuzz` / `fuzz_list` / `fuzz_results` (payload fuzzing,
 //! persisted as attacks), `compare` (structured two-flow diff + reflection

@@ -15,6 +15,9 @@
 //! - Reads go through an r2d2 pool of read-only connections ([`Reader`]).
 //! - [`blob`] gives content-addressed, zstd-compressed, SHA-256-deduplicated
 //!   payload storage.
+//! - [`bundle`] packs a whole session into one portable file (`VACUUM INTO` +
+//!   manifest + zstd) and unpacks one back, so a session can travel to another
+//!   machine.
 //!
 //! # Example
 //!
@@ -40,6 +43,7 @@
 //! ```
 
 pub mod blob;
+pub mod bundle;
 pub mod error;
 pub mod model;
 pub mod reader;

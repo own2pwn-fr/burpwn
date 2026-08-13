@@ -3,7 +3,7 @@
 //! envelope per the global `--json` flag.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -813,9 +813,90 @@ async fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Resu
             );
             Ok(0)
         }
+        SessionAction::Import {
+            file,
+            as_name,
+            use_session,
+        } => cmd_session_import(out, paths, file, as_name, use_session),
         SessionAction::Stats { session } => cmd_session_stats(out, paths, session),
         SessionAction::Auth { action } => cmd_session_auth(out, paths, action).await,
     }
+}
+
+/// `session import <file>`: unpack a bundle into a brand-new session.
+///
+/// The summary is not decoration: the receiving side needs to know what landed
+/// (so an empty or truncated hand-off is obvious immediately) and whether the
+/// file it was just sent is carrying live credentials.
+fn cmd_session_import(
+    out: &Output,
+    paths: &Paths,
+    file: String,
+    as_name: Option<String>,
+    use_session: bool,
+) -> Result<i32> {
+    let outcome = crate::bundle::import_session(
+        paths,
+        &crate::bundle::ImportRequest {
+            file: PathBuf::from(&file),
+            as_name,
+            use_session,
+        },
+    )?;
+    let c = &outcome.counts;
+    let m = &outcome.manifest;
+
+    if out.json {
+        println!(
+            "{}",
+            Envelope::ok(json!({
+                "session": outcome.session,
+                "from": {
+                    "session": m.session,
+                    "burpwn_version": m.burpwn_version,
+                    "schema_version": m.schema_version,
+                    "exported_at": m.exported_at,
+                    "ca_sha256": m.ca_sha256,
+                },
+                "redacted": m.redacted,
+                "migrated_from": outcome.migrated_from,
+                "active": outcome.activated,
+                "flows": c.flows,
+                "workspaces": c.workspaces,
+                "groups": c.groups,
+                "tags": c.tags,
+                "notes": c.notes,
+                "attacks": c.attacks,
+                "warning": (!m.redacted).then_some(crate::bundle::RAW_WARNING),
+            }))
+            .to_json_line()
+        );
+        return Ok(0);
+    }
+
+    println!(
+        "imported session {} from {file} (exported from '{}' by burpwn {})",
+        outcome.session, m.session, m.burpwn_version
+    );
+    println!(
+        "  {} flows, {} workspaces, {} groups, {} tags, {} notes, {} attacks",
+        c.flows, c.workspaces, c.groups, c.tags, c.notes, c.attacks
+    );
+    if let Some(from) = outcome.migrated_from {
+        println!(
+            "  schema v{from} migrated up to v{}",
+            burpwn_store::schema::SCHEMA_VERSION
+        );
+    }
+    if !m.redacted {
+        eprintln!("⚠ {}", crate::bundle::RAW_WARNING);
+    }
+    if outcome.activated {
+        println!("  it is now the active session");
+    } else {
+        println!("  `burpwn session use {}` to switch to it", outcome.session);
+    }
+    Ok(0)
 }
 
 // --- session stats (capture-completeness telemetry) ------------------------
@@ -2081,16 +2162,9 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
                     // Refuse to follow an existing symlink at the target: writing
                     // through it would let an attacker-seeded link redirect the
                     // HAR onto a victim file (this is operator-facing but also
-                    // reachable from agent-driven automation). `symlink_metadata`
-                    // does not follow the final component, so a symlink is caught.
-                    if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                        if meta.file_type().is_symlink() {
-                            crate::fail!(
-                                ErrorCode::InputUnsafePath,
-                                "refusing to write HAR through an existing symlink: {path}"
-                            );
-                        }
-                    }
+                    // reachable from agent-driven automation). `force = true`:
+                    // a HAR export has always overwritten silently.
+                    crate::bundle::guard_output_path(Path::new(&path), "HAR", true)?;
                     std::fs::write(&path, &text).with_context(|| format!("writing {path}"))?;
                     out.ok(
                         format!("wrote {entry_count} entries to {path}"),
@@ -2104,6 +2178,50 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
                         println!("{text}");
                     }
                 }
+            }
+            Ok(0)
+        }
+        ExportAction::Session {
+            session: name,
+            output,
+            redact,
+            force,
+        } => {
+            let name = name.unwrap_or(session);
+            let outcome = crate::bundle::export_session(
+                paths,
+                &crate::bundle::ExportRequest {
+                    session: name,
+                    output: output.map(PathBuf::from),
+                    redact,
+                    force,
+                },
+            )?;
+            let m = &outcome.manifest;
+            if out.json {
+                // The warning goes in the envelope, never on stdout as prose:
+                // the MCP layer parses the last stdout line as the envelope.
+                println!(
+                    "{}",
+                    Envelope::ok(json!({
+                        "path": outcome.path.display().to_string(),
+                        "bytes": outcome.bytes,
+                        "session": m.session,
+                        "flows": m.flow_count,
+                        "schema_version": m.schema_version,
+                        "redacted": m.redacted,
+                        "warning": outcome.warning(),
+                    }))
+                    .to_json_line()
+                );
+            } else {
+                println!(
+                    "wrote {} ({} flows, {} bytes)",
+                    outcome.path.display(),
+                    m.flow_count,
+                    outcome.bytes
+                );
+                eprintln!("⚠ {}", outcome.warning());
             }
             Ok(0)
         }
@@ -2727,6 +2845,83 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// `export session` → `session import` through the command tree itself: the
+    /// hand-over an operator actually types, including the two things that must
+    /// not happen quietly (clobbering a session, moving the active pointer).
+    #[tokio::test]
+    async fn session_bundle_roundtrip_through_the_command_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let fid = populate(&paths, "default").await;
+        let out = Output::new(false);
+
+        let bundle = dir.path().join("hand-over.burpwn");
+        let code = cmd_export(
+            &out,
+            &paths,
+            ExportAction::Session {
+                session: None,
+                output: Some(bundle.to_string_lossy().into_owned()),
+                redact: false,
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(bundle.is_file());
+
+        let code = cmd_session(
+            &out,
+            &paths,
+            SessionAction::Import {
+                file: bundle.to_string_lossy().into_owned(),
+                as_name: Some("hand-over".into()),
+                use_session: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(paths.session_exists("hand-over"));
+        // Importing does not hijack the active session.
+        assert_eq!(paths.active_session(), DEFAULT_SESSION);
+
+        let store = open_store(&paths, "hand-over").unwrap();
+        let rows = store.reader().list_flows(&FlowFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, fid);
+
+        // The same bundle a second time: refused, with the code that tells the
+        // user how to proceed.
+        let err = cmd_session(
+            &out,
+            &paths,
+            SessionAction::Import {
+                file: bundle.to_string_lossy().into_owned(),
+                as_name: Some("hand-over".into()),
+                use_session: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::SessionExists);
+
+        // Re-exporting onto the same path needs --force.
+        let err = cmd_export(
+            &out,
+            &paths,
+            ExportAction::Session {
+                session: None,
+                output: Some(bundle.to_string_lossy().into_owned()),
+                redact: false,
+                force: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::InputFileExists);
     }
 
     #[tokio::test]

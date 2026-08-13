@@ -165,6 +165,11 @@ pub enum ErrorCode {
     SessionNoDataDir,
     /// No flow group by that name exists.
     GroupNotFound,
+    /// The file is not a burpwn session bundle (wrong magic, truncated, or a
+    /// container format this build does not know).
+    SessionBundleInvalid,
+    /// A session by that name already exists, and burpwn will not overwrite it.
+    SessionExists,
 
     // --- input (exit 75) ---------------------------------------------------
     /// A flag was given a value outside its allowed set.
@@ -190,6 +195,8 @@ pub enum ErrorCode {
     /// The referenced parked intercept does not exist (already forwarded,
     /// dropped, or never parked).
     InputNoSuchIntercept,
+    /// The output file already exists and `--force` was not given.
+    InputFileExists,
 
     // --- agent integration (exit 76) ---------------------------------------
     /// The named agent / framework / MCP host is not one burpwn knows.
@@ -229,7 +236,7 @@ impl ErrorCode {
             }
             TlsCaInit | TlsCaLoad | TlsCaMalformed | TlsLeafMint => ErrorClass::Tls,
             SessionInvalidName | SessionNotFound | WorkspaceNotFound | SessionNoDataDir
-            | GroupNotFound => ErrorClass::Session,
+            | GroupNotFound | SessionBundleInvalid | SessionExists => ErrorClass::Session,
             InputInvalidValue
             | InputNoSuchFlow
             | InputNoSuchAttack
@@ -240,7 +247,8 @@ impl ErrorCode {
             | InputUnsafePath
             | InputNothingToDo
             | InputBadRegex
-            | InputNoSuchIntercept => ErrorClass::Input,
+            | InputNoSuchIntercept
+            | InputFileExists => ErrorClass::Input,
             AgentUnknown | AgentConfigShape | AgentRefusedOverwrite => ErrorClass::Agent,
             NetworkReplayFailed | NetworkAuthRefreshFailed => ErrorClass::Network,
             Internal => ErrorClass::Internal,
@@ -281,6 +289,8 @@ impl ErrorCode {
             WorkspaceNotFound => 3,
             SessionNoDataDir => 4,
             GroupNotFound => 5,
+            SessionBundleInvalid => 6,
+            SessionExists => 7,
 
             InputInvalidValue => 1,
             InputNoSuchFlow => 2,
@@ -293,6 +303,7 @@ impl ErrorCode {
             InputNothingToDo => 9,
             InputBadRegex => 10,
             InputNoSuchIntercept => 11,
+            InputFileExists => 12,
 
             AgentUnknown => 1,
             AgentConfigShape => 2,
@@ -349,6 +360,8 @@ impl ErrorCode {
             WorkspaceNotFound => "no such workspace",
             SessionNoDataDir => "burpwn cannot determine where to store its data",
             GroupNotFound => "no such flow group",
+            SessionBundleInvalid => "this file is not a burpwn session bundle",
+            SessionExists => "a session by that name already exists",
 
             InputInvalidValue => "a flag was given an unsupported value",
             InputNoSuchFlow => "no such flow",
@@ -361,6 +374,7 @@ impl ErrorCode {
             InputNothingToDo => "there is nothing to act on",
             InputBadRegex => "the regex is invalid for this use",
             InputNoSuchIntercept => "no such parked intercept",
+            InputFileExists => "the output file already exists",
 
             AgentUnknown => "unknown agent / framework / MCP host",
             AgentConfigShape => "the agent config file is not a shape burpwn can edit",
@@ -467,6 +481,16 @@ impl ErrorCode {
             GroupNotFound => vec![
                 "list them with `burpwn group list`, or create it with `burpwn group new <name>`",
             ],
+            SessionBundleInvalid => vec![
+                "a bundle is what `burpwn export session` writes: a `BURPWNBUNDLE` header \
+                 followed by a zstd-compressed session database",
+                "if the file came over the network or a chat client, check it was not truncated \
+                 or re-encoded in transit",
+            ],
+            SessionExists => vec![
+                "import it under another name with `--as <name>`; burpwn never merges into or \
+                 overwrites an existing session",
+            ],
 
             InputInvalidValue => vec!["the accepted values are listed in the message above"],
             InputNoSuchFlow => vec!["list captured flows with `burpwn req list`"],
@@ -487,6 +511,9 @@ impl ErrorCode {
             InputNoSuchIntercept => vec![
                 "list what is currently parked with `burpwn intercept list` — an intercept \
                  disappears once it has been forwarded or dropped",
+            ],
+            InputFileExists => vec![
+                "pass `--force` to overwrite it deliberately, or choose another `-o <file>`",
             ],
 
             AgentUnknown => vec!["the supported names are listed in the message above"],
@@ -539,6 +566,8 @@ impl ErrorCode {
         ErrorCode::WorkspaceNotFound,
         ErrorCode::SessionNoDataDir,
         ErrorCode::GroupNotFound,
+        ErrorCode::SessionBundleInvalid,
+        ErrorCode::SessionExists,
         ErrorCode::InputInvalidValue,
         ErrorCode::InputNoSuchFlow,
         ErrorCode::InputNoSuchAttack,
@@ -550,6 +579,7 @@ impl ErrorCode {
         ErrorCode::InputNothingToDo,
         ErrorCode::InputBadRegex,
         ErrorCode::InputNoSuchIntercept,
+        ErrorCode::InputFileExists,
         ErrorCode::AgentUnknown,
         ErrorCode::AgentConfigShape,
         ErrorCode::AgentRefusedOverwrite,
@@ -589,7 +619,7 @@ mod tests {
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(*code, back);
         }
-        assert_eq!(ErrorCode::ALL.len(), 43, "register new codes in ALL");
+        assert_eq!(ErrorCode::ALL.len(), 46, "register new codes in ALL");
     }
 
     #[test]

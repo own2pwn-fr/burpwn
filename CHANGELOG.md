@@ -5,6 +5,57 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — a session fits in one file, and that file opens on another machine
+Everything a pentester learns about a target lived in exactly one place: `~/.local/share/burpwn/
+sessions/<name>/session.db` on the machine that captured it. There was no way to hand a finished
+engagement to a colleague, to archive one before wiping a box, or to pick a session back up on a
+different host — short of copying a live SQLite database by hand, which quietly loses whatever the
+running daemon has not checkpointed out of the WAL yet. The session was portable in principle (all
+the bodies are already inside the store, there is no external payload directory) and unportable in
+practice.
+- **`burpwn export session [-o <file>] [--redact] [--force]`** writes the whole session to one
+  `<name>.burpwn` file: every flow with its bodies, plus the workspaces, groups, tags, notes,
+  attacks and match/replace rules. The snapshot is taken with `VACUUM INTO`, so it is
+  transactionally consistent and complete **while the daemon keeps writing** — that is the point,
+  and it is what a `cp session.db` gets wrong. The file is created `0600` and never overwritten
+  without `--force`, and it refuses to be written through a symlink like every other burpwn output.
+- **`burpwn session import <file> [--as <name>] [--use]`** opens one as a **new** session. Never a
+  merge and never an overwrite: the flow, group, attack and blob ids in a bundle are the bundle's
+  own, and renumbering them to fit an existing session is a different and far riskier feature, so a
+  name collision comes back as `BW-SESSION-007` telling you to pick `--as <name>`. The name written
+  in the bundle is validated like any other untrusted input before it becomes a path. A bundle from
+  an older burpwn is migrated on the way in and says so; one from a newer burpwn is refused
+  (`BW-STORE-003`) rather than half-read. The `current` pointer only moves if you pass `--use`, and
+  the import prints what actually landed — flows, workspaces, groups, tags, notes, attacks.
+- **⚠️ A bundle is a credential store, and burpwn says so out loud.** By default the export is RAW:
+  it carries `auth_profiles.token`, the `login_cmd` (whose argv routinely holds a password) and
+  every `Authorization` / `Cookie` header captured in the traffic — because a session that cannot
+  replay identically is not a session you can hand over. Every export prints a warning on stderr
+  (in `--json`, the same text rides in the envelope) saying exactly that. `--redact` is opt-in and
+  its scope is deliberately narrow and honestly documented: it purges the stored auth tokens, login
+  commands and match/replace replacements, and it does **NOT** scrub credentials captured inside
+  recorded requests and responses. Scrubbing those would mean rewriting content-addressed,
+  deduplicated, compressed blobs — changing the SHA-256 that IS their identity — and rebuilding the
+  `flows_fts` rows indexing the same text, to still end up leaking whatever a body happened to
+  contain. A narrow promise that holds beats a broad one that holds sometimes. The CA private key is
+  never in a bundle.
+- **The format is deliberately boring**: `BURPWNBUNDLE` magic, a format byte, then a zstd frame
+  containing the SQLite database with one added `bundle_manifest` table (burpwn version, schema
+  version, origin session, export time, flow count, a SHA-256 of the exporting install's CA for
+  provenance, and the `redacted` flag). No new dependency — the store already compresses blobs with
+  zstd — no tar framing, and the payload stays an ordinary database: `zstd -d` and skipping 13 bytes
+  is enough to open a bundle by hand. The magic exists so that feeding burpwn a HAR, a tarball or a
+  truncated download fails with `BW-SESSION-006` ("this file is not a burpwn session bundle")
+  instead of a SQLite parse error much later.
+- **MCP `session_export`** (**37 tools** now), so an agent can archive its own work when a piece of
+  it is done; its reply is deliberately terse (path, size, flow count, whether it is redacted)
+  because every field is context the agent pays for on the next turn. There is intentionally **no
+  import tool**: loading a session file that arrived from somewhere else is an operator decision,
+  not something an agent should do on its own say-so.
+- **New error codes** `BW-SESSION-006` (not a bundle), `BW-SESSION-007` (that session name is
+  taken) and `BW-INPUT-012` (the output file exists — pass `--force`), and the symlink guard that
+  `export har` had grown is now shared by both exports instead of living in one command.
+
 ### Added — flows can be grouped under a name and a description
 A session is a flat river of flows. The one thing an agent works hardest to reconstruct — *how
 this target authenticates* — had nowhere to live: it ended up as prose in the agent's context,

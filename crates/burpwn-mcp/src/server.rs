@@ -104,6 +104,18 @@ impl BurpwnServer {
             .and_then(ok_json)
     }
 
+    #[tool(
+        description = "Archive the WHOLE session into one portable file (a `.burpwn` bundle): every captured flow with its bodies, plus the workspaces, groups, tags, notes, attacks and match/replace rules. Reach for it when a piece of work is finished and worth keeping or handing over — the file opens on another machine with `burpwn session import <file>`, which is an operator action, not a tool. WARNING: by default the bundle is RAW, so it carries the stored auth tokens, the login commands and the Authorization/Cookie headers captured in the traffic; pass redact=true to drop the stored credentials (it does NOT scrub the ones captured inside recorded requests and responses). Refuses to overwrite an existing file unless force=true."
+    )]
+    async fn session_export(
+        &self,
+        Parameters(params): Parameters<SessionExportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::session_export(self.paths(), self.session(), &params)
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
     // --- session auth -----------------------------------------------------
 
     #[tool(
@@ -505,7 +517,8 @@ impl ServerHandler for BurpwnServer {
                  (Intruder), compare (structured flow diff + reflection check), and \
                  encode/decode (base64/url/hex/jwt). Findings are kept as named \
                  collections (group_new/group_add/group_list/group_show/group_rm), \
-                 tags and notes. Tools operate on the active session unless the \
+                 tags and notes, and a finished session can be archived whole with \
+                 session_export. Tools operate on the active session unless the \
                  server was started with --session."
                     .into(),
             ),

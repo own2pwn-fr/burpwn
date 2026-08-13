@@ -12,14 +12,14 @@
 //!   wrap-hook            (hidden)         stdin tool-input rewrite filter
 //!   proxy [--session S]  (hidden)         the long-running daemon
 //!   ca init | export
-//!   session new|list|use|rm
+//!   session new|list|use|rm|import|stats|auth
 //!   exec [--json] [--workspace W] [--timeout S] [--session S] -- <cmd>...
 //!   req list <filters> | show <id> [--raw] | search <q> | replay <id> [edits]
 //!   intercept enable|disable|list|await|forward|drop
 //!   match-replace add|list|rm|enable|disable
 //!   workspace new|list|use
 //!   tag add <flow> <name> | note add <flow> <text>
-//!   export har [--workspace] [-o file] | pcap
+//!   export har [--workspace] [-o file] | session [-o file] [--redact] | pcap
 //!   fuzz run --flow <id> … | list | show <attack_id>   Intruder
 //!   compare <flow_a> <flow_b> [--what headers|body|all]
 //!   encode <scheme> <value> | decode <scheme> <value>
@@ -44,6 +44,7 @@
 //! and returns a process exit code.
 
 pub mod auth;
+pub mod bundle;
 pub mod cli;
 pub mod commands;
 pub mod compare;
