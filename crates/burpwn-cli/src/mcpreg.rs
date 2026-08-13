@@ -1,7 +1,7 @@
 //! `burpwn mcp register`: write the burpwn stdio MCP server
 //! (`command="burpwn", args=["mcp"]`) into a framework's MCP host config,
 //! idempotently and preserving existing entries. Complementary to `skill
-//! install` — the skill teaches the workflow; this makes the 31 MCP tools
+//! install` — the skill teaches the workflow; this makes the MCP tools
 //! actually reachable for MCP-driven frameworks.
 //!
 //! Supported hosts (all user-level configs under HOME):
