@@ -511,6 +511,19 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
         auth_refresh_consumer(auth_rx, auth_reader, auth_exe, auth_session).await;
     });
 
+    // Hooks: install the sandbox command runner and keep the engine's snapshot
+    // fresh. The engine is ONE object shared by every connection (unlike the
+    // per-connection match/replace snapshot), so a `burpwn hook add` reaches
+    // keep-alive connections that are already open — which matters, since the
+    // connection an agent is hooking is usually the one it just opened.
+    let hooks = proxy.hooks();
+    hooks.set_runner(Arc::new(crate::hooks::SandboxHookRunner::new(
+        paths.clone(),
+        session,
+    )));
+    let hook_reader = store.reader();
+    let hooks_task = tokio::spawn(async move { hook_refresher(hooks, hook_reader).await });
+
     let scm_proxy = proxy.clone();
     let scm = tokio::spawn(async move { scm_proxy.serve_scm_unix(proxy_sock).await });
 
@@ -528,9 +541,43 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
     scm.abort();
     dns.abort();
     auth.abort();
+    hooks_task.abort();
     let _ = std::fs::remove_file(paths.proxy_sock(session));
     let _ = std::fs::remove_file(&control_sock);
     result
+}
+
+/// How often the daemon re-reads the hook table. Hooks are edited by a separate
+/// `burpwn hook` process writing to `session.db`, so the daemon has to notice;
+/// two seconds is imperceptible to an operator (and to an agent that just called
+/// `hook_add` and is about to send a request) while costing one small indexed
+/// SELECT per interval — off the request path entirely.
+const HOOK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Keep the proxy's hook engine in sync with the store.
+///
+/// A read that FAILS (a hook row this build cannot decode) leaves the previous
+/// snapshot in place and logs: the alternative — applying the hooks that did
+/// decode — would silently run a partial policy the operator never configured.
+async fn hook_refresher(engine: burpwn_proxy::HookEngine, reader: burpwn_store::Reader) {
+    let mut last: Option<Vec<burpwn_store::model::Hook>> = None;
+    loop {
+        match reader.list_hooks() {
+            Ok(hooks) => {
+                if last.as_ref() != Some(&hooks) {
+                    let enabled = hooks.iter().filter(|h| h.enabled).count();
+                    tracing::info!(total = hooks.len(), enabled, "hook set reloaded");
+                    engine.set_hooks(hooks.clone());
+                    last = Some(hooks);
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read the hook table; keeping the previous hook set"
+            ),
+        }
+        tokio::time::sleep(HOOK_REFRESH_INTERVAL).await;
+    }
 }
 
 /// Consume 401/403 host signals from the proxy's [`AuthWatcher`]: for each host,

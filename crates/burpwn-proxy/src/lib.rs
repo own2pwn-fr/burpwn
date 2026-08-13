@@ -19,12 +19,16 @@
 //! - [`Proxy::dns_listener`] — run the DNS decode/forward UDP server.
 //! - [`InterceptController`] (re-exported) — the blocking-intercept primitive
 //!   M6/M7 wire CLI + MCP onto.
+//! - [`HookEngine`] (re-exported) — hooks: an action (header/query edit, drop,
+//!   or a sandboxed command whose output is injected) applied to every message
+//!   matching a scope, on one phase.
 
 pub mod auth;
 pub mod classify;
 pub mod decode;
 pub mod dns;
 pub mod fuzz;
+pub mod hooks;
 pub mod http;
 pub mod intercept;
 pub mod matchreplace;
@@ -60,6 +64,7 @@ pub use crate::fuzz::{
     run_attack, AttackMode, AttackReport, BaselineStats, FuzzConfig, FuzzResult, HttpReplaySender,
     Position, RequestSender, SentResponse, Template,
 };
+pub use crate::hooks::{HookEngine, HookOutcome, HookRunner, MatchCtx, HOOK_EXEC_ID_PREFIX};
 pub use crate::http::{HttpContext, Upstream};
 pub use crate::intercept::{
     InterceptController, InterceptData, InterceptDecision, InterceptKind, InterceptScope,
@@ -102,6 +107,7 @@ pub struct Proxy {
     pinned: PinnedHosts,
     intercept: InterceptController,
     auth: AuthWatcher,
+    hooks: HookEngine,
     workspace_id: i64,
     exec_id: Option<String>,
 }
@@ -123,6 +129,7 @@ impl Proxy {
             pinned: PinnedHosts::new(),
             intercept: InterceptController::new(),
             auth: AuthWatcher::new(),
+            hooks: HookEngine::new(),
             workspace_id: cfg.workspace_id,
             exec_id: cfg.exec_id,
         })
@@ -131,6 +138,14 @@ impl Proxy {
     /// The intercept primitive, for CLI/MCP wiring (M6/M7).
     pub fn intercept(&self) -> InterceptController {
         self.intercept.clone()
+    }
+
+    /// The hook engine, for the daemon to load hooks into and install a command
+    /// runner on. ONE engine per proxy, shared by every connection (unlike the
+    /// per-connection match/replace snapshot), so a `burpwn hook add` reaches
+    /// connections that are already open.
+    pub fn hooks(&self) -> HookEngine {
+        self.hooks.clone()
     }
 
     /// The session-auth auto-refresh trigger. The daemon calls
@@ -209,6 +224,7 @@ impl Proxy {
             intercept: self.intercept.clone(),
             auth: self.auth.clone(),
             rules: self.rules(),
+            hooks: self.hooks.clone(),
             workspace_id,
             exec_id,
             client_addr,
@@ -287,6 +303,7 @@ impl Proxy {
                     intercept: self.intercept.clone(),
                     auth: self.auth.clone(),
                     rules: self.rules(),
+                    hooks: self.hooks.clone(),
                     workspace_id,
                     exec_id,
                     client_addr,

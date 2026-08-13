@@ -471,12 +471,21 @@ pub struct HttpReplaySender {
     pub sni: String,
     /// Resolved origin address.
     pub addr: std::net::SocketAddr,
+    /// The session's hooks. Only the DECLARATIVE ones run here — an attack of
+    /// 500 requests must not be 500 sandboxes — but they DO run, because a
+    /// stale `Authorization` is exactly what makes an Intruder run useless, and
+    /// this path never went through the proxy's own hook point.
+    pub hooks: std::sync::Arc<Vec<burpwn_store::model::Hook>>,
 }
 
 #[async_trait]
 impl RequestSender for HttpReplaySender {
     async fn send(&self, raw_request: &[u8]) -> anyhow::Result<SentResponse> {
-        let parsed = parse_raw_request(raw_request)?;
+        let mut parsed = parse_raw_request(raw_request)?;
+        // Applied to the RENDERED request, per request: a hook that adds a
+        // header would otherwise shift every payload offset the operator gave
+        // against the template.
+        apply_request_hooks(&self.hooks, &mut parsed)?;
         let resp = crate::replay_once(
             &self.scheme,
             &self.sni,
@@ -503,6 +512,43 @@ impl RequestSender for HttpReplaySender {
             resp_len: body_len,
         })
     }
+}
+
+/// Run the session's declarative `pre-request` hooks over one rendered fuzz
+/// request. A hook that DROPS fails this request rather than sending it — the
+/// operator asked for that flow not to leave the machine.
+fn apply_request_hooks(
+    hooks: &[burpwn_store::model::Hook],
+    parsed: &mut ParsedRequest,
+) -> anyhow::Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+    let mut msg = crate::matchreplace::Message {
+        host: parsed.authority.clone(),
+        url: parsed.path.clone(),
+        headers: crate::hooks::block_from_pairs(&parsed.headers),
+        body: std::mem::take(&mut parsed.body),
+    };
+    let ctx = crate::hooks::MatchCtx {
+        host: &parsed.authority,
+        method: &parsed.method,
+        path: &parsed.path.clone(),
+        status: None,
+    };
+    let out = crate::hooks::apply_declarative(
+        hooks,
+        burpwn_store::model::HookPhase::PreRequest,
+        &ctx,
+        &mut msg,
+    );
+    if out.dropped {
+        anyhow::bail!("request dropped by a burpwn hook");
+    }
+    parsed.headers = crate::hooks::pairs_from_block(&msg.headers);
+    parsed.path = msg.url;
+    parsed.body = msg.body;
+    Ok(())
 }
 
 /// A minimally-parsed raw HTTP request.

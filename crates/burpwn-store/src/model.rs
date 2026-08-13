@@ -286,6 +286,306 @@ impl MatchKind {
     }
 }
 
+/// Which side of a flow a hook fires on.
+///
+/// Deliberately NOT a `from_db` that falls back on a default (unlike the older
+/// [`MatchKind::from_db`]): a hook whose stored phase is not understood must be
+/// an error, because guessing would run an action on the wrong side of the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HookPhase {
+    /// Before the request is forwarded upstream.
+    PreRequest,
+    /// After the response headers/body arrive, before they go downstream.
+    PostResponse,
+}
+
+impl HookPhase {
+    /// DB string (`pre-request` / `post-response`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookPhase::PreRequest => "pre-request",
+            HookPhase::PostResponse => "post-response",
+        }
+    }
+
+    /// Parse from the DB string. An unknown value is an ERROR, never a default.
+    pub fn from_db(s: &str) -> crate::Result<HookPhase> {
+        match s {
+            "pre-request" => Ok(HookPhase::PreRequest),
+            "post-response" => Ok(HookPhase::PostResponse),
+            other => Err(crate::StoreError::UnsupportedRow {
+                table: "hooks",
+                detail: format!("unknown phase {other:?} (expected pre-request|post-response)"),
+            }),
+        }
+    }
+}
+
+/// When a hook fires: every non-empty field must match, so an empty [`HookScope`]
+/// matches every flow. `host`/`path` are case-insensitive substrings (with the
+/// `*.example.com` form accepted for hosts, as in match/replace), `method` is an
+/// exact case-insensitive match, `status` an exact response status (meaningful
+/// only for [`HookPhase::PostResponse`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookScope {
+    /// Host substring (empty = any).
+    pub host: String,
+    /// Exact request method, case-insensitive (empty = any).
+    pub method: String,
+    /// Path substring (empty = any).
+    pub path: String,
+    /// Exact response status (`None` = any).
+    pub status: Option<u16>,
+}
+
+/// Where the value produced by a [`HookAction::Exec`] is injected. The
+/// `value_template` carries the `{}` placeholder the extracted value replaces
+/// (same convention as [`AuthProfile::header_template`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookInject {
+    /// Injection form.
+    pub kind: HookInjectKind,
+    /// Header or query-parameter name.
+    pub name: String,
+    /// Value template containing `{}`.
+    pub value_template: String,
+}
+
+/// The declarative form a [`HookInject`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HookInjectKind {
+    /// Add the header only if the message does not already carry it.
+    AddHeader,
+    /// Add the header, replacing any existing one of that name.
+    SetHeader,
+    /// Set a query parameter on the request target.
+    SetQueryParam,
+}
+
+impl HookInjectKind {
+    /// DB / CLI string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookInjectKind::AddHeader => "add-header",
+            HookInjectKind::SetHeader => "set-header",
+            HookInjectKind::SetQueryParam => "set-query-param",
+        }
+    }
+
+    /// Parse from a string; unknown values are an error.
+    pub fn from_db(s: &str) -> crate::Result<HookInjectKind> {
+        match s {
+            "add-header" => Ok(HookInjectKind::AddHeader),
+            "set-header" => Ok(HookInjectKind::SetHeader),
+            "set-query-param" => Ok(HookInjectKind::SetQueryParam),
+            other => Err(crate::StoreError::UnsupportedRow {
+                table: "hooks",
+                detail: format!("unknown inject kind {other:?}"),
+            }),
+        }
+    }
+}
+
+/// What a hook DOES to the message it matched.
+///
+/// The first five are **declarative**: pure byte edits, no process, no I/O — the
+/// only kind that may run on every request without a cost. [`HookAction::Exec`]
+/// is the escape hatch: it runs a command in the sandbox, pulls a value out of
+/// its stdout with a one-capture-group regex, and injects it declaratively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum HookAction {
+    /// Add a header ONLY if the message does not already carry one by that name.
+    /// This is the gap match/replace cannot fill: it rewrites what is there, it
+    /// cannot synthesize a header a message never sent.
+    AddHeader {
+        /// Header name.
+        name: String,
+        /// Header value.
+        value: String,
+    },
+    /// Add the header, replacing any existing one of that name (add-or-replace).
+    SetHeader {
+        /// Header name.
+        name: String,
+        /// Header value.
+        value: String,
+    },
+    /// Remove every header line with this name.
+    RemoveHeader {
+        /// Header name.
+        name: String,
+    },
+    /// Set (or add) a query parameter on the request target. Request side only.
+    SetQueryParam {
+        /// Parameter name.
+        name: String,
+        /// Parameter value (percent-encoded on the way in).
+        value: String,
+    },
+    /// Refuse the message: the request is never forwarded / the response never
+    /// returned (the client gets a `403` from burpwn).
+    Drop,
+    /// Run `cmd` in the sandbox, extract a value from its stdout with `extract`
+    /// (one capture group), and inject it per `inject`.
+    Exec {
+        /// Shell command (run as `sh -c`) in the sandbox, like a login macro.
+        cmd: String,
+        /// Regex with exactly one capture group, applied to the command stdout.
+        extract: String,
+        /// How the extracted value reaches the message.
+        inject: HookInject,
+    },
+}
+
+impl HookAction {
+    /// The DB `action` column value.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HookAction::AddHeader { .. } => "add-header",
+            HookAction::SetHeader { .. } => "set-header",
+            HookAction::RemoveHeader { .. } => "remove-header",
+            HookAction::SetQueryParam { .. } => "set-query-param",
+            HookAction::Drop => "drop",
+            HookAction::Exec { .. } => "exec",
+        }
+    }
+
+    /// Whether this action can run without spawning anything (see the type doc).
+    pub fn is_declarative(&self) -> bool {
+        !matches!(self, HookAction::Exec { .. })
+    }
+
+    /// The DB `params` column: a JSON object holding the variant's fields (the
+    /// variant itself is named by the `action` column).
+    pub fn params_json(&self) -> crate::Result<String> {
+        let v = match self {
+            HookAction::AddHeader { name, value }
+            | HookAction::SetHeader { name, value }
+            | HookAction::SetQueryParam { name, value } => {
+                serde_json::json!({ "name": name, "value": value })
+            }
+            HookAction::RemoveHeader { name } => serde_json::json!({ "name": name }),
+            HookAction::Drop => serde_json::json!({}),
+            HookAction::Exec {
+                cmd,
+                extract,
+                inject,
+            } => serde_json::json!({
+                "cmd": cmd,
+                "extract": extract,
+                "inject_kind": inject.kind.as_str(),
+                "inject_name": inject.name,
+                "inject_value": inject.value_template,
+            }),
+        };
+        Ok(serde_json::to_string(&v)?)
+    }
+
+    /// Rebuild an action from its stored `(action, params)` pair. An unknown
+    /// kind — or a kind missing one of its parameters — is an ERROR: a hook that
+    /// quietly degrades into a different action is a hook nobody configured.
+    pub fn from_db(kind: &str, params: &str) -> crate::Result<HookAction> {
+        let v: serde_json::Value = serde_json::from_str(params)?;
+        let field = |key: &str| -> crate::Result<String> {
+            v.get(key)
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| crate::StoreError::UnsupportedRow {
+                    table: "hooks",
+                    detail: format!("action {kind:?} is missing its {key:?} parameter"),
+                })
+        };
+        match kind {
+            "add-header" => Ok(HookAction::AddHeader {
+                name: field("name")?,
+                value: field("value")?,
+            }),
+            "set-header" => Ok(HookAction::SetHeader {
+                name: field("name")?,
+                value: field("value")?,
+            }),
+            "remove-header" => Ok(HookAction::RemoveHeader {
+                name: field("name")?,
+            }),
+            "set-query-param" => Ok(HookAction::SetQueryParam {
+                name: field("name")?,
+                value: field("value")?,
+            }),
+            "drop" => Ok(HookAction::Drop),
+            "exec" => Ok(HookAction::Exec {
+                cmd: field("cmd")?,
+                extract: field("extract")?,
+                inject: HookInject {
+                    kind: HookInjectKind::from_db(&field("inject_kind")?)?,
+                    name: field("inject_name")?,
+                    value_template: field("inject_value")?,
+                },
+            }),
+            other => Err(crate::StoreError::UnsupportedRow {
+                table: "hooks",
+                detail: format!("unknown action {other:?}"),
+            }),
+        }
+    }
+}
+
+/// A hook: an action applied to every message matching [`HookScope`] on one
+/// [`HookPhase`] (schema v6).
+///
+/// Hooks and match/replace rules coexist and do different jobs: match/replace
+/// REWRITES text that is already in the message; a hook can synthesize what is
+/// not there (`add-header`), delete it, park the flow behind a command, or drop
+/// it outright.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hook {
+    /// Hook id.
+    pub id: i64,
+    /// Whether the hook is active.
+    pub enabled: bool,
+    /// Operator-facing name (free text; not unique).
+    pub name: String,
+    /// Which side of the flow it fires on.
+    pub phase: HookPhase,
+    /// When it fires.
+    pub scope: HookScope,
+    /// What it does.
+    pub action: HookAction,
+    /// Application order within a phase, ascending (ties broken by id).
+    pub order: i64,
+    /// Hard budget for an [`HookAction::Exec`] command, in milliseconds. On
+    /// expiry the hook FAILS OPEN: the traffic goes through un-hooked.
+    pub timeout_ms: i64,
+    /// How long an extracted [`HookAction::Exec`] value is reused before the
+    /// command runs again, in milliseconds. `0` = never cache.
+    pub ttl_ms: i64,
+    /// Creation timestamp (unix millis).
+    pub created_at: i64,
+}
+
+/// Parameters to create a [`Hook`] (id is generated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewHook {
+    /// Whether the hook starts enabled.
+    pub enabled: bool,
+    /// Operator-facing name.
+    pub name: String,
+    /// Phase.
+    pub phase: HookPhase,
+    /// Scope.
+    pub scope: HookScope,
+    /// Action.
+    pub action: HookAction,
+    /// Application order.
+    pub order: i64,
+    /// Exec timeout in milliseconds.
+    pub timeout_ms: i64,
+    /// Exec value cache TTL in milliseconds.
+    pub ttl_ms: i64,
+}
+
 /// State of an intercepted flow held in the intercept queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -592,6 +892,62 @@ pub struct ExecStats {
     pub network_execs: i64,
     /// Network-facing execs that captured ZERO flows (likely-escaped traffic).
     pub network_zero_flow_execs: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_action_round_trips_through_the_db_columns() {
+        for action in [
+            HookAction::AddHeader {
+                name: "User-Agent".into(),
+                value: "burpwn".into(),
+            },
+            HookAction::SetHeader {
+                name: "X-Env".into(),
+                value: "staging".into(),
+            },
+            HookAction::RemoveHeader {
+                name: "Cookie".into(),
+            },
+            HookAction::SetQueryParam {
+                name: "debug".into(),
+                value: "1".into(),
+            },
+            HookAction::Drop,
+            HookAction::Exec {
+                cmd: "get-token.sh".into(),
+                extract: r#""token":"([^"]+)""#.into(),
+                inject: HookInject {
+                    kind: HookInjectKind::SetHeader,
+                    name: "Authorization".into(),
+                    value_template: "Bearer {}".into(),
+                },
+            },
+        ] {
+            let params = action.params_json().unwrap();
+            let back = HookAction::from_db(action.kind(), &params).unwrap();
+            assert_eq!(back, action);
+        }
+    }
+
+    // A row this build cannot understand must be refused, not coerced onto some
+    // default action — the whole reason `HookAction::from_db` is fallible where
+    // `MatchKind::from_db` is not.
+    #[test]
+    fn unknown_hook_action_or_phase_is_an_error_not_a_default() {
+        let err = HookAction::from_db("teleport", "{}").unwrap_err();
+        assert!(matches!(err, crate::StoreError::UnsupportedRow { .. }));
+        // A known kind with a missing parameter is equally refused.
+        assert!(HookAction::from_db("add-header", r#"{"name":"X"}"#).is_err());
+        assert!(HookPhase::from_db("mid-flight").is_err());
+        assert_eq!(
+            HookPhase::from_db("post-response").unwrap(),
+            HookPhase::PostResponse
+        );
+    }
 }
 
 /// `serde_bytes`-style helper for `Vec<u8>` so JSON output is reasonable and

@@ -17,7 +17,9 @@ use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 
 use burpwn_proxy::{Proxy, ProxyConfig};
-use burpwn_store::model::FlowFilter;
+use burpwn_store::model::{
+    FlowFilter, Hook, HookAction, HookInject, HookInjectKind, HookPhase, HookScope,
+};
 use burpwn_store::Store;
 
 /// Spin up a trivial loopback origin that echoes method + path and a fixed body.
@@ -54,16 +56,23 @@ async fn spawn_origin() -> SocketAddr {
 
 /// Start the explicit proxy and return its bound address.
 async fn spawn_proxy() -> (SocketAddr, Store, TempDir) {
+    let (bound, store, dir, _proxy) = spawn_proxy_handle().await;
+    (bound, store, dir)
+}
+
+/// Same, keeping the [`Proxy`] itself — the hook engine hangs off it.
+async fn spawn_proxy_handle() -> (SocketAddr, Store, TempDir, Arc<Proxy>) {
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path().join("session.db")).unwrap();
     let cfg = ProxyConfig::new(dir.path().join("ca"));
     let proxy = Arc::new(Proxy::new(cfg, store.writer(), store.reader()).unwrap());
     let (bound, fut) = proxy
+        .clone()
         .explicit_http_bound(([127, 0, 0, 1], 0).into())
         .await
         .unwrap();
     tokio::spawn(fut);
-    (bound, store, dir)
+    (bound, store, dir, proxy)
 }
 
 /// Drive one absolute-form request through the proxy with a raw hyper client.
@@ -254,4 +263,231 @@ async fn sse_response_is_streamed_incrementally_not_withheld() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(recorded, "streamed flow recorded with status 200");
+}
+
+// --- hooks ------------------------------------------------------------------
+
+/// Build a hook with the defaults the tests do not care about.
+fn hook(id: i64, phase: HookPhase, scope: HookScope, action: HookAction) -> Hook {
+    Hook {
+        id,
+        enabled: true,
+        name: format!("hook{id}"),
+        phase,
+        scope,
+        action,
+        order: id,
+        timeout_ms: 1_000,
+        ttl_ms: 0,
+        created_at: 0,
+    }
+}
+
+/// An origin that echoes back the headers it received, so a test can see what
+/// actually left the proxy rather than what the proxy said it sent.
+async fn spawn_header_echo_origin() -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(sock);
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    let mut seen = format!("{}\n", req.uri());
+                    for (name, value) in req.headers() {
+                        seen.push_str(&format!(
+                            "{}: {}\n",
+                            name,
+                            value.to_str().unwrap_or_default()
+                        ));
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .body(Full::new(Bytes::from(seen)))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// The headline case: a `User-Agent` on every request, synthesized by the proxy
+/// for a client that never sent one. Match/replace cannot do this — it rewrites
+/// what is there — and the origin's echo proves the header really went on the
+/// wire, not just into the capture.
+#[tokio::test]
+async fn a_pre_request_hook_adds_a_header_the_client_never_sent() {
+    let origin = spawn_header_echo_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    handle.hooks().set_hooks(vec![hook(
+        1,
+        HookPhase::PreRequest,
+        HookScope::default(),
+        HookAction::AddHeader {
+            name: "User-Agent".into(),
+            value: "burpwn-hook/1".into(),
+        },
+    )]);
+
+    let (status, body) = request_through_proxy(proxy, origin, "GET", "/echo", "").await;
+    assert_eq!(status, 200);
+    let seen = String::from_utf8(body).unwrap();
+    assert!(seen.contains("user-agent: burpwn-hook/1"), "{seen}");
+
+    // …and a `drop` hook refuses the flow outright, without reaching the origin.
+    handle.hooks().set_hooks(vec![hook(
+        2,
+        HookPhase::PreRequest,
+        HookScope {
+            path: "/forbidden".into(),
+            ..Default::default()
+        },
+        HookAction::Drop,
+    )]);
+    let (status, body) = request_through_proxy(proxy, origin, "GET", "/forbidden", "").await;
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("dropped by hook"));
+    // A path outside the hook's scope still goes through untouched.
+    let (status, _) = request_through_proxy(proxy, origin, "GET", "/allowed", "").await;
+    assert_eq!(status, 200);
+}
+
+/// A response hook must see a STREAMED body too. `should_stream` short-circuits
+/// the whole response-rewrite path when nothing is in scope, so without the hook
+/// clause a `post-response` hook on an SSE endpoint would simply never run —
+/// silently, which is the worst way for a security tool to not work.
+#[tokio::test]
+async fn a_post_response_hook_takes_a_streaming_response_off_the_streaming_path() {
+    let origin = spawn_sse_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    handle.hooks().set_hooks(vec![hook(
+        1,
+        HookPhase::PostResponse,
+        HookScope {
+            status: Some(200),
+            ..Default::default()
+        },
+        HookAction::SetHeader {
+            name: "X-Burpwn-Hook".into(),
+            value: "seen".into(),
+        },
+    )]);
+
+    let tcp = TcpStream::connect(proxy).await.unwrap();
+    let io = TokioIo::new(tcp);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{origin}/sse"))
+        .header("host", origin.to_string())
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-burpwn-hook")
+            .and_then(|v| v.to_str().ok()),
+        Some("seen"),
+        "the response hook must have run on a streamed body"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"data: 1\n\ndata: 2\n\n");
+}
+
+/// THE recursion test, end to end through a real proxy: an `exec` hook whose
+/// command itself makes an HTTP request through that same proxy.
+///
+/// The explicit front-end has no exec id to stamp, so the `hook:` marker is
+/// absent here BY CONSTRUCTION — this exercises the second guard, the one that
+/// has to hold when the first is missing. The command must run exactly once, the
+/// request it makes must come back normally, and the whole thing must finish in
+/// well under the hook timeout: a recursion that "resolves at the timeout" is
+/// still a proxy that hangs.
+#[tokio::test]
+async fn a_hook_command_that_talks_through_the_proxy_does_not_recurse() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A runner that does what a token-mint command does: an HTTP request
+    /// through the proxy it is being run by.
+    struct ProxiedRunner {
+        proxy: SocketAddr,
+        origin: SocketAddr,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl burpwn_proxy::HookRunner for ProxiedRunner {
+        async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (status, body) =
+                request_through_proxy(self.proxy, self.origin, "GET", "/token", "").await;
+            assert_eq!(status, 200, "the hook's own request must be served");
+            Ok(format!(
+                "{{\"token\":\"{}\"}}",
+                String::from_utf8_lossy(&body).len()
+            ))
+        }
+    }
+
+    let origin = spawn_header_echo_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    handle.hooks().set_runner(Arc::new(ProxiedRunner {
+        proxy,
+        origin,
+        calls: calls.clone(),
+    }));
+    handle.hooks().set_hooks(vec![hook(
+        1,
+        HookPhase::PreRequest,
+        HookScope::default(),
+        HookAction::Exec {
+            cmd: "mint-a-token".into(),
+            extract: r#""token":"([^"]+)""#.into(),
+            inject: HookInject {
+                kind: HookInjectKind::SetHeader,
+                name: "Authorization".into(),
+                value_template: "Bearer {}".into(),
+            },
+        },
+    )]);
+
+    let started = std::time::Instant::now();
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        request_through_proxy(proxy, origin, "GET", "/api", ""),
+    )
+    .await
+    .expect("the proxy must not deadlock on a self-triggering hook");
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, 200);
+    let seen = String::from_utf8(body).unwrap();
+    assert!(
+        seen.contains("authorization: Bearer"),
+        "the outer request still got its token: {seen}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the command ran once: the request it made must not have re-fired the hook"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the guard must answer immediately, not resolve at the hook timeout \
+         ({elapsed:?})"
+    );
 }

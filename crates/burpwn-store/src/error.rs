@@ -39,6 +39,18 @@ pub enum StoreError {
         supported: i64,
     },
 
+    /// A stored row carries a value this build does not understand — an unknown
+    /// hook phase or action kind. Refused loudly instead of being coerced onto a
+    /// default: a hook that silently becomes some OTHER hook would mutate live
+    /// traffic in a way nobody asked for.
+    #[error("unsupported value in a stored {table} row: {detail}")]
+    UnsupportedRow {
+        /// The table the row came from.
+        table: &'static str,
+        /// What could not be understood.
+        detail: String,
+    },
+
     /// A compressed blob decoded to more bytes than its recorded `size` (or the
     /// hard ceiling) allows — refused rather than risking an OOM from a tampered
     /// or maliciously-fed high-ratio frame.
@@ -60,6 +72,10 @@ impl burpwn_error::Coded for StoreError {
             // the actionable framing, unlike a bare "io error".
             StoreError::Io(_) => C::StoreOpen,
             StoreError::Sqlite(_) | StoreError::Pool(_) | StoreError::Serde(_) => C::StoreSqlite,
+            // Today the only rows with a closed variant set are hooks, and the
+            // remediation is hook-specific (find it, delete it) — a generic
+            // "a database operation failed" would leave the user nowhere.
+            StoreError::UnsupportedRow { .. } => C::StoreHookUnreadable,
             StoreError::WriterGone | StoreError::NoReply(_) => C::StoreWriterGone,
             StoreError::IncompatibleSchema { .. } => C::StoreSchemaTooNew,
             StoreError::BlobTooLarge { .. } => C::StoreBlobTooLarge,
@@ -91,6 +107,14 @@ mod tests {
             ErrorCode::StoreBlobTooLarge
         );
         assert_eq!(
+            StoreError::UnsupportedRow {
+                table: "hooks",
+                detail: "unknown action".into()
+            }
+            .code(),
+            ErrorCode::StoreHookUnreadable
+        );
+        assert_eq!(
             StoreError::NoReply("x".into()).code(),
             ErrorCode::StoreWriterGone
         );
@@ -107,6 +131,10 @@ mod tests {
                 supported: 3,
             },
             StoreError::BlobTooLarge { id: 1, limit: 10 },
+            StoreError::UnsupportedRow {
+                table: "hooks",
+                detail: "unknown action".into(),
+            },
             StoreError::Io(std::io::Error::other("x")),
         ];
         for e in errors {

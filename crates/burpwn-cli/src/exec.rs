@@ -330,7 +330,38 @@ pub async fn run_exec(
     timeout: Option<Duration>,
     inherit_stdio: bool,
 ) -> Result<ExecResult> {
-    let exec_id = new_exec_id();
+    run_exec_as(
+        paths,
+        session,
+        workspace_id,
+        runtime,
+        argv,
+        timeout,
+        inherit_stdio,
+        new_exec_id(),
+    )
+    .await
+}
+
+/// [`run_exec`] with a caller-chosen `exec_id`.
+///
+/// The id is not cosmetic: it travels in the SCM wire header of every connection
+/// the sandboxed command makes, so the proxy can tell WHOSE traffic it is
+/// looking at while it is looking at it. That is what the hook engine's
+/// recursion guard reads — a command run by a hook gets an id prefixed with
+/// [`burpwn_proxy::HOOK_EXEC_ID_PREFIX`] and its own traffic is therefore never
+/// hooked again (see `crate::hooks`).
+#[allow(clippy::too_many_arguments)] // one more than run_exec, same shape
+pub async fn run_exec_as(
+    paths: &Paths,
+    session: &str,
+    workspace_id: i64,
+    runtime: Arc<dyn SandboxRuntime>,
+    argv: Vec<String>,
+    timeout: Option<Duration>,
+    inherit_stdio: bool,
+    exec_id: String,
+) -> Result<ExecResult> {
     // Classify + record the command line BEFORE the argv is moved into the spec,
     // for capture-completeness telemetry (`session stats`).
     let network_facing = is_network_facing(&argv);

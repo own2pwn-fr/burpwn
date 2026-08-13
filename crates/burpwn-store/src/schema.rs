@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
@@ -26,6 +26,7 @@ const MIGRATIONS: &[(i64, MigrationStep)] = &[
     (3, migrate_v3),
     (4, migrate_v4),
     (5, migrate_v5),
+    (6, migrate_v6),
 ];
 
 /// Apply pending migrations, stamp the version, and ensure the default
@@ -196,6 +197,29 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
             replacement TEXT NOT NULL,
             on_request  INTEGER NOT NULL DEFAULT 1
         );
+
+        -- Hooks: an action applied to every message matching a scope, on one
+        -- phase (schema v6). `ord` is spelled short because ORDER is a SQL
+        -- keyword; `params` is the JSON payload of the action named by `action`.
+        CREATE TABLE IF NOT EXISTS hooks (
+            id         INTEGER PRIMARY KEY,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            name       TEXT NOT NULL DEFAULT '',
+            phase      TEXT NOT NULL,
+            host       TEXT NOT NULL DEFAULT '',
+            method     TEXT NOT NULL DEFAULT '',
+            path       TEXT NOT NULL DEFAULT '',
+            status     INTEGER,
+            action     TEXT NOT NULL,
+            params     TEXT NOT NULL DEFAULT '{}',
+            ord        INTEGER NOT NULL DEFAULT 0,
+            timeout_ms INTEGER NOT NULL DEFAULT 10000,
+            ttl_ms     INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- The proxy reads hooks by phase, in application order.
+        CREATE INDEX IF NOT EXISTS idx_hooks_phase ON hooks(phase, ord, id);
 
         CREATE TABLE IF NOT EXISTS intercepts (
             id          INTEGER PRIMARY KEY,
@@ -410,6 +434,37 @@ fn migrate_v5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6: the `hooks` table — an action (declarative header/query edit, a drop, or
+/// a sandboxed command whose output is injected) applied to every message
+/// matching a scope on one phase. New table + one index, both `IF NOT EXISTS`,
+/// so the step is a no-op on the fresh-create replay (the v1 baseline already
+/// ships them) and adds the table in place on a v5→v6 upgrade. Nothing existing
+/// is touched: match/replace rules keep working exactly as before.
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS hooks (
+            id         INTEGER PRIMARY KEY,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            name       TEXT NOT NULL DEFAULT '',
+            phase      TEXT NOT NULL,
+            host       TEXT NOT NULL DEFAULT '',
+            method     TEXT NOT NULL DEFAULT '',
+            path       TEXT NOT NULL DEFAULT '',
+            status     INTEGER,
+            action     TEXT NOT NULL,
+            params     TEXT NOT NULL DEFAULT '{}',
+            ord        INTEGER NOT NULL DEFAULT 0,
+            timeout_ms INTEGER NOT NULL DEFAULT 10000,
+            ttl_ms     INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_hooks_phase ON hooks(phase, ord, id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -484,6 +539,7 @@ mod tests {
             "flow_groups",
             "notes",
             "match_replace_rules",
+            "hooks",
             "intercepts",
             "flows_fts",
             "ws_messages",
@@ -818,6 +874,92 @@ mod tests {
             .collect();
         members.sort_unstable();
         assert_eq!(members, vec![11, 12]);
+    }
+
+    /// A file in the real v5 shape: every table v5 shipped, stamped at
+    /// `user_version = 5`, with a match/replace rule and a group in it. The v6
+    /// upgrade must add `hooks` without disturbing any of that.
+    fn v5_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        // The v1 baseline already ships v6's table on a fresh create; drop it to
+        // emulate a file that genuinely predates v6.
+        conn.execute_batch("DROP TABLE IF EXISTS hooks;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspaces(id, name, created_at) VALUES (1, 'default', 0);
+             INSERT INTO groups(id, name, workspace_id, created_at)
+                VALUES (1, 'auth-flow', 1, 7);
+             INSERT INTO match_replace_rules(id, enabled, scope, match_kind, pattern, replacement, on_request)
+                VALUES (1, 1, 'api.test', 'header', '^Authorization:.*', 'Authorization: Bearer x', 1);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn
+    }
+
+    #[test]
+    fn migrates_v5_to_v6_adds_hooks_and_keeps_everything_else() {
+        let conn = v5_db();
+        assert!(!table_exists(&conn, "hooks"));
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "hooks"));
+        assert!(index_exists(&conn, "idx_hooks_phase"));
+        for c in [
+            "enabled",
+            "name",
+            "phase",
+            "host",
+            "method",
+            "path",
+            "status",
+            "action",
+            "params",
+            "ord",
+            "timeout_ms",
+            "ttl_ms",
+            "created_at",
+        ] {
+            assert!(column_exists(&conn, "hooks", c), "missing hooks.{c}");
+        }
+
+        // The pre-existing match/replace rule and group are untouched: hooks are
+        // an ADDITION, they do not migrate anything onto themselves.
+        let pattern: String = conn
+            .query_row(
+                "SELECT pattern FROM match_replace_rules WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pattern, "^Authorization:.*");
+        let group: String = conn
+            .query_row("SELECT name FROM groups WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(group, "auth-flow");
+
+        // The new table takes rows, and a second init() is a no-op.
+        conn.execute(
+            "INSERT INTO hooks(phase, action, params) VALUES ('pre-request', 'add-header', '{}')",
+            [],
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

@@ -109,6 +109,87 @@ pub struct SessionExportParams {
     pub force: bool,
 }
 
+/// `hook_add` — install a hook on the proxy pipeline.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct HookAddParams {
+    /// Name for the hook, for later listings (e.g. `refresh-api-token`).
+    pub name: String,
+    /// `add-header`, `set-header`, `remove-header`, `set-query-param`, `drop`
+    /// or `exec`.
+    pub action: String,
+    /// `pre-request` (default) or `post-response`.
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// Only hosts containing this (omit for every host).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Only this request method (omit for any).
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Only request targets containing this (omit for any).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Only this response status (`post-response` hooks only).
+    #[serde(default)]
+    pub status: Option<u16>,
+    /// `Name: value` for the header actions, or a bare `Name` for
+    /// `remove-header`.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// `name=value`, for `set-query-param`.
+    #[serde(default)]
+    pub param: Option<String>,
+    /// The command, for `exec`. Runs as `sh -c` in the sandbox.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// Regex with ONE capture group pulling the value out of the command's
+    /// stdout, e.g. `"access_token":"([^"]+)"`.
+    #[serde(default)]
+    pub extract: Option<String>,
+    /// Where the extracted value goes: `Name: prefix {}`.
+    #[serde(default)]
+    pub inject_header: Option<String>,
+    /// Where the extracted value goes as a query parameter: `name={}`.
+    #[serde(default)]
+    pub inject_param: Option<String>,
+    /// Application order within the phase (ascending; default 0).
+    #[serde(default)]
+    pub order: Option<i64>,
+    /// Hard budget for an `exec` command in milliseconds (default 10000). On
+    /// expiry the hook fails OPEN and the request goes through un-hooked.
+    #[serde(default)]
+    pub timeout_ms: Option<i64>,
+    /// How long an extracted value is reused before the command runs again, in
+    /// milliseconds (default 300000). `0` runs the command per request.
+    #[serde(default)]
+    pub ttl_ms: Option<i64>,
+}
+
+/// `hook_set_enabled` — turn a hook on or off without deleting it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct HookSetEnabledParams {
+    /// Hook id from `hook_list`.
+    pub id: i64,
+    /// `true` to enable, `false` to disable.
+    pub enabled: bool,
+}
+
+/// `hook_rm` — delete a hook.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct HookRmParams {
+    /// Hook id from `hook_list`.
+    pub id: i64,
+}
+
+/// `hook_test` — replay a hook against a captured flow.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct HookTestParams {
+    /// Hook id from `hook_list`.
+    pub id: i64,
+    /// Captured flow to replay it against.
+    pub flow_id: i64,
+}
+
 /// `group_new` — create (or re-describe) a named collection of flows.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GroupNewParams {

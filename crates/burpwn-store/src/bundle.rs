@@ -311,6 +311,17 @@ pub fn redact(conn: &Connection) -> Result<()> {
             [REDACTED],
         )?;
     }
+    // A hook's `exec` command is a login command by another name — it carries
+    // credentials in its argv exactly like `auth_profiles.login_cmd` — and the
+    // value it injects is whatever it minted. Blank the whole parameter object
+    // rather than surgically editing the JSON: an unparseable-but-empty hook is
+    // refused loudly on import, which is the right failure for a redacted file.
+    if table_exists(conn, "hooks")? {
+        conn.execute(
+            "UPDATE hooks SET params = ?1 WHERE action = 'exec'",
+            [REDACTED],
+        )?;
+    }
     Ok(())
 }
 
@@ -799,6 +810,28 @@ mod tests {
             w.set_auth_token("example.com", Some("s3cr3t".into()), Some(rule), 1017)
                 .await
                 .unwrap();
+            // A hook whose exec command carries a password in its argv, like the
+            // login macro it resembles.
+            w.add_hook(crate::model::NewHook {
+                enabled: true,
+                name: "refresh".into(),
+                phase: crate::model::HookPhase::PreRequest,
+                scope: crate::model::HookScope::default(),
+                action: crate::model::HookAction::Exec {
+                    cmd: "curl -u admin:hunter2 https://example.com/token".into(),
+                    extract: "\"token\":\"([^\"]+)\"".into(),
+                    inject: crate::model::HookInject {
+                        kind: crate::model::HookInjectKind::SetHeader,
+                        name: "Authorization".into(),
+                        value_template: "Bearer {}".into(),
+                    },
+                },
+                order: 0,
+                timeout_ms: 10_000,
+                ttl_ms: 0,
+            })
+            .await
+            .unwrap();
             let _ = flow_id;
         }
 
@@ -814,6 +847,10 @@ mod tests {
         let profile = store.reader().auth_profiles().unwrap().remove(0);
         assert_eq!(profile.token.as_deref(), Some("s3cr3t"));
         assert!(profile.login_cmd.contains("hunter2"));
+        let hooks = store.reader().list_hooks().unwrap();
+        assert!(
+            matches!(&hooks[0].action, crate::model::HookAction::Exec { cmd, .. } if cmd.contains("hunter2"))
+        );
 
         // Redacted export: the stored credentials are gone.
         let clean = dir.path().join("clean.burpwn");
@@ -830,6 +867,17 @@ mod tests {
         assert_eq!(profile.login_cmd, REDACTED);
         let rules = store.reader().list_match_replace().unwrap();
         assert_eq!(rules[0].replacement, REDACTED);
+        // The hook's command (password and all) is gone. Its row survives with
+        // unreadable parameters, which `list_hooks` refuses out loud — a
+        // redacted bundle is for reading the CAPTURE, not for re-running the
+        // engagement's credentials.
+        let hooks = store.reader().list_hooks();
+        assert!(hooks.is_err(), "a redacted exec hook must not decode");
+        let raw_params: String = rusqlite::Connection::open(&clean_db)
+            .unwrap()
+            .query_row("SELECT params FROM hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_params, REDACTED);
         // …and the capture itself is untouched: the Authorization header the
         // proxy recorded is still in the blob. Documented, not accidental.
         let flows = store

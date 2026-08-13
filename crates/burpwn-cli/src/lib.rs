@@ -57,6 +57,7 @@ pub mod envelope;
 pub mod exec;
 pub mod fuzz;
 pub mod har;
+pub mod hooks;
 pub mod initcheck;
 pub mod mcpreg;
 pub mod paths;

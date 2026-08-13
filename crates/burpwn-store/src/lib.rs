@@ -775,6 +775,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_crud_roundtrip_and_ordering() {
+        use crate::model::{HookAction, HookPhase, HookScope, NewHook};
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let second = w
+            .add_hook(NewHook {
+                enabled: true,
+                name: "strip-cookie".into(),
+                phase: HookPhase::PreRequest,
+                scope: HookScope {
+                    host: "api.test".into(),
+                    method: "GET".into(),
+                    path: "/v1".into(),
+                    status: None,
+                },
+                action: HookAction::RemoveHeader {
+                    name: "Cookie".into(),
+                },
+                order: 10,
+                timeout_ms: 5_000,
+                ttl_ms: 0,
+            })
+            .await
+            .unwrap();
+        let first = w
+            .add_hook(NewHook {
+                enabled: false,
+                name: "ua".into(),
+                phase: HookPhase::PreRequest,
+                scope: HookScope::default(),
+                action: HookAction::AddHeader {
+                    name: "User-Agent".into(),
+                    value: "burpwn".into(),
+                },
+                order: 1,
+                timeout_ms: 10_000,
+                ttl_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        // Listed in APPLICATION order (`ord`), not insertion order.
+        let hooks = reader.list_hooks().unwrap();
+        assert_eq!(
+            hooks.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert!(!hooks[0].enabled);
+        assert_eq!(hooks[1].scope.host, "api.test");
+        assert_eq!(hooks[1].scope.method, "GET");
+        assert_eq!(
+            hooks[1].action,
+            HookAction::RemoveHeader {
+                name: "Cookie".into()
+            }
+        );
+        assert!(hooks[1].created_at > 0, "the writer stamps created_at");
+
+        w.set_hook_enabled(first, true).await.unwrap();
+        assert!(reader.get_hook(first).unwrap().unwrap().enabled);
+
+        w.delete_hook(first).await.unwrap();
+        assert!(reader.get_hook(first).unwrap().is_none());
+        assert_eq!(reader.list_hooks().unwrap().len(), 1);
+    }
+
+    /// A row this build cannot decode fails the whole read, so a caller never
+    /// silently runs a PARTIAL hook set (see `Reader::list_hooks`).
+    #[tokio::test]
+    async fn a_hook_row_with_an_unknown_action_fails_the_read() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        {
+            let _store = Store::open(&db).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO hooks(phase, action, params) VALUES ('pre-request', 'launch-missiles', '{}')",
+            [],
+        )
+        .unwrap();
+        let store = Store::open(&db).unwrap();
+        let err = store.reader().list_hooks().unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedRow { .. }), "{err}");
+    }
+
+    #[tokio::test]
     async fn get_flow_includes_tags_and_notes() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("session.db")).unwrap();

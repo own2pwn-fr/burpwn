@@ -15,9 +15,9 @@ executes inside a rootless Linux sandbox whose **entire** network (HTTP/HTTPS/DN
 through a built-in intercepting proxy. The agent can then go back through history, search and filter
 the decrypted request/response flows, replay and edit them (Repeater), fuzz them with a native
 Intruder, diff responses, encode/decode tokens, keep itself authenticated with a login macro, apply
-match/replace rules, block and rewrite traffic in flight, organize flows into workspaces and named
-groups, and pack a whole session into one portable file to hand to someone else — all from a
-scriptable CLI or over MCP (37 tools). It is at once a Burp and a tshark, but driven by an agent.
+match/replace rules, hook every request or response with an action of its own, block and rewrite
+traffic in flight, organize flows into workspaces and named groups, and pack a whole session into
+one portable file to hand to someone else — all from a scriptable CLI or over MCP (42 tools). It is at once a Burp and a tshark, but driven by an agent.
 
 > **Status:** early development. See the milestones below.
 
@@ -49,6 +49,10 @@ namespace, so LLM traffic is excluded by construction.
   battering-ram / pitchfork / cluster-bomb, results ranked by anomaly), response `compare`,
   `encode`/`decode` (base64/url/hex/jwt), scoped blocking interception, and a session-auth login macro
   that auto-refreshes the token on 401/403 — so the tight probe loop never leaves the session.
+- **Hooks.** One action applied to every request (or response) matching a scope: add a header the
+  client never sent, replace or remove one, set a query parameter, drop the flow — or run a command
+  in the sandbox before the request goes out and inject what it prints (a token mint, a request
+  signer), cached for a TTL. A slow or failing hook fails **open**, so it never blocks an engagement.
 - **Agent integration (rtk-style).** `burpwn init` installs the right command-rewrite hook for the
   detected agent (Claude Code / Copilot, Cursor, Gemini CLI, Cline/Roo), plus a generic global shell
   hook so even a custom agent is covered.
@@ -70,6 +74,11 @@ burpwn compare 42 43 --what all                # structured diff + reflection ch
 burpwn decode jwt <token>                      # encode/decode base64(url)/url/hex/jwt
 burpwn session auth set --login 'curl -s https://target.example/login -d u=a' \
   --extract '"token":"([^"]+)"' --header 'Authorization: Bearer {}'  # login-macro refresh on 401/403
+burpwn hook add ua --action add-header --header 'User-Agent: burpwn'  # on EVERY request
+burpwn hook add token --action exec --host api.target.example \
+  --cmd './mint-token.sh' --extract '"access_token":"([^"]+)"' \
+  --inject-header 'Authorization: Bearer {}' --ttl 300000  # refresh + inject, cached 5 min
+burpwn hook test 2 --flow 42                   # replay a hook against a capture, no live traffic
 burpwn intercept scope target.example --path /admin  # narrow blocking intercept
 burpwn intercept enable                        # blocking intercept (also via MCP await_intercept)
 burpwn group new auth-flow \
@@ -328,7 +337,9 @@ For an agent with neither native skills nor stdio MCP, install the generic skill
 out to `burpwn exec` (or the `burpwn-shell` wrapper) for target-facing commands.
 </details>
 
-### Hook (opt-in: enforced auto-capture)
+### Agent capture hook (opt-in: enforced auto-capture)
+
+Not to be confused with `burpwn hook`, which acts on the traffic itself.
 
 `burpwn init` installs an rtk-style command-rewrite hook so **every** shell command is auto-routed
 through `burpwn exec`. This guarantees capture even if the model forgets to wrap a command — but it

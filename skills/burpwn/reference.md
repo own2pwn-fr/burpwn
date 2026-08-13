@@ -62,6 +62,7 @@ produce it — the JSON envelope disambiguates.
 | `BW-STORE-003` | the capture database is from a newer burpwn |
 | `BW-STORE-004` | a stored body is larger than the safety limit |
 | `BW-STORE-005` | the capture writer has shut down |
+| `BW-STORE-006` | a stored hook is not one this burpwn understands |
 
 **TLS** — exit code `73`
 
@@ -100,6 +101,7 @@ produce it — the JSON envelope disambiguates.
 | `BW-INPUT-010` | the regex is invalid for this use |
 | `BW-INPUT-011` | no such parked intercept |
 | `BW-INPUT-012` | the output file already exists |
+| `BW-INPUT-013` | no such hook |
 
 **AGENT** — exit code `76`
 
@@ -206,6 +208,46 @@ cannot use them (WSL). `--quick` skips the live probe.
 - `burpwn match-replace enable <ID> [--json]`
 - `burpwn match-replace disable <ID> [--json]`
 
+## hook
+An action the PROXY applies to every message matching a scope, on one phase.
+Complements match-replace: a rule rewrites text that is already in the message,
+a hook can add what is not there, remove it, drop the flow, or run a command and
+inject what it prints.
+- `burpwn hook add <NAME> --action <ACTION> [OPTIONS] [--json]`
+  - `--action` — `add-header` (only if absent), `set-header` (add-or-replace),
+    `remove-header`, `set-query-param`, `drop`, `exec`.
+  - `--phase <pre-request|post-response>` — default `pre-request`.
+  - Scope (every non-empty field must match; all optional): `--host <SUBSTRING>`
+    (`*.example.com` accepted), `--method <METHOD>`, `--path <SUBSTRING>`,
+    `--status <CODE>` (post-response only).
+  - `--header 'Name: value'` for the header actions (a bare `Name` for
+    `remove-header`), `--param name=value` for `set-query-param`.
+  - `exec` only: `--cmd <COMMAND>` (run as `sh -c` IN THE SANDBOX, so its traffic
+    is captured — and never re-hooked), `--extract <REGEX>` (exactly one capture
+    group), and one of `--inject-header 'Name: prefix {}'` /
+    `--inject-param name={}` (`{}` is where the extracted value goes).
+    `--inject-if-absent` makes a header injection add-only.
+  - `--ttl <MS>` (default 300000) reuses the extracted value instead of running
+    the command again; `--ttl 0` runs it on every matching request — one sandbox
+    per request. `--timeout <MS>` (default 10000) is a hard budget; on expiry the
+    hook FAILS OPEN and the traffic goes through un-hooked.
+  - `--order <N>` orders hooks within a phase; `--disabled` creates it off.
+- `burpwn hook list [--json]` — in application order.
+- `burpwn hook show <ID> [--json]`
+- `burpwn hook enable <ID>` / `burpwn hook disable <ID>` / `burpwn hook rm <ID>`
+- `burpwn hook test <ID> --flow <FLOW_ID> [--json]` — replay the hook against a
+  CAPTURED flow and report `matched` / `changed` / `dropped` plus the before and
+  after. No live traffic. For an `exec` hook the command really runs, so this is
+  also how you check the extraction regex still matches.
+
+Notes: hooks run after match/replace and before the intercept, on both phases.
+`exec` hooks run **one command at a time for the whole proxy** — a second request
+that needs a fresh value while one is running is forwarded un-hooked rather than
+queued behind it (that is also what stops a hook whose command talks to the
+target from triggering itself). Repeater (`req replay`) and Intruder (`fuzz`)
+apply the **declarative** hooks only; they have no sandbox, and 500 fuzz requests
+must not be 500 commands.
+
 ## workspace
 - `burpwn workspace new <NAME> [--json]`
 - `burpwn workspace list [--json]`
@@ -242,12 +284,13 @@ workspace and every subcommand takes the NAME, not an id.
 ## mcp (stdio server)
 `burpwn mcp [--session <n>]` — start the MCP server over stdio. It does not print
 `--help`; running it starts the server (it exits when the stdio connection
-closes). Exposes 37 tools: `session_list`, `session_current`, `session_stats`,
+closes). Exposes 42 tools: `session_list`, `session_current`, `session_stats`,
 `session_export`, `session_auth_set`, `session_auth_refresh`,
 `session_auth_status`, `req_list`,
 `req_show`, `req_search`, `req_replay`, `workspace_list`, `workspace_new`,
 `tag_list`, `tag_add`, `note_add`, `group_new`, `group_add`, `group_list`,
 `group_show`, `group_rm`, `match_replace_list`, `match_replace_add`,
+`hook_add`, `hook_list`, `hook_set_enabled`, `hook_rm`, `hook_test`,
 `intercept_enable`, `intercept_disable`, `intercept_list`, `intercept_scope`,
 `await_intercept`, `intercept_forward`, `intercept_drop`, `exec`, `fuzz`,
 `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.
