@@ -4,10 +4,19 @@
 This script is the *source of truth* for the dataset files. It emits one JSON
 object per line. Every command name, flag, JSON envelope shape and MCP tool
 name encoded here was verified against the real ``burpwn`` debug binary
-(``target/debug/burpwn``) and the MCP server's typed parameter structs /
-handlers (``crates/burpwn-mcp/src/{params,server,handlers}.rs``) on
-2026-06-13 by actually running the binary and capturing the ``{ok,data,error}``
-envelopes (see README.md "How accuracy was grounded").
+(``target/debug/burpwn``, **built from this checkout** — see below) and the MCP
+server's typed parameter structs / handlers
+(``crates/burpwn-mcp/src/{params,server,handlers}.rs``), most recently on
+2026-08-13 at version 0.3.4, by actually running the binary and capturing the
+``{ok,data,error}`` envelopes (see README.md "How accuracy was grounded").
+
+The anti-drift guard is ``training/eval/surface.py --check``. It grounds on a
+binary built from the current tree and refuses to run against one whose
+``--version`` disagrees with ``Cargo.toml``. That check is load-bearing: it
+previously read an installed 0.2.0 binary off ``$PATH`` and reported the sets
+below as consistent while seven subcommands and eighteen flags of 0.3.x went
+entirely unverified. Any hard-coded count in this file (e.g. "42 tools") is
+only as trustworthy as that guard.
 
 Two example *styles* are produced, distinguished by the top-level ``"style"``
 key on every record (and mirrored in the system prompt):
@@ -115,8 +124,13 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
   MCP tool results (the handlers wrap differently — NO {ok,data,error}, NO
   "type" tag):
     * session_list → {sessions, active}; session_current → {active, db_exists}.
-    * req_list → {flows:[...], count:N}; req_show → flow-detail object (raw=true
-      adds raw_request/raw_response); req_search → {flow_ids:[...]}.
+    * req_list → {flows:[...], count:N}; req_search → {flow_ids:[...]}.
+    * req_show → flow-detail object. ``raw=true`` adds top-level raw_request/
+      raw_response AND **drops** the decoded ``headers``/``body`` from
+      request/response (they used to be emitted as well, which shipped every
+      body twice). The decoded metadata stays: request{method,authority,path,
+      http_version}, response{status,http_version,timing_ms}. req_show is NOT
+      null-pruned, so sni/exec_id/timing_ms can be literal nulls.
     * workspace_list → {workspaces:[...]}; tag_list → {tags:[...]};
       match_replace_list → {rules:[...]}.
     * match_replace_add → {id}; tag_add → {tag_id}; note_add → {note_id};
@@ -129,9 +143,14 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     * req_replay → {status, response:"<raw HTTP string>"} (MCP adds a numeric
       `status`; the CLI envelope's data is just {response:"..."}).
     * fuzz → same object as CLI ``fuzz run`` data; fuzz_list → {attacks,count};
-      fuzz_results → {attack,results,count}.
+      fuzz_results → {attack,results,count}. Each ``results`` row is
+      {id,payload,flow_id,status_code,resp_len,latency_ms,anomaly_score,ts};
+      the per-row ``attack_id`` was REMOVED (it repeated the caller's own
+      argument on every row).
     * compare → same object as CLI ``compare`` data (flow_a/flow_b/status/
-      headers/body+reflected).
+      headers/body+reflected). No output cap: ``body.only_in_a``/``only_in_b``
+      and ``headers.added/removed/changed`` are unbounded, and there is no
+      truncation field as of 0.3.4.
     * encode → {scheme,encoded}; decode → {scheme,decoded,bytes?} or the jwt
       object {alg,header,claims,signature,verified:false}.
     * session_stats → {session,total_execs,total_flows,network_execs,
@@ -140,6 +159,41 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       session_auth_refresh → {refreshed:[{host,rule_id,token}]}.
     * any intercept tool with no daemon → error string starting "no burpwn proxy
       daemon answering ...".
+    * 0.3.x groups (named flow collections). NOTE the MCP shapes differ from the
+      CLI ones for add/list/rm — do not conflate:
+      group_new → {group_id,name,workspace_id,created:<bool>} (create-or-update:
+      calling it twice is safe, ``created`` just flips to false);
+      group_add → {group_id,name,added:[ids],flow_count} (CLI: {group_id,name,
+      flow_ids}); group_list → {groups:[{id,name,description,workspace_id,
+      created_at,flow_count}],count} — NOT null-pruned, so ``description:null``
+      really appears (CLI: {groups:[...]}, no count);
+      group_show → {group:{id,name,description,workspace_id,created_at},
+      flows:[flow rows],count} (null-pruned);
+      group_rm → {group_id,name,deleted:true} (CLI: {group_id,name}).
+      Missing group → error "no such group: <name>".
+    * 0.3.x hooks (pre-request / post-response actions):
+      hook_add → {hook_id,name}; hook_list → {hooks:[...]} (null-pruned; NO
+      count); hook_set_enabled → {id,enabled} (one tool for both directions,
+      where the CLI has ``hook enable``/``hook disable``); hook_rm →
+      {removed:<id>}; hook_test → {hook_id,flow_id,phase,matched,changed,dropped,
+      exec:<obj|null>,before:{headers,url},after:{headers,url}}.
+      A hook list row is {id,enabled,name,phase,scope:{host,method,path,status},
+      action:{...},order,timeout_ms,ttl_ms,created_at}; ``action`` is an
+      internally tagged object, e.g. {"action":"add-header",name,value} or
+      {"action":"exec",cmd,extract,inject:{kind,name,value_template}}.
+    * 0.3.x session_export → {path,bytes,flows,redacted} plus a ``warning``
+      member ONLY when redacted is false. The CLI's ``export session`` data
+      carries more (schema_version, session, and a longer warning) — another
+      CLI/MCP divergence.
+
+  prune_nulls (0.3.x): MCP applies it to req_list, workspace_list, tag_list,
+    match_replace_list, hook_list, group_show, fuzz_list, fuzz_results and
+    session_auth_status — members whose value is null are REMOVED rather than
+    emitted. It recurses through objects and arrays and drops nothing else (no
+    ``""``, ``0``, ``false``, ``[]`` or ``{}``). It is deliberately NOT applied
+    to req_show, group_list, compare, or any of the write/ack tools, so those
+    still emit literal nulls. The CLI ``{ok,data,error}`` envelope is never
+    pruned — ``data:null`` on an error is exactly how it reports one.
   MCP arg names: req_search.query, req_show.{id,raw}, tag_add.{flow_id,name,color?},
     note_add.{flow_id,body}, workspace_new.name, match_replace_add.{scope,kind,
     pattern,replacement,on_request}, await_intercept.timeout_secs,
@@ -150,7 +204,41 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     fuzz.{flow,positions:[":"],payloads:[...],mode,concurrency?,delay_ms?,marker?,
     name?}, fuzz_list.{workspace?}, fuzz_results.{attack_id,sort?,limit?},
     compare.{flow_a,flow_b,what?}, encode/decode.{scheme,value},
-    session_auth_set.{login,extract,header,host?}, session_auth_refresh.{host?}.
+    session_auth_set.{login,extract,header,host?}, session_auth_refresh.{host?},
+    group_new.{name,description?,workspace?(numeric id)},
+    group_add.{name,flow_ids:[...]}, group_list.{workspace?}, group_show.{name},
+    group_rm.{name}, hook_list takes NO arguments ({}),
+    hook_add.{name,action,phase?,host?,method?,path?,status?,header?,param?,cmd?,
+    extract?,inject_header?,inject_param?,order?,timeout_ms?,ttl_ms?},
+    hook_set_enabled.{id,enabled}, hook_rm.{id}, hook_test.{id,flow_id}
+    (note flow_id, where req_show/fuzz use ``id``/``flow``),
+    session_export.{output?,redact?,force?}.
+
+  0.3.x CLI additions (see KNOWN_CLI_* below):
+    * ``group new <name> [--description D] [--workspace W]`` → data {group_id,
+      name,workspace_id,created:<bool>} — create-or-update, so an agent can call
+      it unconditionally before each ``group add``. ``group add <name> <id>...``
+      → {group_id,name,flow_ids}; ``group rm-flow`` → same shape; ``group list``
+      → {groups:[{id,name,description,flow_count,workspace_id,created_at}]};
+      ``group show <name>`` → {group:{...},flows:[rows],count}; ``group rm`` →
+      {group_id,name}. ``req list --group <name>`` and ``export har --group
+      <name>`` filter by group (``--group`` is mutually exclusive with
+      ``--workspace`` on export har).
+    * ``hook add <name> --action <a> [...]`` → data {hook_id,name}; ``hook
+      list`` → {hooks:[...]}; ``hook show <id>`` → the hook object; ``hook
+      enable|disable <id>`` → {id,enabled}; ``hook rm <id>`` → {removed:<id>};
+      ``hook test <id> --flow <n>`` → the before/after report (no live traffic;
+      an ``exec`` hook's command DOES run). Actions: add-header, set-header,
+      remove-header, set-query-param, drop, exec.
+    * ``export session [-o F] [--redact] [--force]`` → data {path,bytes,flows,
+      redacted,schema_version,session,warning}; refuses an existing file without
+      ``--force``. ``session import <file> [--as NAME] [--use]`` → data
+      {session,active,flows,groups,tags,notes,attacks,redacted,migrated_from,
+      from:{session,burpwn_version,schema_version,exported_at,ca_sha256},
+      warning}. Import ALWAYS creates a new session — it never merges into and
+      never overwrites an existing one.
+    * ``doctor --quick`` skips the live sandbox probe (``sandbox_probe:null``).
+    * ``debug bundle [-o F] [--no-probe]``, ``debug list``, ``debug show [PATH]``.
 """
 
 from __future__ import annotations
@@ -212,10 +300,14 @@ SYSTEM_SHELL = (
 # name Claude Code exposes and that burpwn's PreToolUse hook matches).
 SHELL_TOOL_NAME = "Bash"
 
-# The 31 MCP tools exposed by `burpwn mcp` (verified against server.rs; 0.2.0
+# The 42 MCP tools exposed by `burpwn mcp` (verified against server.rs; 0.2.0
 # added the offensive surface: req_replay, fuzz/fuzz_list/fuzz_results, compare,
-# encode/decode, intercept_scope, session_stats and the session_auth_* trio).
-# Kept in exact sync with the real surface by `training/eval/surface.py --check`.
+# encode/decode, intercept_scope, session_stats and the session_auth_* trio;
+# 0.3.x added the five `group_*` tools, the five `hook_*` tools and
+# `session_export`).
+# Kept in exact sync with the real surface by `training/eval/surface.py --check`,
+# which grounds on a binary built from this checkout — see the note there about
+# the stale-binary false green that let 0.3.x land unverified.
 MCP_TOOL_NAMES = {
     "session_list",
     "session_current",
@@ -248,6 +340,20 @@ MCP_TOOL_NAMES = {
     "compare",
     "encode",
     "decode",
+    # 0.3.x: named flow collections.
+    "group_new",
+    "group_add",
+    "group_list",
+    "group_show",
+    "group_rm",
+    # 0.3.x: pre-request / post-response hook engine.
+    "hook_add",
+    "hook_list",
+    "hook_set_enabled",
+    "hook_rm",
+    "hook_test",
+    # 0.3.x: portable session bundle.
+    "session_export",
 }
 
 # Known CLI tokens (subcommands + flags) for the lenient command linter. Kept in
@@ -268,6 +374,11 @@ KNOWN_CLI_SUBCOMMANDS = {
     # before clap, so it is hidden from `--help`; `mcp`/`register` still appear in
     # the derived surface (top-level `mcp` variant + the explicit register probe).
     "skill", "mcp", "install", "uninstall", "register",
+    # 0.3.x: `group` (named flow collections), `hook` (pre-request/post-response
+    # actions), `export session` + `session import` (portable bundle) and
+    # `debug bundle/list/show`. `test` is `hook test`, `rm-flow` is
+    # `group rm-flow`, `bundle` is `debug bundle`, `import` is `session import`.
+    "group", "hook", "test", "rm-flow", "debug", "bundle", "import",
 }
 KNOWN_CLI_FLAGS = {
     "--json", "-g", "--global", "--agent", "--name", "--workspace",
@@ -280,6 +391,13 @@ KNOWN_CLI_FLAGS = {
     "--payloads", "--position", "--request", "--sort", "--what",
     # 0.2.0 skill/mcp integration flags
     "--all", "--force", "--print", "--project", "--list",
+    # 0.3.x: group/hook/bundle surface.
+    "--description",                      # group new
+    "--group",                            # req list / export har
+    "--action", "--phase", "--cmd", "--param", "--order", "--ttl",
+    "--inject-header", "--inject-param", "--inject-if-absent", "--disabled",
+    "--as", "--use", "--redact",          # session import / export session
+    "--out", "--no-probe", "--quick",     # debug bundle / doctor
 }
 
 # Tools the engine commonly drives via `exec` (the sandboxed pentest tooling).
@@ -1727,11 +1845,14 @@ def fam_meta() -> list[dict[str, Any]]:
                     "Both expose the same engine. Use the **CLI** (`burpwn <cmd> --json`) for "
                     "ad-hoc shell work, scripting and piping. Use the **MCP server** "
                     "(`burpwn mcp`, stdio) when an LLM agent should call burpwn as tools — it "
-                    "exposes 31 tools (`req_list`, `req_show`, `req_search`, `req_replay`, "
+                    "exposes 42 tools (`req_list`, `req_show`, `req_search`, `req_replay`, "
                     "`exec`, `fuzz`/`fuzz_list`/`fuzz_results`, `compare`, `encode`/`decode`, "
-                    "`intercept_*` incl. `intercept_scope`, `match_replace_*`, `tag_add`, "
-                    "`note_add`, `workspace_*`, `session_*` incl. `session_stats` and the "
-                    "`session_auth_*` trio) with typed JSON arguments. One gotcha: the "
+                    "`intercept_*` incl. `intercept_scope`, `match_replace_*`, `hook_*` "
+                    "(`hook_add`/`hook_list`/`hook_set_enabled`/`hook_rm`/`hook_test`), "
+                    "`group_*` (`group_new`/`group_add`/`group_list`/`group_show`/"
+                    "`group_rm`), `tag_add`, `note_add`, `workspace_*`, `session_*` incl. "
+                    "`session_stats`, `session_export` and the `session_auth_*` trio) with "
+                    "typed JSON arguments. One gotcha: the "
                     "MCP tool *results* are NOT wrapped in `{ok,data,error}` and use "
                     "different keys (e.g. `req_list` returns `{flows,count}`, intercept tools "
                     "return `{ok:true}`/`{pending:...}`/`{found:...}`), so don't expect the "
@@ -2029,19 +2150,25 @@ def fam_mcp_single() -> list[dict[str, Any]]:
             user="Show me the raw bytes of flow 41 so I can build a PoC.",
             steps=[{
                 "tool": "req_show", "args": {"id": 41, "raw": True},
+                # raw:true REPLACES the decoded headers/body inside
+                # request/response — it does not add to them. The metadata
+                # (method/path/http_version, status/timing_ms) stays.
                 "result": {
                     "id": 41, "protocol": "h2",
                     "request": {"method": "GET", "path": "/v1/me",
-                                "headers": "authorization: Bearer ...\r\n", "body": ""},
-                    "response": {"status": 200, "headers": "content-type: application/json\r\n",
-                                 "body": '{"id":1001,"role":"user"}'},
+                                "http_version": "HTTP/2"},
+                    "response": {"status": 200, "http_version": "HTTP/2",
+                                 "timing_ms": 38},
                     "raw_request": "GET /v1/me HTTP/2\r\nauthorization: Bearer ...\r\n\r\n",
                     "raw_response": 'HTTP/2 200\r\ncontent-type: application/json\r\n\r\n'
                                     '{"id":1001,"role":"user"}',
                 },
-                "final": "Flow 41 is `GET /v1/me` with a bearer token; the JSON exposes "
-                         '`{"id":1001,"role":"user"}`. The `raw_request`/`raw_response` '
-                         "fields are byte-exact. Since the response leaks the numeric user "
+                "final": "Flow 41 is `GET /v1/me` with a bearer token; the raw response "
+                         'body exposes `{"id":1001,"role":"user"}`. Note that with '
+                         "`raw:true` the decoded `headers`/`body` are **replaced** by "
+                         "`raw_request`/`raw_response` rather than added alongside them, so "
+                         "each body appears exactly once — drop `raw` if you want the "
+                         "decoded members back. Since the response leaks the numeric user "
                          "id, this is a strong IDOR candidate on `/v1/users/<id>`.",
             }],
         )
@@ -2371,9 +2498,10 @@ def fam_mcp_multi() -> list[dict[str, Any]]:
                 {
                     "preamble": "Decode flow 31.",
                     "tool": "req_show", "args": {"id": 31, "raw": True},
+                    # raw:true → the body lives only in raw_response.
                     "result": {"id": 31, "protocol": "h1",
-                               "response": {"status": 200,
-                                            "body": '{"user":"admin","password":"P@ss"}'},
+                               "response": {"status": 200, "http_version": "HTTP/1.1",
+                                            "timing_ms": 61},
                                "raw_response": 'HTTP/1.1 200 OK\r\n\r\n'
                                                '{"user":"admin","password":"P@ss"}'},
                     "final": "Flow 31's response body returns a cleartext credential "
@@ -5123,7 +5251,7 @@ def fam_mcp_register() -> list[dict[str, Any]]:
                     "Register the burpwn stdio MCP server into Codex's config "
                     "(`~/.codex/config.toml`, a `[mcp_servers.burpwn]` table):\n\n```\n"
                     "burpwn --json mcp register --agent codex\n```\n\n```json\n" + _ok(codex_data)
-                    + "\n```\n\nCodex now launches `burpwn mcp` (stdio) and can call the 31 "
+                    + "\n```\n\nCodex now launches `burpwn mcp` (stdio) and can call the 42 "
                     "burpwn tools. **Caveat:** Codex's default `workspace-write` sandbox blocks "
                     "outbound network, so burpwn's tools — which make network calls on your "
                     "behalf via `exec` — need `network_access=true` in the Codex sandbox config, "
@@ -5235,7 +5363,7 @@ def fam_integration_setup() -> list[dict[str, Any]]:
                     "assistant",
                     "```\nburpwn --json mcp register --agent codex\n```\n\n```json\n"
                     + _ok({"registered": [_skill_installed("codex", "/home/op/.codex/config.toml")]})
-                    + "\n```\n\nCodex now launches `burpwn mcp` (stdio) with the 31 burpwn tools. "
+                    + "\n```\n\nCodex now launches `burpwn mcp` (stdio) with the 42 burpwn tools. "
                     "**One required tweak:** Codex's default `workspace-write` sandbox blocks "
                     "outbound network, so burpwn's tools (they reach the target via `exec`) will "
                     "capture nothing until you set `network_access=true` in Codex's sandbox "
