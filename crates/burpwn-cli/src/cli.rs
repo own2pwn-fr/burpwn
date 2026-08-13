@@ -687,11 +687,15 @@ pub enum MatchReplaceAction {
 pub struct HookAddArgs {
     /// Name for this hook (free text, for `hook list`).
     pub name: String,
-    /// When it fires: `pre-request` (default) or `post-response`.
+    /// When it fires: `pre-request` (default), `post-response`, `ws-c2s` /
+    /// `ws-s2c` (one complete WebSocket message, client→server /
+    /// server→client) or `dns-query`.
     #[arg(long, default_value = "pre-request")]
     pub phase: String,
     /// What it does: `add-header`, `set-header`, `remove-header`,
-    /// `set-query-param`, `drop` or `exec`.
+    /// `set-query-param`, `drop`, `exec` (HTTP phases), `replace-payload`
+    /// (`ws-*`) or `set-answer` (`dns-query`). An action that does not apply
+    /// to the phase is refused here, not ignored later.
     #[arg(long)]
     pub action: String,
     /// Only for hosts containing this (empty = every host; `*.example.com`
@@ -714,6 +718,18 @@ pub struct HookAddArgs {
     /// `name=value`, for `set-query-param`.
     #[arg(long)]
     pub param: Option<String>,
+    /// The literal text to look for in a WebSocket payload, for
+    /// `replace-payload`.
+    #[arg(long)]
+    pub find: Option<String>,
+    /// What replaces `--find` (empty = delete it), for `replace-payload`.
+    #[arg(long)]
+    pub replace: Option<String>,
+    /// The address to answer with instead of resolving, for `set-answer`.
+    /// Only an `A` (IPv4) or `AAAA` (IPv6) query is answered; anything else
+    /// still goes upstream.
+    #[arg(long)]
+    pub answer: Option<String>,
     /// The command to run, for `exec` (run as `sh -c` IN THE SANDBOX, so
     /// its own traffic is captured — and never re-hooked).
     #[arg(long)]
