@@ -3,6 +3,42 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added — flows can be grouped under a name and a description
+A session is a flat river of flows. The one thing an agent works hardest to reconstruct — *how
+this target authenticates* — had nowhere to live: it ended up as prose in the agent's context,
+which the next session does not have, or as a tag, which is a label with no room to say what the
+sequence means. The `groups` / `flow_groups` tables have been in the schema since v1, unreachable
+from the CLI, the MCP server, or even a public writer method: dead weight nothing could use.
+- **`burpwn group new|add|rm-flow|list|show|rm`** — a group is a named, described SUBSET of a
+  session's flows, the equivalent of a Burp highlight. `burpwn group new auth-flow --description
+  'login form → POST /login → redirect + Set-Cookie session'` then `burpwn group add auth-flow 3 5
+  9` pins the reconstructed scenario to a handle; `group show` renders it exactly like `req list`,
+  so it can be read back and replayed later. The same move isolates one campaign
+  (`xss-fuzz-search-param`) from the thousands of flows around it. Every subcommand takes the
+  NAME, supports `--json`, and `group new` is **idempotent** — re-running it returns the same
+  group and updates its description, so it is safe to call before every `add` instead of
+  branching on existence. Deleting a group deletes the grouping only; the flows stay captured.
+- **The group is a first-class filter, not just a view** — `burpwn req list --group auth-flow
+  --method POST` composes with every other filter, and `burpwn export har --group auth-flow`
+  exports precisely one named scenario (exclusive with `--workspace`, which the group already
+  belongs to). That is the point of naming a subset: it becomes the unit you hand to someone else.
+- **Five MCP tools** (`group_new`, `group_add`, `group_list`, `group_show`, `group_rm`), bringing
+  the server to **36 tools**. Their descriptions tell the model *when* to reach for them — after
+  working out an auth sequence, or to fence off a fuzzing campaign — because a tool an agent never
+  thinks to call is a tool that does not exist.
+- **Schema v5** — `groups` gains `description` and `created_at`, `(workspace_id, name)` becomes
+  unique (a name is the handle everything resolves on, so it may not designate two groups in one
+  workspace), and `flow_groups` gains the group-side index the membership read needs (its primary
+  key is `(flow_id, group_id)`, whose prefix is the wrong way round for "every flow in this
+  group"). An existing v4 database migrates in place; because nothing ever enforced uniqueness
+  before, same-named groups are folded onto the oldest id — memberships re-pointed — rather than
+  failing someone's upgrade.
+- **New error code `BW-SESSION-005`** (`no such flow group`), so an unknown group name comes back
+  as a branchable code instead of an empty result. Adding a flow id that does not exist fails the
+  whole `group add` rather than half-filling the group.
+
 ## [0.3.4] - 2026-08-10
 
 ### Fixed — an in-place upgrade kept serving traffic from the OLD daemon

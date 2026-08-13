@@ -107,6 +107,13 @@ pub enum Command {
         action: NoteAction,
     },
 
+    /// Group flows under a name + description (a named collection / highlight).
+    Group {
+        /// Group subcommand.
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+
     /// Export captured flows.
     Export {
         /// Export subcommand.
@@ -536,6 +543,9 @@ pub struct ReqListArgs {
     /// Restrict to a workspace by NAME.
     #[arg(long)]
     pub workspace: Option<String>,
+    /// Restrict to the flows in a group, by NAME (see `burpwn group list`).
+    #[arg(long)]
+    pub group: Option<String>,
     /// Max rows.
     #[arg(long)]
     pub limit: Option<i64>,
@@ -698,6 +708,60 @@ pub enum NoteAction {
     },
 }
 
+/// `group` subcommands.
+///
+/// A group is a named, described subset of a session's flows: the handle for a
+/// reconstructed scenario ("auth-flow": login form → POST /login → redirect +
+/// Set-Cookie) or one campaign ("xss-fuzz-search-param"). Names are unique per
+/// workspace; every subcommand takes the NAME, not an id.
+#[derive(Debug, Subcommand)]
+pub enum GroupAction {
+    /// Create a group (or update the description of an existing one).
+    New {
+        /// Group name (unique within the workspace).
+        name: String,
+        /// What this collection of flows means, in prose.
+        #[arg(long)]
+        description: Option<String>,
+        /// Workspace to create it in, by NAME or numeric id (defaults to the
+        /// session's default workspace).
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Add one or more flows to a group.
+    Add {
+        /// Group name.
+        name: String,
+        /// Flow ids to add.
+        #[arg(required = true)]
+        flow_id: Vec<i64>,
+    },
+    /// Remove one or more flows from a group (the flows themselves survive).
+    RmFlow {
+        /// Group name.
+        name: String,
+        /// Flow ids to remove.
+        #[arg(required = true)]
+        flow_id: Vec<i64>,
+    },
+    /// List groups with their description and flow count.
+    List {
+        /// Restrict to a workspace, by NAME or numeric id.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// List the flows in a group (same rendering as `req list`).
+    Show {
+        /// Group name.
+        name: String,
+    },
+    /// Delete a group. Only the grouping goes away; the flows stay captured.
+    Rm {
+        /// Group name.
+        name: String,
+    },
+}
+
 /// `export` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ExportAction {
@@ -706,6 +770,11 @@ pub enum ExportAction {
         /// Restrict to a workspace id.
         #[arg(long)]
         workspace: Option<i64>,
+        /// Restrict to the flows in a group, by NAME — the natural way to
+        /// export one named scenario. Mutually exclusive with `--workspace`
+        /// (the group already lives in a workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        group: Option<String>,
         /// Output file (defaults to stdout).
         #[arg(short, long)]
         output: Option<String>,

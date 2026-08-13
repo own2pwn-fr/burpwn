@@ -184,15 +184,23 @@ pub struct Tag {
     pub color: Option<String>,
 }
 
-/// A group definition (a named collection of flows within a workspace).
+/// A group definition: a named, described collection of flows within a
+/// workspace — the "highlight" an agent uses to pin a reconstructed scenario
+/// (an auth sequence, one fuzzing campaign) to a handle it can come back to.
+/// The name is unique per workspace (schema v5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     /// Group id.
     pub id: i64,
-    /// Group name.
+    /// Group name (unique within the workspace).
     pub name: String,
+    /// What the collection means, in prose — e.g. "login form → POST /login →
+    /// redirect + Set-Cookie session".
+    pub description: Option<String>,
     /// Owning workspace.
     pub workspace_id: i64,
+    /// Creation timestamp (unix millis; 0 for groups predating schema v5).
+    pub created_at: i64,
 }
 
 /// A workspace.
@@ -335,6 +343,9 @@ pub struct Intercept {
 pub struct FlowFilter {
     /// Restrict to a workspace.
     pub workspace_id: Option<i64>,
+    /// Restrict to the flows that are members of this group (by id — resolve a
+    /// group NAME through [`crate::Reader::group_by_name`] first).
+    pub group_id: Option<i64>,
     /// Substring match against request authority / SNI / dst_ip.
     pub host_contains: Option<String>,
     /// Exact response status.

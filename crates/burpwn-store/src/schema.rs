@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
@@ -25,6 +25,7 @@ const MIGRATIONS: &[(i64, MigrationStep)] = &[
     (2, migrate_v2),
     (3, migrate_v3),
     (4, migrate_v4),
+    (5, migrate_v5),
 ];
 
 /// Apply pending migrations, stamp the version, and ensure the default
@@ -154,14 +155,28 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS groups (
             id           INTEGER PRIMARY KEY,
             name         TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL REFERENCES workspaces(id)
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+            -- Named-collection metadata (schema v5, nullable). On a fresh create
+            -- these ship in the baseline DDL; migrate_v5 adds them to pre-v5
+            -- files via a guarded ALTER (skipped here because they exist).
+            description  TEXT,
+            created_at   INTEGER NOT NULL DEFAULT 0
         );
+
+        -- A group NAME is the handle the CLI/MCP resolve on, so it must identify
+        -- at most one group per workspace (schema v5).
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_workspace_name
+            ON groups(workspace_id, name);
 
         CREATE TABLE IF NOT EXISTS flow_groups (
             flow_id  INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
             group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
             PRIMARY KEY (flow_id, group_id)
         );
+
+        -- The PK is (flow_id, group_id), so "every flow in THIS group" — the
+        -- read `group show` / `--group` filtering does — has no usable prefix.
+        CREATE INDEX IF NOT EXISTS idx_flow_groups_group ON flow_groups(group_id);
 
         CREATE TABLE IF NOT EXISTS notes (
             id      INTEGER PRIMARY KEY,
@@ -329,6 +344,72 @@ fn migrate_v4(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v5: flow groups become a real feature. `groups` gains the `description` an
+/// agent uses to say what the collection MEANS ("login form → POST /login →
+/// redirect + Set-Cookie") plus a `created_at`, the (workspace_id, name) pair
+/// becomes unique (a name is the handle the CLI/MCP resolve on, so it may not
+/// designate two groups in one workspace), and `flow_groups` gains the
+/// group-side index the "flows in this group" read needs — its PK is
+/// (flow_id, group_id), whose prefix is the wrong way round for that query.
+///
+/// Idempotent on both paths: the columns go in through a guarded ALTER (the v1
+/// baseline already ships them on a fresh create) and the indexes use
+/// `IF NOT EXISTS`. Pre-v5 files could in principle hold two same-named groups
+/// in one workspace (nothing enforced it, and nothing but a unit test ever
+/// created one), so duplicates are folded onto the lowest id — with their
+/// memberships re-pointed — before the unique index goes on, rather than
+/// letting the migration fail on someone's database.
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    // Don't assume the tables are there: a step must be runnable on any older
+    // file, including one whose `groups`/`flow_groups` never got created.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS groups (
+            id           INTEGER PRIMARY KEY,
+            name         TEXT NOT NULL,
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+            description  TEXT,
+            created_at   INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS flow_groups (
+            flow_id  INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (flow_id, group_id)
+        );
+        "#,
+    )?;
+
+    add_column_if_missing(conn, "groups", "description", "TEXT")?;
+    add_column_if_missing(conn, "groups", "created_at", "INTEGER NOT NULL DEFAULT 0")?;
+
+    conn.execute_batch(
+        r#"
+        -- Re-point every membership of a duplicate group onto the surviving
+        -- (lowest-id) row of the same (workspace_id, name). OR IGNORE: when the
+        -- survivor already holds that flow the row stays on the duplicate and
+        -- is removed by the cascade below.
+        UPDATE OR IGNORE flow_groups SET group_id = (
+            SELECT MIN(g2.id) FROM groups g2
+            JOIN groups g1 ON g1.id = flow_groups.group_id
+            WHERE g2.workspace_id = g1.workspace_id AND g2.name = g1.name
+        );
+        DELETE FROM groups WHERE id NOT IN (
+            SELECT MIN(id) FROM groups GROUP BY workspace_id, name
+        );
+        -- Memberships the OR IGNORE above left on a now-deleted duplicate. The
+        -- FK cascade normally takes care of these, but `PRAGMA foreign_keys` is
+        -- a connection setting, so don't depend on it during a migration.
+        DELETE FROM flow_groups WHERE group_id NOT IN (SELECT id FROM groups);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_workspace_name
+            ON groups(workspace_id, name);
+        CREATE INDEX IF NOT EXISTS idx_flow_groups_group ON flow_groups(group_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -361,6 +442,19 @@ mod tests {
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    /// Whether an index by that name exists (indexes live in `sqlite_master`
+    /// under `type = 'index'`, alongside tables).
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
                 [name],
                 |r| r.get(0),
             )
@@ -404,6 +498,14 @@ mod tests {
         // v3 TLS columns present on a fresh create.
         for c in ["tls_version", "tls_cipher", "tls_alpn", "origin_cert_fp"] {
             assert!(column_exists(&conn, "flows", c), "missing flows.{c}");
+        }
+
+        // v5 group metadata + indexes present on a fresh create.
+        for c in ["description", "created_at"] {
+            assert!(column_exists(&conn, "groups", c), "missing groups.{c}");
+        }
+        for i in ["idx_groups_workspace_name", "idx_flow_groups_group"] {
+            assert!(index_exists(&conn, i), "missing index {i}");
         }
 
         let name: String = conn
@@ -583,6 +685,139 @@ mod tests {
 
         // Idempotent second init is a no-op.
         init(&conn).unwrap();
+    }
+
+    /// Build a file in the pre-v5 shape of the tables v5 touches: `groups`
+    /// without description/created_at, `flow_groups`, plus the `workspaces` and
+    /// `flows` rows they reference. Stamped at `user_version = 4`.
+    fn v4_db_with_groups() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL
+            );
+            INSERT INTO workspaces(id, name, created_at) VALUES (1, 'default', 0);
+            CREATE TABLE flows (
+                id INTEGER PRIMARY KEY,
+                workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+                ts_start INTEGER NOT NULL
+            );
+            INSERT INTO flows(id, workspace_id, ts_start) VALUES (11, 1, 100), (12, 1, 200);
+            CREATE TABLE groups (
+                id           INTEGER PRIMARY KEY,
+                name         TEXT NOT NULL,
+                workspace_id INTEGER NOT NULL REFERENCES workspaces(id)
+            );
+            CREATE TABLE flow_groups (
+                flow_id  INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+                group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                PRIMARY KEY (flow_id, group_id)
+            );
+            INSERT INTO groups(id, name, workspace_id) VALUES (1, 'auth-flow', 1);
+            INSERT INTO flow_groups(flow_id, group_id) VALUES (11, 1);
+            "#,
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn
+    }
+
+    #[test]
+    fn migrates_v4_to_v5_adds_group_metadata_and_preserves_memberships() {
+        let conn = v4_db_with_groups();
+        assert!(!column_exists(&conn, "groups", "description"));
+        assert!(!index_exists(&conn, "idx_groups_workspace_name"));
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        for c in ["description", "created_at"] {
+            assert!(column_exists(&conn, "groups", c), "missing groups.{c}");
+        }
+        for i in ["idx_groups_workspace_name", "idx_flow_groups_group"] {
+            assert!(index_exists(&conn, i), "missing index {i}");
+        }
+
+        // Pre-existing data survives: the group keeps its id/name (description
+        // defaults to NULL) and its membership row is untouched.
+        let (name, desc): (String, Option<String>) = conn
+            .query_row(
+                "SELECT name, description FROM groups WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "auth-flow");
+        assert_eq!(desc, None);
+        let members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_groups WHERE group_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 1);
+
+        // The new unique index is live: a second 'auth-flow' in workspace 1 is
+        // refused, while the same name in another workspace is fine.
+        assert!(conn
+            .execute(
+                "INSERT INTO groups(name, workspace_id) VALUES ('auth-flow', 1)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO workspaces(id, name, created_at) VALUES (2, 'other', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO groups(name, workspace_id) VALUES ('auth-flow', 2)",
+            [],
+        )
+        .unwrap();
+
+        // Idempotent second init.
+        init(&conn).unwrap();
+    }
+
+    #[test]
+    fn migrating_to_v5_folds_duplicate_group_names_onto_the_lowest_id() {
+        // Nothing before v5 stopped a workspace holding two same-named groups,
+        // so the unique index cannot simply be created: the duplicates must
+        // collapse (memberships and all) instead of failing the upgrade.
+        let conn = v4_db_with_groups();
+        conn.execute_batch(
+            "INSERT INTO groups(id, name, workspace_id) VALUES (2, 'auth-flow', 1);
+             INSERT INTO flow_groups(flow_id, group_id) VALUES (12, 2), (11, 2);",
+        )
+        .unwrap();
+
+        init(&conn).unwrap();
+
+        // One 'auth-flow' left, the lowest id, owning BOTH flows (11 was already
+        // its member, 12 was re-pointed off the duplicate).
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM groups WHERE name = 'auth-flow' AND workspace_id = 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, vec![1]);
+        let mut members: Vec<i64> = conn
+            .prepare("SELECT flow_id FROM flow_groups WHERE group_id = 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        members.sort_unstable();
+        assert_eq!(members, vec![11, 12]);
     }
 
     #[test]

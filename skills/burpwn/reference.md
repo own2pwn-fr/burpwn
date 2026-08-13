@@ -80,6 +80,7 @@ produce it — the JSON envelope disambiguates.
 | `BW-SESSION-002` | no such session |
 | `BW-SESSION-003` | no such workspace |
 | `BW-SESSION-004` | burpwn cannot determine where to store its data |
+| `BW-SESSION-005` | no such flow group |
 
 **INPUT** — exit code `75`
 
@@ -165,6 +166,7 @@ cannot use them (WSL). `--quick` skips the live probe.
   - `--protocol <PROTOCOL>` — exact wire protocol: `h1`, `h2`, `ws`, `dns`, `rawtcp`, `tls-passthru`.
   - `--port <PORT>` — exact destination port.
   - `--workspace <WORKSPACE>` — restrict to a workspace id.
+  - `--group <GROUP>` — restrict to the flows in a group, by NAME (see `burpwn group list`).
   - `--limit <LIMIT>` / `--offset <OFFSET>` — pagination.
 - `burpwn req show <ID> [--raw] [--json]` — show one flow (`--raw` = verbatim bytes).
 - `burpwn req search <QUERY> [--json]` — full-text search flow bodies.
@@ -204,15 +206,29 @@ cannot use them (WSL). `--quick` skips the live probe.
 - `burpwn tag add <FLOW_ID> <NAME> [--json]`
 - `burpwn note add <FLOW_ID> <TEXT> [--json]`
 
+## group
+A named, described SUBSET of a session's flows (a Burp-style highlight): a
+reconstructed auth scenario, one fuzzing campaign. Names are unique per
+workspace and every subcommand takes the NAME, not an id.
+- `burpwn group new <NAME> [--description <TEXT>] [--workspace <ID|NAME>] [--json]` — idempotent: an existing name is returned as is, with its description updated. Defaults to the default workspace.
+- `burpwn group add <NAME> <FLOW_ID>... [--json]` — add flows; an unknown flow id fails the call without adding any.
+- `burpwn group rm-flow <NAME> <FLOW_ID>... [--json]` — remove flows from the group (the flows stay captured).
+- `burpwn group list [--workspace <ID|NAME>] [--json]` — name, description, flow count.
+- `burpwn group show <NAME> [--json]` — the group's flows, rendered like `req list`.
+- `burpwn group rm <NAME> [--json]` — delete the grouping only.
+
 ## export
-- `burpwn export har [--workspace <WORKSPACE>] [-o <OUTPUT>] [--json]` — HAR 1.2 (stdout if no `-o`).
+- `burpwn export har [--workspace <WORKSPACE>] [--group <GROUP>] [-o <OUTPUT>] [--json]` — HAR 1.2 (stdout if no `-o`). `--group <NAME>` exports one named scenario; it is exclusive with `--workspace`.
 - `burpwn export pcap` — not yet implemented (errors clearly).
 
 ## mcp (stdio server)
 `burpwn mcp [--session <n>]` — start the MCP server over stdio. It does not print
 `--help`; running it starts the server (it exits when the stdio connection
-closes). Exposes 19 tools: `session_list`, `session_current`, `req_list`,
-`req_show`, `req_search`, `workspace_list`, `workspace_new`, `tag_list`,
-`tag_add`, `note_add`, `match_replace_list`, `match_replace_add`,
-`intercept_enable`, `intercept_disable`, `intercept_list`, `await_intercept`,
-`intercept_forward`, `intercept_drop`, `exec`.
+closes). Exposes 36 tools: `session_list`, `session_current`, `session_stats`,
+`session_auth_set`, `session_auth_refresh`, `session_auth_status`, `req_list`,
+`req_show`, `req_search`, `req_replay`, `workspace_list`, `workspace_new`,
+`tag_list`, `tag_add`, `note_add`, `group_new`, `group_add`, `group_list`,
+`group_show`, `group_rm`, `match_replace_list`, `match_replace_add`,
+`intercept_enable`, `intercept_disable`, `intercept_list`, `intercept_scope`,
+`await_intercept`, `intercept_forward`, `intercept_drop`, `exec`, `fuzz`,
+`fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.

@@ -222,10 +222,10 @@ burpwn match-replace list
 burpwn match-replace disable <id>          # also: enable <id>, rm <id>
 ```
 
-## Organize: workspaces, tags, notes, export
+## Organize: workspaces, groups, tags, notes, export
 
 ```sh
-burpwn workspace new recon                 # group flows
+burpwn workspace new recon                 # a workspace scopes a whole capture run
 burpwn exec --workspace recon -- curl ...  # attribute captures to it
 burpwn req list --workspace recon
 burpwn tag add <flow_id> sqli-candidate
@@ -236,14 +236,38 @@ burpwn export har -o /tmp/session.har      # HAR 1.2 (stdout if no -o); export p
 `burpwn workspace use <name>` only records the choice in config — you must still
 pass `--workspace` on `exec`/`req` to actually scope.
 
+**Groups** are named, described SUBSETS of a session's flows — the equivalent of
+a Burp highlight, and the right place to record a scenario you had to work out.
+Once you understand how the target authenticates, pin it:
+
+```sh
+burpwn group new auth-flow \
+  --description 'login form -> POST /login -> redirect + Set-Cookie session'
+burpwn group add auth-flow 3 5 9           # flow ids, from `req list` / `exec`
+burpwn group list                          # name, description, flow count
+burpwn group show auth-flow                # the flows, rendered like `req list`
+burpwn req list --group auth-flow --method POST
+burpwn export har --group auth-flow -o /tmp/auth.har
+burpwn group rm-flow auth-flow 5           # and: burpwn group rm auth-flow
+```
+
+Do the same to isolate a campaign (`burpwn group new xss-fuzz-search-param
+--description '...'`). Names are unique per workspace and `group new` is
+idempotent — re-running it returns the same group and updates its description,
+so it is safe to call before every `group add`. Deleting a group never deletes
+flows.
+
 ## CLI vs MCP
 
 - **CLI / hook (default):** use the commands above, or rely on the `init` hook.
-- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 31 tools
+- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 36 tools
   over stdio — the full loop is usable MCP-only, no shell needed. Session/query:
   `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
   `req_search`, `workspace_list`, `workspace_new`, `tag_list`, `tag_add`,
-  `note_add`, `match_replace_list`, `match_replace_add`, `exec`. Repeater/Intruder:
+  `note_add`, `match_replace_list`, `match_replace_add`, `exec`. Organize:
+  `group_new`, `group_add`, `group_list`, `group_show`, `group_rm` (named
+  collections of flows: a reconstructed auth scenario, one fuzzing campaign).
+  Repeater/Intruder:
   `req_replay` (Repeater parity — replay/edit stored flows), `fuzz`, `fuzz_list`,
   `fuzz_results`. Analysis: `compare`, `encode`, `decode`. Auth: `session_auth_set`,
   `session_auth_refresh`, `session_auth_status`. Interception: `intercept_enable`,

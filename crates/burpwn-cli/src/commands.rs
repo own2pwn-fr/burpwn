@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use burpwn_error::ErrorCode;
 use burpwn_sandbox::{deep_probe, doctor, RootlessRuntime, SandboxRuntime};
-use burpwn_store::model::{FlowFilter, MatchKind, NewMatchReplaceRule, Protocol};
+use burpwn_store::model::{FlowFilter, Group, MatchKind, NewMatchReplaceRule, Protocol};
 use burpwn_store::Store;
 use burpwn_tls::CertAuthority;
 use burpwn_wrap::{install, install_global, Agent, WrapConfig};
@@ -71,6 +71,7 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::Workspace { action } => cmd_workspace(&out, paths, action).await,
         Command::Tag { action } => cmd_tag(&out, paths, action).await,
         Command::Note { action } => cmd_note(&out, paths, action).await,
+        Command::Group { action } => cmd_group(&out, paths, action).await,
         Command::Export { action } => cmd_export(&out, paths, action),
         Command::Fuzz { action } => cmd_fuzz(&out, paths, action).await,
         Command::Compare(args) => cmd_compare(&out, paths, args),
@@ -1325,8 +1326,15 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
             }
         }
     };
+    // Same posture for `--group`: an unknown NAME is a mistake, not an empty
+    // listing. Scoped to `--workspace` when both are given.
+    let group_id = match &args.group {
+        None => None,
+        Some(name) => Some(resolve_group(&store, name, workspace_id)?.id),
+    };
     let filter = FlowFilter {
         workspace_id,
+        group_id,
         host_contains: args.host,
         status: args.status,
         method: args.method,
@@ -1345,23 +1353,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
     } else if rows.is_empty() {
         println!("(no flows)");
     } else {
-        for r in &rows {
-            println!(
-                "{:>6}  {:<5} {:<4} {}://{}{}  -> {}",
-                r.id,
-                r.protocol.as_str(),
-                r.method.as_deref().unwrap_or("-"),
-                r.scheme,
-                r.authority
-                    .as_deref()
-                    .or(r.sni.as_deref())
-                    .unwrap_or(&r.dst_ip),
-                r.path.as_deref().unwrap_or(""),
-                r.status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "-".into()),
-            );
-        }
+        print_flow_rows(&rows);
     }
     Ok(0)
 }
@@ -1854,16 +1846,223 @@ async fn cmd_note(out: &Output, paths: &Paths, action: NoteAction) -> Result<i32
     Ok(0)
 }
 
+// --- group (named collections of flows) ------------------------------------
+
+/// Resolve a `--workspace` value that may be a NAME or a numeric id. An unknown
+/// value is an error rather than a silent fallback to the default workspace:
+/// putting a group somewhere the user did not ask for is worse than refusing.
+fn resolve_workspace_ref(store: &Store, value: &str) -> Result<i64> {
+    let workspaces = store.reader().list_workspaces()?;
+    if let Some(w) = workspaces.iter().find(|w| w.name == value) {
+        return Ok(w.id);
+    }
+    if let Ok(id) = value.parse::<i64>() {
+        if let Some(w) = workspaces.iter().find(|w| w.id == id) {
+            return Ok(w.id);
+        }
+    }
+    crate::fail!(ErrorCode::WorkspaceNotFound, "no such workspace: {value}");
+}
+
+/// Resolve a group NAME (optionally scoped to a workspace) to its row, failing
+/// with `GroupNotFound` when there is none.
+fn resolve_group(store: &Store, name: &str, workspace_id: Option<i64>) -> Result<Group> {
+    match store.reader().group_by_name(name, workspace_id)? {
+        Some(g) => Ok(g),
+        None => crate::fail!(ErrorCode::GroupNotFound, "no such group: {name}"),
+    }
+}
+
+/// Print flow summary rows, one per line — shared by `req list` and
+/// `group show` so a group renders exactly like the listing it came from.
+fn print_flow_rows(rows: &[burpwn_store::model::FlowRow]) {
+    for r in rows {
+        println!(
+            "{:>6}  {:<5} {:<4} {}://{}{}  -> {}",
+            r.id,
+            r.protocol.as_str(),
+            r.method.as_deref().unwrap_or("-"),
+            r.scheme,
+            r.authority
+                .as_deref()
+                .or(r.sni.as_deref())
+                .unwrap_or(&r.dst_ip),
+            r.path.as_deref().unwrap_or(""),
+            r.status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
+    }
+}
+
+async fn cmd_group(out: &Output, paths: &Paths, action: GroupAction) -> Result<i32> {
+    let session = paths.active_session();
+    let store = open_store(paths, &session)?;
+    match action {
+        GroupAction::New {
+            name,
+            description,
+            workspace,
+        } => {
+            let workspace_id = match &workspace {
+                Some(v) => resolve_workspace_ref(&store, v)?,
+                None => burpwn_store::schema::DEFAULT_WORKSPACE_ID,
+            };
+            // `create_group` is a create-or-update (see the store docs), so look
+            // first purely to tell the user WHICH of the two happened.
+            let existed = store
+                .reader()
+                .group_by_name(&name, Some(workspace_id))?
+                .is_some();
+            let id = store
+                .writer()
+                .create_group(
+                    name.clone(),
+                    description.clone(),
+                    workspace_id,
+                    now_millis(),
+                )
+                .await?;
+            let human = if existed {
+                format!("group {name} ({id}) already existed — description updated")
+            } else {
+                format!("created group {name} ({id})")
+            };
+            out.ok(
+                human,
+                json!({
+                    "group_id": id,
+                    "name": name,
+                    "description": description,
+                    "workspace_id": workspace_id,
+                    "created": !existed,
+                }),
+            );
+        }
+        GroupAction::Add { name, flow_id } => {
+            let group = resolve_group(&store, &name, None)?;
+            // Validate every id BEFORE writing any membership, so a typo in the
+            // third id doesn't leave the group half-populated.
+            for id in &flow_id {
+                if !store.reader().flow_exists(*id)? {
+                    crate::fail!(ErrorCode::InputNoSuchFlow, "no such flow: {id}");
+                }
+            }
+            for id in &flow_id {
+                store.writer().add_flow_to_group(*id, group.id).await?;
+            }
+            out.ok(
+                format!("added {} flow(s) to group {name}", flow_id.len()),
+                json!({ "group_id": group.id, "name": name, "flow_ids": flow_id }),
+            );
+        }
+        GroupAction::RmFlow { name, flow_id } => {
+            let group = resolve_group(&store, &name, None)?;
+            for id in &flow_id {
+                store.writer().remove_flow_from_group(*id, group.id).await?;
+            }
+            out.ok(
+                format!("removed {} flow(s) from group {name}", flow_id.len()),
+                json!({ "group_id": group.id, "name": name, "flow_ids": flow_id }),
+            );
+        }
+        GroupAction::List { workspace } => {
+            let workspace_id = match &workspace {
+                Some(v) => Some(resolve_workspace_ref(&store, v)?),
+                None => None,
+            };
+            let reader = store.reader();
+            let groups = reader.list_groups(workspace_id)?;
+            let mut view = Vec::with_capacity(groups.len());
+            for g in &groups {
+                let count = reader.group_flow_count(g.id)?;
+                view.push(json!({
+                    "id": g.id,
+                    "name": g.name,
+                    "description": g.description,
+                    "workspace_id": g.workspace_id,
+                    "created_at": g.created_at,
+                    "flow_count": count,
+                }));
+            }
+            if out.json {
+                println!("{}", Envelope::ok(json!({ "groups": view })).to_json_line());
+            } else if groups.is_empty() {
+                println!("(no groups)");
+            } else {
+                for (g, v) in groups.iter().zip(&view) {
+                    let count = v["flow_count"].as_i64().unwrap_or(0);
+                    println!("{:>4} {} ({count} flows)", g.id, g.name);
+                    if let Some(d) = &g.description {
+                        println!("      {d}");
+                    }
+                }
+            }
+        }
+        GroupAction::Show { name } => {
+            let group = resolve_group(&store, &name, None)?;
+            let rows = store.reader().flows_in_group(group.id)?;
+            if out.json {
+                println!(
+                    "{}",
+                    Envelope::ok(json!({
+                        "group": {
+                            "id": group.id,
+                            "name": group.name,
+                            "description": group.description,
+                            "workspace_id": group.workspace_id,
+                            "created_at": group.created_at,
+                        },
+                        "flows": rows,
+                        "count": rows.len(),
+                    }))
+                    .to_json_line()
+                );
+            } else {
+                if let Some(d) = &group.description {
+                    println!("{}: {d}", group.name);
+                }
+                if rows.is_empty() {
+                    println!("(no flows in group {name})");
+                } else {
+                    print_flow_rows(&rows);
+                }
+            }
+        }
+        GroupAction::Rm { name } => {
+            let group = resolve_group(&store, &name, None)?;
+            store.writer().delete_group(group.id).await?;
+            out.ok(
+                format!("deleted group {name} ({})", group.id),
+                json!({ "group_id": group.id, "name": name }),
+            );
+        }
+    }
+    Ok(0)
+}
+
 // --- export ----------------------------------------------------------------
 
 fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> {
     let session = paths.active_session();
     match action {
-        ExportAction::Har { workspace, output } => {
+        ExportAction::Har {
+            workspace,
+            group,
+            output,
+        } => {
             let store = open_store(paths, &session)?;
+            // `--group NAME` exports exactly one named scenario. It is exclusive
+            // with `--workspace` (clap enforces that), so the group's own
+            // workspace scopes the export.
+            let group_id = match &group {
+                None => None,
+                Some(name) => Some(resolve_group(&store, name, None)?.id),
+            };
             let reader = store.reader();
             let rows = reader.list_flows(&FlowFilter {
                 workspace_id: workspace,
+                group_id,
                 limit: Some(100_000),
                 ..Default::default()
             })?;
@@ -2377,6 +2576,159 @@ mod tests {
         assert_eq!(v["exec_id"], "e1");
     }
 
+    /// The `group` command tree end to end: create (idempotent), populate,
+    /// filter `req list` through it, export it, and delete it without losing a
+    /// single capture. Also pins the two failure modes an agent will hit —
+    /// unknown group NAME and unknown flow id — to their catalogue codes.
+    #[tokio::test]
+    async fn group_command_tree_roundtrip_and_coded_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let fid = populate(&paths, "default").await;
+        let out = Output::new(false);
+
+        // Unknown group name → BW-SESSION-005, not an empty listing.
+        let err = cmd_group(
+            &out,
+            &paths,
+            GroupAction::Show {
+                name: "auth-flow".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::GroupNotFound);
+
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::New {
+                name: "auth-flow".into(),
+                description: Some("login form -> POST /login".into()),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Re-creating the same name succeeds (idempotent) instead of erroring.
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::New {
+                name: "auth-flow".into(),
+                description: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // An unknown --workspace is refused rather than silently defaulting.
+        let err = cmd_group(
+            &out,
+            &paths,
+            GroupAction::New {
+                name: "elsewhere".into(),
+                description: None,
+                workspace: Some("no-such-workspace".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::WorkspaceNotFound
+        );
+
+        // A bogus flow id fails the whole add.
+        let err = cmd_group(
+            &out,
+            &paths,
+            GroupAction::Add {
+                name: "auth-flow".into(),
+                flow_id: vec![fid, 4242],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::InputNoSuchFlow);
+
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::Add {
+                name: "auth-flow".into(),
+                flow_id: vec![fid],
+            },
+        )
+        .await
+        .unwrap();
+
+        // The group now filters `req list` and scopes a HAR export.
+        let store = open_store(&paths, "default").unwrap();
+        let group = resolve_group(&store, "auth-flow", None).unwrap();
+        assert_eq!(store.reader().group_flow_count(group.id).unwrap(), 1);
+        let listed = store
+            .reader()
+            .list_flows(&FlowFilter {
+                group_id: Some(group.id),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, fid);
+        let har_out = dir.path().join("group.har");
+        let code = cmd_export(
+            &out,
+            &paths,
+            ExportAction::Har {
+                workspace: None,
+                group: Some("auth-flow".into()),
+                output: Some(har_out.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let har: Value = serde_json::from_slice(&std::fs::read(&har_out).unwrap()).unwrap();
+        assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 1);
+
+        // Removing the flow, then the group, leaves the capture untouched.
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::RmFlow {
+                name: "auth-flow".into(),
+                flow_id: vec![fid],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.reader().group_flow_count(group.id).unwrap(), 0);
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::Rm {
+                name: "auth-flow".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(store
+            .reader()
+            .group_by_name("auth-flow", None)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .reader()
+                .list_flows(&FlowFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn har_export_has_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -2534,6 +2886,7 @@ mod tests {
             &paths,
             ExportAction::Har {
                 workspace: None,
+                group: None,
                 output: Some(link.to_string_lossy().into_owned()),
             },
         )
@@ -2552,6 +2905,7 @@ mod tests {
             &paths,
             ExportAction::Har {
                 workspace: None,
+                group: None,
                 output: Some(plain.to_string_lossy().into_owned()),
             },
         )

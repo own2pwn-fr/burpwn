@@ -135,12 +135,16 @@ pub enum WriteOp {
         /// Reply with the note id.
         reply: IdReply,
     },
-    /// Create a group; replies with the group id.
+    /// Create (or update the description of) a group; replies with the group id.
     CreateGroup {
-        /// Group name.
+        /// Group name (unique within the workspace).
         name: String,
+        /// What the collection means; `None` leaves an existing description as is.
+        description: Option<String>,
         /// Owning workspace.
         workspace_id: i64,
+        /// Creation timestamp (unix millis); ignored when the group exists.
+        created_at: i64,
         /// Reply with the group id.
         reply: IdReply,
     },
@@ -148,6 +152,23 @@ pub enum WriteOp {
     AddFlowToGroup {
         /// Target flow.
         flow_id: i64,
+        /// Group id.
+        group_id: i64,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
+    },
+    /// Remove a flow from a group (the flow and the group both survive).
+    RemoveFlowFromGroup {
+        /// Target flow.
+        flow_id: i64,
+        /// Group id.
+        group_id: i64,
+        /// Optional completion ack.
+        reply: Option<AckReply>,
+    },
+    /// Delete a group. Its memberships go with it (`flow_groups` cascades); the
+    /// flows themselves are untouched.
+    DeleteGroup {
         /// Group id.
         group_id: i64,
         /// Optional completion ack.
@@ -452,15 +473,68 @@ impl WriteHandle {
     }
 
     /// Create a group, awaiting its id.
-    pub async fn create_group(&self, name: impl Into<String>, workspace_id: i64) -> Result<i64> {
+    ///
+    /// IDEMPOTENT create-or-update, like [`WriteHandle::tag_flow`]: re-creating an
+    /// existing `(workspace_id, name)` returns the SAME id instead of erroring,
+    /// and a non-`None` `description` overwrites the stored one (passing `None`
+    /// keeps it). An agent that re-runs its own bookkeeping — or two agents
+    /// racing on the same scenario name — converges on one group rather than
+    /// failing halfway through a capture.
+    pub async fn create_group(
+        &self,
+        name: impl Into<String>,
+        description: Option<String>,
+        workspace_id: i64,
+        created_at: i64,
+    ) -> Result<i64> {
         let (reply, rx) = oneshot::channel();
         self.send(WriteOp::CreateGroup {
             name: name.into(),
+            description,
             workspace_id,
+            created_at,
             reply,
         })
         .await?;
         recv_id(rx).await
+    }
+
+    /// Add a flow to a group, awaiting ack. Re-adding a flow already in the
+    /// group is a no-op (the membership PK absorbs it).
+    pub async fn add_flow_to_group(&self, flow_id: i64, group_id: i64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::AddFlowToGroup {
+            flow_id,
+            group_id,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
+    /// Remove a flow from a group, awaiting ack. Removing a flow that is not a
+    /// member succeeds (deleting nothing).
+    pub async fn remove_flow_from_group(&self, flow_id: i64, group_id: i64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::RemoveFlowFromGroup {
+            flow_id,
+            group_id,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
+    }
+
+    /// Delete a group, awaiting ack. Only the grouping goes away — the flows it
+    /// held stay in the session.
+    pub async fn delete_group(&self, group_id: i64) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::DeleteGroup {
+            group_id,
+            reply: Some(reply),
+        })
+        .await?;
+        recv_ack(rx).await
     }
 
     /// Insert a match/replace rule, awaiting its id.
@@ -745,10 +819,18 @@ fn handle_op(conn: &Connection, op: WriteOp) {
         }
         WriteOp::CreateGroup {
             name,
+            description,
             workspace_id,
+            created_at,
             reply,
         } => {
-            let _ = reply.send(do_create_group(conn, &name, workspace_id));
+            let _ = reply.send(do_create_group(
+                conn,
+                &name,
+                description.as_deref(),
+                workspace_id,
+                created_at,
+            ));
         }
         WriteOp::AddFlowToGroup {
             flow_id,
@@ -763,6 +845,31 @@ fn handle_op(conn: &Connection, op: WriteOp) {
             )
             .map(|_| ())
             .map_err(Into::into),
+        ),
+        WriteOp::RemoveFlowFromGroup {
+            flow_id,
+            group_id,
+            reply,
+        } => ack(
+            reply,
+            conn.execute(
+                "DELETE FROM flow_groups WHERE flow_id = ?1 AND group_id = ?2",
+                rusqlite::params![flow_id, group_id],
+            )
+            .map(|_| ())
+            .map_err(Into::into),
+        ),
+        WriteOp::DeleteGroup { group_id, reply } => ack(
+            reply,
+            // Drop the memberships explicitly: `flow_groups` cascades from
+            // `groups`, but only while `PRAGMA foreign_keys` is on, and a
+            // dangling membership would resurrect the group's contents if the
+            // id were ever reused.
+            (|| -> Result<()> {
+                conn.execute("DELETE FROM flow_groups WHERE group_id = ?1", [group_id])?;
+                conn.execute("DELETE FROM groups WHERE id = ?1", [group_id])?;
+                Ok(())
+            })(),
         ),
         WriteOp::CreateWorkspace {
             name,
@@ -1025,12 +1132,32 @@ fn do_add_note(conn: &Connection, flow_id: i64, body: &str, ts: i64) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
-fn do_create_group(conn: &Connection, name: &str, workspace_id: i64) -> Result<i64> {
+/// Create-or-update a group, keyed on the unique `(workspace_id, name)` pair.
+///
+/// Idempotent by design (see [`WriteHandle::create_group`]): on conflict only a
+/// non-NULL `description` overwrites the stored one, so re-creating a group to
+/// add flows to it never blanks the prose that says what it means. The id is
+/// re-read rather than taken from `last_insert_rowid`, which is not updated by a
+/// `DO UPDATE`/`DO NOTHING` branch.
+fn do_create_group(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+    workspace_id: i64,
+    created_at: i64,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO groups(name, workspace_id) VALUES (?1, ?2)",
-        rusqlite::params![name, workspace_id],
+        "INSERT INTO groups(name, description, workspace_id, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(workspace_id, name) DO UPDATE SET
+            description = COALESCE(excluded.description, groups.description)",
+        rusqlite::params![name, description, workspace_id, created_at],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id: i64 = conn.query_row(
+        "SELECT id FROM groups WHERE workspace_id = ?1 AND name = ?2",
+        rusqlite::params![workspace_id, name],
+        |r| r.get(0),
+    )?;
+    Ok(id)
 }
 
 fn do_create_workspace(conn: &Connection, name: &str, created_at: i64) -> Result<i64> {
