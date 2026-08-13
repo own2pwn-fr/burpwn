@@ -52,7 +52,9 @@ namespace, so LLM traffic is excluded by construction.
 - **Hooks.** One action applied to every request (or response) matching a scope: add a header the
   client never sent, replace or remove one, set a query parameter, drop the flow — or run a command
   in the sandbox before the request goes out and inject what it prints (a token mint, a request
-  signer), cached for a TTL. A slow or failing hook fails **open**, so it never blocks an engagement.
+  signer), cached for a TTL — a burst of concurrent requests on a cold cache runs the command once
+  and all of them go out carrying its value. A slow or failing hook fails **open**, so it never
+  blocks an engagement.
 - **Agent integration (rtk-style).** `burpwn init` installs the right command-rewrite hook for the
   detected agent (Claude Code / Copilot, Cursor, Gemini CLI, Cline/Roo), plus a generic global shell
   hook so even a custom agent is covered.

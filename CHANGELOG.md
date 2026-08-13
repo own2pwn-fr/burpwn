@@ -5,6 +5,40 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — a cold cache no longer costs the burst its token
+An `exec` hook runs one command at a time for the whole proxy, and the requests that lost that
+race were forwarded **un-hooked, immediately**. On a warm TTL cache nobody ever noticed. On a cold
+one — the first call of a session, the first call after an expiry — a burst of N concurrent API
+requests saw exactly *one* of them get the fresh token and the other N-1 collect a `401`. That is
+precisely the scenario the feature exists to cover, and it was the scenario it failed.
+
+A request that loses the claim now **waits for the winner and reads the value out of the cache**
+instead of going out bare. It never starts a command of its own, so the single-flight and the
+recursion backstop are untouched: still at most one sandbox for the whole proxy, whatever the
+arrival rate.
+
+The reason it did not already work this way is real and is preserved. The request doing the
+waiting may *be* the running command's own traffic — that is the missing-marker case the backstop
+exists for, and the explicit front-end hits it by construction, having no exec id to stamp — in
+which case winner and loser block each other. An earlier attempt at an unbounded wait recreated
+exactly that deadlock and was caught by the end-to-end test. So the wait is **bounded**:
+- at most 5 s, and never more than **half** the hook's own `--timeout` (10 s by default, so the
+  ceiling is the full 5 s). Strictly under the winner's budget is the point: a wait that can
+  consume the whole timeout starves the winner it is waiting for, and bounds nothing useful.
+- waiting is skipped entirely when it provably cannot pay — a hook with `--ttl 0` publishes
+  nothing a waiter could read, and a command minting a *different* hook's value is no use either.
+  Both fail open on the spot, exactly as before. That is also why the recursion tests still assert
+  *milliseconds*, not the bound.
+- on expiry the request is forwarded un-hooked and says so at `WARN`, distinguishing "the command
+  did not finish in time" from "it finished and cached nothing" (it failed, or its `--extract` did
+  not match). Fail-open is still the contract; it just stopped being the *first* answer.
+
+The pathological case therefore degrades from a deadlock to a stall with a ceiling, and the normal
+case — which is every burst on a cold cache — now gets what it asked for. Tests: eight concurrent
+requests through the live proxy come back with the same token and one command run; the winner
+failing makes the losers fail open without re-running anything; and a command whose own re-entrant
+traffic waits on itself gives up at the bound with the winner still inside its timeout.
+
 ### Changed — output has a shape now, and it depends on who is reading
 Every command wrote its output with `println!` and a hard-coded width: 123 of them in
 `commands.rs`, thirty-one of which open-coded their own `if json { … } else { … }`. There were two
@@ -92,9 +126,10 @@ then let it go — had no expression at all.
   every connection it opens: any flow carrying it bypasses the engine entirely — every hook, both
   phases. That is a property of the connection, not a timing window, so it cannot be raced. Second,
   as a backstop for the case where the marker is somehow absent, **at most one hook command runs at
-  a time for the whole proxy**: a request that would need to start another one is forwarded
-  un-hooked *immediately* rather than parked behind it, because waiting is exactly what turns a
-  recursion into a stall. That invariant doubles as the single-flight the TTL cache wants — a burst
+  a time for the whole proxy**: a request that would need to start another one never spawns beside
+  it — it reads the running command's value or is forwarded un-hooked (see the bounded wait above,
+  because waiting *without* a bound is exactly what turns a recursion into a stall). That invariant
+  doubles as the single-flight the TTL cache wants — a burst
   of requests on a cold cache mints one value, not one sandbox each. An end-to-end test drives a
   hook whose command makes a real HTTP request through the very proxy running it, and asserts the
   command runs once and the whole thing finishes in milliseconds rather than at the timeout.

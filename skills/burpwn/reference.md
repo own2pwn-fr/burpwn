@@ -262,9 +262,14 @@ have one.
 
 Notes: hooks run after match/replace and before the intercept, on both phases.
 `exec` hooks run **one command at a time for the whole proxy** — a second request
-that needs a fresh value while one is running is forwarded un-hooked rather than
-queued behind it (that is also what stops a hook whose command talks to the
-target from triggering itself). Repeater (`req replay`) and Intruder (`fuzz`)
+that needs a fresh value while one is running never starts its own command. It
+waits for the running one and reads the value out of the TTL cache, so a burst on
+a cold cache mints ONE value and every request in it is hooked. That wait is
+bounded (5 s, and never more than half `--timeout`) because the waiting request
+may be the command's OWN traffic, which is how a hook whose command talks to the
+target is stopped from triggering itself; on expiry the request is forwarded
+un-hooked. With `--ttl 0` nothing is cached, so there is nothing to wait for and
+the loser is forwarded un-hooked at once. Repeater (`req replay`) and Intruder (`fuzz`)
 apply the **declarative** hooks only; they have no sandbox, and 500 fuzz requests
 must not be 500 commands.
 

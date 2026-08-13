@@ -251,7 +251,9 @@ Scope with `--host/--method/--path` (and `--status` on `--phase post-response`);
 `--action` is `add-header|set-header|remove-header|set-query-param|drop|exec`. A
 slow or failing `exec` hook FAILS OPEN — the traffic goes through un-hooked — and
 only one hook command runs at a time, so a hook whose command talks to the target
-cannot trigger itself. `req replay` and `fuzz` apply the declarative hooks only.
+cannot trigger itself; concurrent requests on a cold `--ttl` wait for that one
+command (bounded) and are all hooked with its value. `req replay` and `fuzz`
+apply the declarative hooks only.
 
 ## Organize: workspaces, groups, tags, notes, export
 
