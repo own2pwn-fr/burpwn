@@ -428,6 +428,11 @@ pub struct CompareParams {
     /// What to diff: `headers`, `body`, or `all` (default).
     #[serde(default)]
     pub what: Option<String>,
+    /// Max body-diff lines per side. Absent or `0` = 200; a negative value
+    /// lifts the cap entirely. When lines are cut, the reply carries
+    /// `body.truncated`.
+    #[serde(default)]
+    pub max_lines: Option<i64>,
 }
 
 /// `encode` / `decode` — byte transforms.

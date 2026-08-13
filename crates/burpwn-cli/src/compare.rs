@@ -5,9 +5,23 @@
 //! also runs a reflection check — tokens drawn from flow A's *request* that
 //! appear verbatim in flow B's *response* body — a cheap signal for reflection /
 //! IDOR / auth-bypass reasoning (e.g. A's id reflected in B's response).
+//!
+//! [`diff_flows`] itself is complete and uncapped — it is what the `compare`
+//! CLI command shows a human, who asked for the diff and wants all of it.
+//! Capping is a separate, explicit step ([`cap_body_lines`]) applied by the MCP
+//! tool, whose reader pays per line for the rest of the conversation.
 
 use burpwn_store::model::FlowDetail;
 use serde_json::{json, Value};
+
+/// Default ceiling on `body.only_in_a` / `only_in_b` lines per side, for the
+/// callers that cap at all (the MCP tool — see [`cap_body_lines`]).
+///
+/// Two HTML pages that differ share almost no lines, so a diff of them is
+/// naturally thousands of lines long. Two hundred is enough to see WHAT changed
+/// and to reason about it; past that an agent is paying for a page it will not
+/// read, on every turn it keeps the reply in context.
+pub const DEFAULT_MAX_BODY_LINES: usize = 200;
 
 /// Which parts of the flows to diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +109,52 @@ pub fn diff_flows(a: &FlowDetail, b: &FlowDetail, what: CompareWhat) -> Value {
     }
 
     out
+}
+
+/// Resolve a caller-supplied line cap into the one [`cap_body_lines`] takes.
+///
+/// Absent or `0` is the default cap: the caller said nothing, so it gets the
+/// budget rather than the firehose. A NEGATIVE value is the explicit "give me
+/// everything" — deliberately not spelled `0`, so that "I did not think about
+/// it" and "I want the whole diff" can never be the same request.
+pub fn resolve_max_lines(requested: Option<i64>) -> usize {
+    match requested {
+        None | Some(0) => DEFAULT_MAX_BODY_LINES,
+        Some(n) if n < 0 => 0,
+        Some(n) => n as usize,
+    }
+}
+
+/// Truncate the per-side body line lists of a [`diff_flows`] result to
+/// `max_lines` each (`0` = no cap), marking what was cut.
+///
+/// Truncation is never silent: a side that lost lines is reported under
+/// `body.truncated.<side> = { shown, total }`, and the `truncated` object only
+/// exists when something was actually cut — a reader that does not see it knows
+/// it is holding the whole diff, and one that does knows exactly how much it is
+/// missing and can ask again with a bigger `max_lines`.
+pub fn cap_body_lines(v: &mut Value, max_lines: usize) {
+    if max_lines == 0 {
+        return;
+    }
+    let Some(body) = v.get_mut("body").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let mut marks = serde_json::Map::new();
+    for side in ["only_in_a", "only_in_b"] {
+        let Some(lines) = body.get_mut(side).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let total = lines.len();
+        if total <= max_lines {
+            continue;
+        }
+        lines.truncate(max_lines);
+        marks.insert(side.into(), json!({ "shown": max_lines, "total": total }));
+    }
+    if !marks.is_empty() {
+        body.insert("truncated".into(), Value::Object(marks));
+    }
 }
 
 /// Parse a raw `Name: value\r\n` header block into ordered pairs.
@@ -308,6 +368,67 @@ mod tests {
         assert_eq!(v["body"]["identical"], false);
         // Headers omitted when what=body.
         assert!(v.get("headers").is_none());
+    }
+
+    /// A body diff of two HTML pages is thousands of lines; the capped reply
+    /// must say so instead of quietly handing back a prefix.
+    #[test]
+    fn body_lines_are_capped_with_an_explicit_marker() {
+        let big_a: Vec<u8> = (0..500)
+            .map(|i| format!("a-line-{i}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let big_b: Vec<u8> = (0..10)
+            .map(|i| format!("b-line-{i}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let a = flow(1, "/", b"", 200, b"", &big_a);
+        let b = flow(2, "/", b"", 200, b"", &big_b);
+
+        let mut v = diff_flows(&a, &b, CompareWhat::Body);
+        cap_body_lines(&mut v, DEFAULT_MAX_BODY_LINES);
+        assert_eq!(v["body"]["only_in_a"].as_array().unwrap().len(), 200);
+        assert_eq!(v["body"]["truncated"]["only_in_a"]["shown"], 200);
+        assert_eq!(v["body"]["truncated"]["only_in_a"]["total"], 500);
+        // The side that fits is untouched AND unmarked: the marker means "there
+        // is more", so it must never appear where there is not.
+        assert_eq!(v["body"]["only_in_b"].as_array().unwrap().len(), 10);
+        assert!(v["body"]["truncated"].get("only_in_b").is_none());
+        // The lines that survive are the FIRST ones, in order.
+        assert_eq!(v["body"]["only_in_a"][0], "a-line-0");
+
+        // Under the cap, nothing is marked at all.
+        let small = flow(3, "/", b"", 200, b"", b"one\ntwo\n");
+        let mut v = diff_flows(&small, &b, CompareWhat::Body);
+        cap_body_lines(&mut v, DEFAULT_MAX_BODY_LINES);
+        assert!(
+            v["body"].get("truncated").is_none(),
+            "no marker when there is nothing to say: {v}"
+        );
+
+        // And the cap can be lifted, or raised.
+        let mut v = diff_flows(&a, &b, CompareWhat::Body);
+        cap_body_lines(&mut v, 0);
+        assert_eq!(v["body"]["only_in_a"].as_array().unwrap().len(), 500);
+        assert!(v["body"].get("truncated").is_none());
+        let mut v = diff_flows(&a, &b, CompareWhat::Body);
+        cap_body_lines(&mut v, 300);
+        assert_eq!(v["body"]["only_in_a"].as_array().unwrap().len(), 300);
+        assert_eq!(v["body"]["truncated"]["only_in_a"]["total"], 500);
+
+        // `what=headers` has no body at all: capping it is a no-op, not a panic.
+        let mut v = diff_flows(&a, &b, CompareWhat::Headers);
+        cap_body_lines(&mut v, DEFAULT_MAX_BODY_LINES);
+        assert!(v.get("body").is_none());
+    }
+
+    #[test]
+    fn max_lines_resolves_absent_zero_and_negative() {
+        assert_eq!(resolve_max_lines(None), DEFAULT_MAX_BODY_LINES);
+        assert_eq!(resolve_max_lines(Some(0)), DEFAULT_MAX_BODY_LINES);
+        assert_eq!(resolve_max_lines(Some(50)), 50);
+        // Negative is the explicit "no cap", which `cap_body_lines` reads as 0.
+        assert_eq!(resolve_max_lines(Some(-1)), 0);
     }
 
     #[test]

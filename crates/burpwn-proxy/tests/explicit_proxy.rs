@@ -407,6 +407,70 @@ async fn a_post_response_hook_takes_a_streaming_response_off_the_streaming_path(
     assert_eq!(body.as_ref(), b"data: 1\n\ndata: 2\n\n");
 }
 
+/// The cold-TTL burst, end to end: eight concurrent requests through the live
+/// proxy on an empty cache. The command must run ONCE and all eight requests
+/// must reach the origin carrying the token it minted — the seven that lose the
+/// single-flight claim wait for the winner instead of being forwarded un-hooked
+/// into a `401`, which is the whole reason an `exec` hook exists.
+#[tokio::test]
+async fn a_cold_ttl_burst_hooks_every_request_with_one_command() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A token mint: slow enough that the burst genuinely overlaps it.
+    struct SlowMint(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl burpwn_proxy::HookRunner for SlowMint {
+        async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(r#"{"token":"minted-once"}"#.to_string())
+        }
+    }
+
+    let origin = spawn_header_echo_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    handle.hooks().set_runner(Arc::new(SlowMint(calls.clone())));
+    let mut h = hook(
+        1,
+        HookPhase::PreRequest,
+        HookScope::default(),
+        HookAction::Exec {
+            cmd: "mint-a-token".into(),
+            extract: r#""token":"([^"]+)""#.into(),
+            inject: HookInject {
+                kind: HookInjectKind::SetHeader,
+                name: "Authorization".into(),
+                value_template: "Bearer {}".into(),
+            },
+        },
+    );
+    h.ttl_ms = 60_000;
+    handle.hooks().set_hooks(vec![h]);
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        tasks.push(tokio::spawn(async move {
+            request_through_proxy(proxy, origin, "GET", "/api", "").await
+        }));
+    }
+    for t in tasks {
+        let (status, body) = t.await.unwrap();
+        assert_eq!(status, 200);
+        let seen = String::from_utf8(body).unwrap();
+        assert!(
+            seen.contains("authorization: Bearer minted-once"),
+            "every request in the burst must carry the token: {seen}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one command for the whole burst, not one per request"
+    );
+}
+
 /// THE recursion test, end to end through a real proxy: an `exec` hook whose
 /// command itself makes an HTTP request through that same proxy.
 ///

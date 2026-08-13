@@ -262,9 +262,14 @@ have one.
 
 Notes: hooks run after match/replace and before the intercept, on both phases.
 `exec` hooks run **one command at a time for the whole proxy** — a second request
-that needs a fresh value while one is running is forwarded un-hooked rather than
-queued behind it (that is also what stops a hook whose command talks to the
-target from triggering itself). Repeater (`req replay`) and Intruder (`fuzz`)
+that needs a fresh value while one is running never starts its own command. It
+waits for the running one and reads the value out of the TTL cache, so a burst on
+a cold cache mints ONE value and every request in it is hooked. That wait is
+bounded (5 s, and never more than half `--timeout`) because the waiting request
+may be the command's OWN traffic, which is how a hook whose command talks to the
+target is stopped from triggering itself; on expiry the request is forwarded
+un-hooked. With `--ttl 0` nothing is cached, so there is nothing to wait for and
+the loser is forwarded un-hooked at once. Repeater (`req replay`) and Intruder (`fuzz`)
 apply the **declarative** hooks only; they have no sandbox, and 500 fuzz requests
 must not be 500 commands.
 
@@ -320,6 +325,13 @@ for the rest of the conversation: listings omit `null` members, `fuzz_results` d
 `attack_id` it was called with, and `req_show` with `raw: true` returns the verbatim
 `raw_request` / `raw_response` **instead of** the decoded `headers`/`body` (the same bytes twice),
 keeping the decoded method / path / status / timings either way.
+
+`compare` is the one reply whose size the TARGET decides — two HTML pages that differ share almost
+no lines — so its `body.only_in_a` / `only_in_b` are capped at **200 lines per side**. The cut is
+never silent: the reply then carries `body.truncated = {only_in_a|only_in_b: {shown, total}}`, only
+for the sides actually cut and absent entirely when nothing was. Pass a larger `max_lines` for
+more, or a NEGATIVE `max_lines` for the whole diff (`0` or absent = the 200-line default). The
+`burpwn compare` CLI command is not capped: a human asking for a diff gets all of it.
 
 There is deliberately no `session_import` tool: loading a session file that came
 from somewhere else is an operator decision (`burpwn session import`), not

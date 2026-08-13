@@ -49,18 +49,41 @@
 //! 2. **The one-command invariant (bounded, defensive).** If the marker is ever
 //!    missing — a hook command that reaches a *different* burpwn, a front-end
 //!    that loses the exec id — **at most one hook command runs at a time, for
-//!    the whole proxy**. A request that would need to start a second one is
-//!    served fail-open immediately: it never waits on the running one (waiting
-//!    is what turns a recursion into a stall) and never spawns beside it. A
-//!    recursion therefore cannot amplify into N sandboxes; it degrades into one
-//!    logged, un-hooked request.
+//!    the whole proxy**. A request that would need to start a second one never
+//!    spawns beside it: it either reads the running command's result or is
+//!    forwarded un-hooked. A recursion therefore cannot amplify into N
+//!    sandboxes; it degrades into a bounded stall and a logged, un-hooked
+//!    request.
 //!
 //! That invariant doubles as the **single-flight** the TTL cache needs: a burst
 //! of concurrent requests on a cold cache mints ONE value, not one per request.
-//! The price is explicit — the requests that lose the race are forwarded
-//! un-hooked rather than parked behind the winner — and it is why an `exec` hook
-//! wants a `ttl_ms`: with one, the race window is a single command per TTL and
-//! every other request reads the cache.
+//!
+//! # Losing the claim: a BOUNDED wait, not a coin flip
+//!
+//! The requests that lose the claim used to be forwarded un-hooked on the spot,
+//! which quietly defeated the feature exactly where it matters: on a cold TTL,
+//! a burst of N concurrent calls saw ONE request get the fresh token and N-1
+//! take a `401`. So a loser now waits for the winner and then re-reads the
+//! cache — but only under conditions that make waiting both useful and safe:
+//!
+//! - **Only when the winner publishes something it can use.** The handoff
+//!   happens through the TTL cache, so a hook with `ttl_ms == 0` (which caches
+//!   nothing) and a command minting a *different* hook's value are both
+//!   fail-open immediately, as before. Waiting there could only ever wake up to
+//!   the same miss.
+//! - **Only for [`MAX_SINGLE_FLIGHT_WAIT`], and never more than half the hook's
+//!   own `timeout_ms`.** The waiter may BE the winner's own traffic — that is
+//!   the missing-marker case, and the explicit front-end has no exec id to
+//!   stamp — in which case the two block each other until the wait expires. An
+//!   unbounded wait is a deadlock (a previous attempt at one was caught by the
+//!   end-to-end test); a wait capped under the winner's own budget is a stall
+//!   with a ceiling, after which the loser fails open and the winner still has
+//!   half its timeout left to finish and cache.
+//!
+//! With the default `--timeout 10000` the ceiling is the full 5 s; with a
+//! shorter timeout it is half of it. Either way it stays strictly under the
+//! budget the operator gave the command, because a wait that can consume the
+//! whole timeout bounds nothing useful.
 //!
 //! On top of both, every `exec` hook is bounded by its own `timeout_ms` and
 //! FAILS OPEN on expiry or error: a broken hook never breaks traffic, it just
@@ -74,6 +97,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
+use tokio::sync::Notify;
 
 use burpwn_store::model::{Hook, HookAction, HookInject, HookInjectKind, HookPhase, HookScope};
 
@@ -85,6 +109,19 @@ pub const HOOK_EXEC_ID_PREFIX: &str = "hook:";
 
 /// The placeholder an injected value replaces in a template.
 pub const VALUE_PLACEHOLDER: &str = "{}";
+
+/// Hard ceiling on how long a request may be parked on ANOTHER request's hook
+/// command before it gives up and is forwarded un-hooked.
+///
+/// It exists because the request that waits might be the running command's own
+/// traffic (the missing-marker case, see the module docs), and then the two
+/// block each other. The effective wait is `min(this, timeout_ms / 2)`: it must
+/// stay strictly under the winner's own budget, or the winner dies of its
+/// timeout while being waited on and nobody gets a value. Five seconds is sized
+/// on what it is waiting FOR — a token mint is a sandbox plus an HTTPS round
+/// trip, hundreds of milliseconds — and on the default `--timeout 10000`, of
+/// which it is exactly half.
+pub const MAX_SINGLE_FLIGHT_WAIT: Duration = Duration::from_secs(5);
 
 /// Whether this flow was produced by a hook's own command, and must therefore
 /// not be hooked again.
@@ -149,9 +186,14 @@ struct Inner {
     runner: RwLock<Option<Arc<dyn HookRunner>>>,
     /// Extracted values, per hook id, with their TTL deadline.
     cache: Mutex<HashMap<i64, CachedValue>>,
-    /// Whether a hook command is running right now. Claimed with a
-    /// compare-and-swap, so "at most one" is an invariant and not a race.
-    running: AtomicBool,
+    /// WHICH hook's command is running right now, if any. The claim is taken
+    /// under this lock, so "at most one for the whole proxy" is an invariant
+    /// and not a race — and a request that finds it taken can see whose value
+    /// is being minted, which is what decides whether waiting could pay.
+    running: Mutex<Option<i64>>,
+    /// Signalled when a command releases the claim, so the requests parked on
+    /// it wake on the value rather than on their timer.
+    finished: Notify,
 }
 
 /// The proxy-side hook engine. Clone-cheap (internally `Arc`-shared); one
@@ -178,7 +220,8 @@ impl HookEngine {
                 any_post: AtomicBool::new(false),
                 runner: RwLock::new(None),
                 cache: Mutex::new(HashMap::new()),
-                running: AtomicBool::new(false),
+                running: Mutex::new(None),
+                finished: Notify::new(),
             }),
         }
     }
@@ -361,18 +404,11 @@ impl HookEngine {
             return Some(v);
         }
         // Guard 2 + single flight, in one claim: exactly one hook command runs
-        // at a time. Losing the claim means forwarding un-hooked RIGHT NOW —
-        // never waiting for the winner, because a request that waits may well be
-        // the winner's own traffic (a missing marker), and then both are stuck
-        // until the timeout.
-        let Some(_running) = RunGuard::claim(&self.inner) else {
-            tracing::warn!(
-                hook = hook.id,
-                name = %hook.name,
-                "another hook command is already running; forwarding un-hooked \
-                 (single-flight / recursion backstop)"
-            );
-            return None;
+        // at a time. Losing the claim never spawns a second command — it waits
+        // for the winner's value instead, briefly and only when that can work.
+        let _running = match RunGuard::claim(&self.inner, hook.id) {
+            Ok(guard) => guard,
+            Err(holder) => return self.wait_for_running_command(hook, holder, budget).await,
         };
         let runner = self.inner.runner.read().clone();
         let Some(runner) = runner else {
@@ -419,6 +455,73 @@ impl HookEngine {
         Some(value)
     }
 
+    /// This request lost the one-command claim to `holder`. Park it on that
+    /// command — bounded — and read the value it caches, or fail open.
+    ///
+    /// The whole point is the cold-TTL burst: N concurrent calls, one command,
+    /// N hooked requests. Forwarding the losers un-hooked (what this used to do)
+    /// hands them the `401` the hook exists to prevent.
+    async fn wait_for_running_command(
+        &self,
+        hook: &Hook,
+        holder: i64,
+        budget: Duration,
+    ) -> Option<String> {
+        // Two cases where waiting is provably pointless, and therefore stays
+        // immediate fail-open: nothing will be published for us to read.
+        let pointless = if hook.ttl_ms <= 0 {
+            Some("this hook caches nothing (ttl 0), so the running command publishes no value")
+        } else if holder != hook.id {
+            Some("the running command belongs to another hook, whose value this one cannot use")
+        } else {
+            None
+        };
+        let wait = single_flight_wait(budget);
+        if let Some(reason) = pointless.or((wait.is_zero()).then_some("no time left to wait")) {
+            tracing::warn!(
+                hook = hook.id,
+                name = %hook.name,
+                running_hook = holder,
+                reason,
+                "another hook command is already running; forwarding un-hooked \
+                 (single-flight / recursion backstop)"
+            );
+            return None;
+        }
+
+        let notified = self.inner.finished.notified();
+        tokio::pin!(notified);
+        // Register interest BEFORE the last cache read: a winner that finishes
+        // in between then wakes us instead of leaving us on the timer.
+        notified.as_mut().enable();
+        if let Some(v) = self.cached(hook.id) {
+            return Some(v);
+        }
+        let woken = tokio::time::timeout(wait, notified).await.is_ok();
+        // The winner published through the cache, so that is where the answer
+        // is — a loser never runs a command of its own.
+        if let Some(v) = self.cached(hook.id) {
+            return Some(v);
+        }
+        if woken {
+            tracing::warn!(
+                hook = hook.id,
+                name = %hook.name,
+                "the hook command that was already running cached no value \
+                 (it failed, or its extract did not match); forwarding un-hooked"
+            );
+        } else {
+            tracing::warn!(
+                hook = hook.id,
+                name = %hook.name,
+                waited_ms = wait.as_millis(),
+                "waited for the running hook command and it did not finish in time; \
+                 forwarding un-hooked (fail open)"
+            );
+        }
+        None
+    }
+
     fn cached(&self, id: i64) -> Option<String> {
         let mut cache = self.inner.cache.lock();
         match cache.get(&id) {
@@ -432,25 +535,46 @@ impl HookEngine {
     }
 }
 
+/// How long a request may be parked on another request's hook command, given
+/// that request's own budget.
+///
+/// Half the budget, capped at [`MAX_SINGLE_FLIGHT_WAIT`]. Halving is what keeps
+/// the pathological case survivable: if the waiter turns out to be the winner's
+/// own traffic, the winner is blocked for exactly this long and must still have
+/// enough of its timeout left to run. A wait equal to the timeout would bound
+/// the stall on paper and starve every winner in practice.
+fn single_flight_wait(budget: Duration) -> Duration {
+    MAX_SINGLE_FLIGHT_WAIT.min(budget / 2)
+}
+
 /// The exclusive right to run a hook command, released on drop — including when
 /// the future is CANCELLED by the hook timeout, which is why this is a guard and
 /// not a flag cleared at the end of the happy path.
 struct RunGuard(Arc<Inner>);
 
 impl RunGuard {
-    /// Take the right, or `None` if another command holds it.
-    fn claim(inner: &Arc<Inner>) -> Option<Self> {
-        inner
-            .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()
-            .map(|_| Self(inner.clone()))
+    /// Take the right for `hook_id`, or report WHICH hook already holds it (a
+    /// loser needs to know: only the value it is itself waiting for is worth
+    /// waiting for).
+    fn claim(inner: &Arc<Inner>, hook_id: i64) -> Result<Self, i64> {
+        let mut running = inner.running.lock();
+        match *running {
+            Some(holder) => Err(holder),
+            None => {
+                *running = Some(hook_id);
+                Ok(Self(inner.clone()))
+            }
+        }
     }
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        self.0.running.store(false, Ordering::SeqCst);
+        *self.0.running.lock() = None;
+        // Wake everything parked on this command. Either it cached a value they
+        // can read or it failed — both are answers, and neither is worth
+        // sitting out the rest of the wait for.
+        self.0.finished.notify_waiters();
     }
 }
 
@@ -1077,12 +1201,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2, "re-minted after the TTL");
     }
 
-    /// Eight requests hitting a cold cache at once must mint ONE token, not
-    /// eight sandboxes. The ones that lose the race are forwarded un-hooked
-    /// (never parked behind the winner — see the module docs), and once the
-    /// value is cached every later request gets it without running anything.
+    /// THE cold-cache burst. Eight requests hitting a cold TTL at once must
+    /// mint ONE token, not eight sandboxes — and all EIGHT must go out carrying
+    /// it. Forwarding the seven losers un-hooked (what this used to do) hands
+    /// them exactly the `401` the hook exists to prevent.
     #[tokio::test]
-    async fn concurrent_cache_misses_run_the_command_once_single_flight() {
+    async fn concurrent_cache_misses_run_the_command_once_and_all_get_the_value() {
         let engine = HookEngine::new();
         let calls = Arc::new(AtomicUsize::new(0));
         engine.set_runner(Arc::new(CountingRunner {
@@ -1099,26 +1223,153 @@ mod tests {
                 let mut m = msg();
                 let out = e.pre_request(None, "GET", &mut m).await;
                 assert!(!out.dropped, "a busy hook never drops traffic");
-                out.changed
+                (
+                    out.changed,
+                    String::from_utf8_lossy(&m.headers).into_owned(),
+                )
             }));
         }
-        let injected = {
-            let mut n = 0;
-            for t in tasks {
-                if t.await.unwrap() {
-                    n += 1;
-                }
-            }
-            n
-        };
+        for t in tasks {
+            let (changed, headers) = t.await.unwrap();
+            assert!(changed, "every request in the burst must be hooked");
+            assert!(
+                headers.contains("Authorization: Bearer shared"),
+                "and with the SAME value the winner minted: {headers}"
+            );
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly ONE sandbox");
-        assert!(injected >= 1, "the winner must still be hooked");
 
         // The value is now cached: no further command, and the header lands.
         let mut m = msg();
         assert!(engine.pre_request(None, "GET", &mut m).await.changed);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(String::from_utf8_lossy(&m.headers).contains("Bearer shared"));
+    }
+
+    /// The winner failing must not turn into a retry storm: the losers wake up
+    /// on the released claim, find nothing in the cache and fail open — without
+    /// each running a command of their own.
+    #[tokio::test]
+    async fn when_the_winner_fails_the_losers_fail_open_without_re_running_it() {
+        struct SlowBoom(Arc<AtomicUsize>);
+        #[async_trait]
+        impl HookRunner for SlowBoom {
+            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Err(anyhow::anyhow!("the token endpoint is down"))
+            }
+        }
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_runner(Arc::new(SlowBoom(calls.clone())));
+        engine.set_hooks(vec![token_hook(1, 10_000)]);
+
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let e = engine.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut m = msg();
+                e.pre_request(None, "GET", &mut m).await
+            }));
+        }
+        for t in tasks {
+            let out = t.await.unwrap();
+            assert!(!out.changed && !out.dropped, "fail OPEN, never drop");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a loser must never start a command of its own"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the losers wake on the released claim, not on their timer"
+        );
+    }
+
+    /// The wait must be BOUNDED, because the request doing the waiting can be
+    /// the winner's own traffic: an `exec` command whose marker is missing (the
+    /// explicit front-end has no exec id to stamp) re-enters the engine and
+    /// wants the very value it is itself minting. Nobody can win that, so the
+    /// waiter gives up at `min(MAX_SINGLE_FLIGHT_WAIT, timeout/2)` and the
+    /// winner still has half its budget left to finish.
+    #[tokio::test]
+    async fn a_waiter_that_is_the_winners_own_traffic_stalls_at_most_the_bound() {
+        struct ReEnter {
+            engine: Mutex<Option<HookEngine>>,
+            calls: Arc<AtomicUsize>,
+            nested_ms: Arc<Mutex<u128>>,
+        }
+        #[async_trait]
+        impl HookRunner for ReEnter {
+            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let engine = self.engine.lock().clone().unwrap();
+                let started = Instant::now();
+                let mut m = msg();
+                // No marker, and the SAME hook: this request is waiting for the
+                // command that is waiting for it.
+                let out = engine.pre_request(None, "GET", &mut m).await;
+                *self.nested_ms.lock() = started.elapsed().as_millis();
+                assert!(!out.changed, "the nested request cannot be hooked");
+                Ok(r#"{"token":"outer"}"#.to_string())
+            }
+        }
+
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let nested_ms = Arc::new(Mutex::new(0));
+        engine.set_runner(Arc::new(ReEnter {
+            engine: Mutex::new(Some(engine.clone())),
+            calls: calls.clone(),
+            nested_ms: nested_ms.clone(),
+        }));
+        // ttl > 0, so the waiting path is the one under test; timeout 300 ms, so
+        // the bound is 150 ms and the whole thing fits well inside the budget.
+        let mut h = token_hook(1, 10_000);
+        h.timeout_ms = 300;
+        engine.set_hooks(vec![h]);
+
+        let mut m = msg();
+        let started = Instant::now();
+        let out = engine.pre_request(None, "GET", &mut m).await;
+        let elapsed = started.elapsed();
+        assert!(
+            out.changed,
+            "the outer request must still get its token ({elapsed:?})"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one command run");
+        let nested = *nested_ms.lock();
+        assert!(
+            (100..250).contains(&nested),
+            "the nested request must give up at the bound (~150 ms), got {nested} ms"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "and the winner must finish inside its own timeout ({elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn the_single_flight_wait_stays_under_the_hooks_own_timeout() {
+        // The default hook timeout (10 s) yields the full ceiling…
+        assert_eq!(
+            single_flight_wait(Duration::from_secs(10)),
+            MAX_SINGLE_FLIGHT_WAIT
+        );
+        // …a longer one does not raise it…
+        assert_eq!(
+            single_flight_wait(Duration::from_secs(120)),
+            MAX_SINGLE_FLIGHT_WAIT
+        );
+        // …and a short one is halved, never met.
+        assert_eq!(
+            single_flight_wait(Duration::from_millis(400)),
+            Duration::from_millis(200)
+        );
+        assert!(single_flight_wait(Duration::ZERO).is_zero());
     }
 
     /// GUARD 1. A hook's command runs in the sandbox, so its traffic comes back
@@ -1178,8 +1429,13 @@ mod tests {
     /// GUARD 2. Same setup, but the marker is MISSING (a front-end that lost the
     /// exec id, another burpwn in the path). The one-command invariant must
     /// refuse the nested run outright: no chain of sandboxes, and — the part
-    /// that matters — no stall either, because the nested request is answered
-    /// immediately instead of waiting for the command it is itself blocking.
+    /// that matters — no stall either.
+    ///
+    /// Both hooks here have `ttl 0`, which is what makes the answer IMMEDIATE
+    /// rather than merely bounded: a hook that caches nothing publishes nothing
+    /// a waiter could read, so waiting is skipped entirely. (The bounded wait
+    /// that a `ttl > 0` hook gets in this same shape is covered by
+    /// `a_waiter_that_is_the_winners_own_traffic_stalls_at_most_the_bound`.)
     #[tokio::test]
     async fn a_missing_marker_is_caught_by_the_one_command_backstop() {
         struct ReEnter {
