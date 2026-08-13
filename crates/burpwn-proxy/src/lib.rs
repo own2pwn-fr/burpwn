@@ -392,7 +392,7 @@ impl Proxy {
             std_sock.set_nonblocking(true)?;
             let sock = tokio::net::UdpSocket::from_std(std_sock)?;
             let (ws, exec) = self.flow_attr(&conn);
-            let cfg = crate::dns::DnsConfig::from_host(ws, exec);
+            let cfg = crate::dns::DnsConfig::from_host(ws, exec, self.hooks.clone());
             return crate::dns::serve_socket(sock, cfg, self.writer.clone())
                 .await
                 .map_err(Into::into);
@@ -589,7 +589,8 @@ impl Proxy {
     /// Run the DNS decode/forward UDP server on `addr`, forwarding to the host's
     /// first resolver (or 1.1.1.1).
     pub async fn dns_listener(&self, addr: SocketAddr) -> anyhow::Result<()> {
-        let cfg = dns::DnsConfig::from_host(self.workspace_id, self.exec_id.clone());
+        let cfg =
+            dns::DnsConfig::from_host(self.workspace_id, self.exec_id.clone(), self.hooks.clone());
         dns::serve(addr, cfg, self.writer.clone()).await?;
         Ok(())
     }

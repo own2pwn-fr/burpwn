@@ -19,21 +19,48 @@
 //! namespace) per run — which is why its value is cached per hook and why the
 //! declarative path never touches any of that machinery.
 //!
+//! # The phases, and what an action means on each
+//!
+//! A hook fires on one [`HookPhase`], and a phase decides what the message even
+//! IS. `pre-request`/`post-response` carry an HTTP message: headers, a target, a
+//! status. `ws-c2s`/`ws-s2c` carry one complete WebSocket message. `dns-query`
+//! carries a name and a record type. An `add-header` on a WebSocket frame is not
+//! a no-op waiting to happen, it is a hook nobody could have meant — so
+//! [`burpwn_store::model::HookAction::allowed_on`] answers the pairing once and
+//! the write paths refuse it at `hook add` time.
+//!
+//! The two non-HTTP phase families are also where `exec` stops being available,
+//! and that is a COST decision, not a semantic one: a WebSocket carrying a
+//! thousand messages a second, or a resolver being asked for every name a page
+//! loads, would each turn one hook into a thousand sandboxes — and the
+//! one-command invariant below would serialize the whole proxy behind them. Both
+//! paths are therefore SYNCHRONOUS here, which makes running a command on them
+//! structurally impossible rather than merely forbidden.
+//!
 //! # What is NOT hooked
 //!
-//! Hooks are an HTTP-message primitive: they act on a request before it is
-//! forwarded and on a response before it is returned. Deliberately outside that:
-//!
-//! - **WebSocket frames** (`crate::ws`). After the `101` the proxy splices two
-//!   byte streams; there is no request/response to act on, and a per-frame hook
-//!   is a different feature with a different cost model. The `Upgrade` request
-//!   ITSELF is a normal request and IS hooked — which is what matters for
-//!   authenticating a socket.
-//! - **Raw TCP** (`crate::rawtcp`) and **TLS passthrough** (`crate::passthrough`):
-//!   nothing there is parsed, by design. There is no header to add.
-//! - **DNS** (`crate::dns`): a different protocol entirely.
-//! - `req replay` and `fuzz` run the DECLARATIVE subset only — see
-//!   [`apply_declarative`].
+//! - **Raw TCP** (`crate::rawtcp`). The proxy has the bytes and nothing else:
+//!   the class exists precisely because the stream matched no protocol it can
+//!   parse. There is no message to scope on, no field to edit, and a byte offset
+//!   into an unknown protocol is not something an operator can write down. What
+//!   would act there is match/replace on the raw stream, which is a different
+//!   feature.
+//! - **TLS passthrough** (`crate::passthrough`). Worse than unparsed: the proxy
+//!   never had the plaintext. A passthrough flow is the case where MITM was
+//!   skipped or refused (a pinned certificate), so the bytes on the wire are
+//!   ciphertext under a key burpwn does not hold. No hook — and no match/replace
+//!   either — can touch it. The fix is to make the flow MITM-able, not to hook
+//!   it.
+//! - **WebSocket control frames** (ping/pong/close) and any socket that
+//!   negotiated a `Sec-WebSocket-Extensions` (i.e. `permessage-deflate`): see
+//!   [`HookEngine::ws_message`] and `crate::http`.
+//! - **DNS responses.** Only the QUERY is a phase. Rewriting an answer that came
+//!   back from upstream would mean re-encoding records burpwn did not synthesize
+//!   — CNAME chains, EDNS(0), DNSSEC material — and the case that is actually
+//!   wanted, "force this name to resolve here", is served by answering the query
+//!   instead of asking (see [`HookAction::SetAnswer`]).
+//! - `req replay` and `fuzz` run the DECLARATIVE subset of the HTTP phases only —
+//!   see [`apply_declarative`].
 //!
 //! # Recursion: the guarantee, in two layers
 //!
@@ -112,7 +139,9 @@ use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use tokio::sync::Notify;
 
-use burpwn_store::model::{Hook, HookAction, HookInject, HookInjectKind, HookPhase, HookScope};
+use burpwn_store::model::{
+    Hook, HookAction, HookInject, HookInjectKind, HookPhase, HookScope, WsDirection,
+};
 
 use crate::matchreplace::Message;
 
@@ -175,6 +204,21 @@ pub struct HookOutcome {
     pub dropped: bool,
 }
 
+/// What the `dns-query` hooks decided about one query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsDecision {
+    /// No hook matched: resolve it upstream, exactly as an unhooked proxy does.
+    Resolve,
+    /// A `drop` hook matched. The shim answers `REFUSED` rather than staying
+    /// silent: a client that gets no datagram at all retries and then blames the
+    /// network, whereas an rcode fails fast and is visible in the capture.
+    Refuse,
+    /// A `set-answer` hook matched: answer with this address WITHOUT asking
+    /// upstream — but only if the query type matches the address family, which
+    /// the shim checks (see `crate::dns`).
+    Answer(std::net::IpAddr),
+}
+
 /// Runs a hook's command and returns its stdout.
 ///
 /// The engine deliberately knows nothing about HOW (the sandbox, the session,
@@ -202,9 +246,13 @@ struct Inner {
     /// The current snapshot, in application order.
     hooks: RwLock<Arc<Vec<Hook>>>,
     /// `true` when at least one ENABLED hook exists for that phase. The whole
-    /// hot path is gated on these, so an unconfigured proxy pays one atomic load.
+    /// hot path is gated on these, so an unconfigured proxy pays one atomic
+    /// load — on a WebSocket splice and on a DNS query exactly as on a request.
     any_pre: AtomicBool,
     any_post: AtomicBool,
+    any_ws_c2s: AtomicBool,
+    any_ws_s2c: AtomicBool,
+    any_dns: AtomicBool,
     /// The command runner, installed by the daemon. Absent = `exec` hooks are
     /// skipped (fail-open), which is what the CLI-side `hook test` and the unit
     /// tests rely on.
@@ -243,6 +291,9 @@ impl HookEngine {
                 hooks: RwLock::new(Arc::new(Vec::new())),
                 any_pre: AtomicBool::new(false),
                 any_post: AtomicBool::new(false),
+                any_ws_c2s: AtomicBool::new(false),
+                any_ws_s2c: AtomicBool::new(false),
+                any_dns: AtomicBool::new(false),
                 runner: RwLock::new(None),
                 cache: Mutex::new(HashMap::new()),
                 running: Mutex::new(None),
@@ -260,12 +311,10 @@ impl HookEngine {
     /// the freed rowid straight back, so an id-only check would happily keep
     /// serving the token the PREVIOUS login command minted.
     pub fn set_hooks(&self, hooks: Vec<Hook>) {
-        let any_pre = hooks
-            .iter()
-            .any(|h| h.enabled && h.phase == HookPhase::PreRequest);
-        let any_post = hooks
-            .iter()
-            .any(|h| h.enabled && h.phase == HookPhase::PostResponse);
+        let any = |phase: HookPhase| hooks.iter().any(|h| h.enabled && h.phase == phase);
+        let (any_pre, any_post) = (any(HookPhase::PreRequest), any(HookPhase::PostResponse));
+        let (any_ws_c2s, any_ws_s2c) = (any(HookPhase::WsC2s), any(HookPhase::WsS2c));
+        let any_dns = any(HookPhase::DnsQuery);
         {
             let previous = self.snapshot();
             let mut cache = self.inner.cache.lock();
@@ -284,6 +333,9 @@ impl HookEngine {
         *self.inner.hooks.write() = Arc::new(hooks);
         self.inner.any_pre.store(any_pre, Ordering::Relaxed);
         self.inner.any_post.store(any_post, Ordering::Relaxed);
+        self.inner.any_ws_c2s.store(any_ws_c2s, Ordering::Relaxed);
+        self.inner.any_ws_s2c.store(any_ws_s2c, Ordering::Relaxed);
+        self.inner.any_dns.store(any_dns, Ordering::Relaxed);
     }
 
     /// Install the command runner used by [`HookAction::Exec`].
@@ -297,9 +349,30 @@ impl HookEngine {
         self.inner.hooks.read().clone()
     }
 
-    /// Whether ANY enabled hook exists, either phase. One relaxed atomic load.
+    /// Whether ANY enabled hook exists, any phase. Relaxed atomic loads only.
     pub fn any(&self) -> bool {
-        self.inner.any_pre.load(Ordering::Relaxed) || self.inner.any_post.load(Ordering::Relaxed)
+        self.inner.any_pre.load(Ordering::Relaxed)
+            || self.inner.any_post.load(Ordering::Relaxed)
+            || self.inner.any_ws_c2s.load(Ordering::Relaxed)
+            || self.inner.any_ws_s2c.load(Ordering::Relaxed)
+            || self.inner.any_dns.load(Ordering::Relaxed)
+    }
+
+    /// Whether an enabled hook exists for this WebSocket direction. ONE relaxed
+    /// atomic load, and the gate the splice pump checks per read: a socket on a
+    /// proxy with no `ws-*` hook is spliced exactly as it was before hooks
+    /// existed, byte for byte, and a hook added while it is open still reaches
+    /// it (at the next message boundary).
+    pub fn any_ws(&self, direction: WsDirection) -> bool {
+        match direction {
+            WsDirection::C2s => self.inner.any_ws_c2s.load(Ordering::Relaxed),
+            WsDirection::S2c => self.inner.any_ws_s2c.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether an enabled `dns-query` hook exists. One relaxed atomic load.
+    pub fn any_dns(&self) -> bool {
+        self.inner.any_dns.load(Ordering::Relaxed)
     }
 
     /// Whether an enabled `post-response` hook could fire for this message.
@@ -368,6 +441,117 @@ impl HookEngine {
             status: Some(status),
         };
         self.apply(HookPhase::PostResponse, exec_id, m, msg).await
+    }
+
+    /// Apply the WebSocket hooks of one direction to one COMPLETE message,
+    /// rewriting `payload` in place.
+    ///
+    /// Synchronous on purpose. Every action valid here is a byte edit, `exec` is
+    /// refused at `hook add` time, and keeping this function non-`async` is what
+    /// makes "no command may run per frame" a property of the code rather than a
+    /// rule someone has to remember. It also means the splice pump never awaits
+    /// anything to forward a frame.
+    ///
+    /// `host` and `path` are the UPGRADE request's, so a socket is scoped the
+    /// way the request that opened it is (`--host api.example.com --path /ws`).
+    /// There is no method and no status on a frame: a hook carrying either
+    /// simply never matches, which is why `hook add` refuses them here.
+    ///
+    /// Control frames never reach this — the caller forwards ping/pong/close
+    /// verbatim (see the module docs).
+    pub fn ws_message(
+        &self,
+        exec_id: Option<&str>,
+        direction: WsDirection,
+        host: &str,
+        path: &str,
+        payload: &mut Vec<u8>,
+    ) -> HookOutcome {
+        if !self.any_ws(direction) {
+            return HookOutcome::default();
+        }
+        // Guard 1, as everywhere: a hook command's own socket is never hooked.
+        if is_hook_traffic(exec_id) {
+            return HookOutcome::default();
+        }
+        let phase = match direction {
+            WsDirection::C2s => HookPhase::WsC2s,
+            WsDirection::S2c => HookPhase::WsS2c,
+        };
+        let m = MatchCtx {
+            host,
+            method: "",
+            path,
+            status: None,
+        };
+        let mut out = HookOutcome::default();
+        for hook in self.snapshot().iter() {
+            if !hook.enabled || hook.phase != phase || !scope_matches(&hook.scope, &m) {
+                continue;
+            }
+            match &hook.action {
+                HookAction::Drop => {
+                    out.dropped = true;
+                    return out;
+                }
+                HookAction::ReplacePayload { find, replace } => {
+                    out.changed |= replace_in_payload(payload, find.as_bytes(), replace.as_bytes());
+                }
+                // Refused at `hook add` time; a row that predates the check (or
+                // was written by hand) is skipped LOUDLY rather than silently.
+                other => tracing::warn!(
+                    hook = hook.id,
+                    name = %hook.name,
+                    action = other.kind(),
+                    phase = phase.as_str(),
+                    "this action cannot act on a websocket message; skipping it"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Consult the `dns-query` hooks for one query.
+    ///
+    /// Synchronous, for the same reason as [`Self::ws_message`], and consulted
+    /// only after the [`Self::any_dns`] gate: a proxy with no DNS hook resolves
+    /// exactly as before, having paid one atomic load.
+    ///
+    /// `qname` is the queried name and `qtype` the record type rendered as the
+    /// shim's flow path (`/A`, `/AAAA`, …), so `--host`/`--path` scope a DNS
+    /// hook the same way they read in `req list` (`dns://example.com./A`).
+    pub fn dns_query(&self, exec_id: Option<&str>, qname: &str, qtype_path: &str) -> DnsDecision {
+        if !self.any_dns() {
+            return DnsDecision::Resolve;
+        }
+        // A hook command has to be able to resolve names, or a `dns-query` drop
+        // would make every login macro fail with the hook that needs it.
+        if is_hook_traffic(exec_id) {
+            return DnsDecision::Resolve;
+        }
+        let m = MatchCtx {
+            host: qname,
+            method: "QUERY",
+            path: qtype_path,
+            status: None,
+        };
+        for hook in self.snapshot().iter() {
+            if !hook.enabled || hook.phase != HookPhase::DnsQuery || !scope_matches(&hook.scope, &m)
+            {
+                continue;
+            }
+            match &hook.action {
+                HookAction::Drop => return DnsDecision::Refuse,
+                HookAction::SetAnswer { ip } => return DnsDecision::Answer(*ip),
+                other => tracing::warn!(
+                    hook = hook.id,
+                    name = %hook.name,
+                    action = other.kind(),
+                    "this action cannot act on a dns query; skipping it"
+                ),
+            }
+        }
+        DnsDecision::Resolve
     }
 
     async fn apply(
@@ -815,7 +999,56 @@ fn apply_declarative_action(action: &HookAction, msg: &mut Message) -> (bool, bo
         // An `exec` hook has no declarative form; callers that cannot run
         // commands skip it (see `apply_declarative`).
         HookAction::Exec { .. } => (false, false),
+        // These belong to the WebSocket / DNS phases and cannot be reached from
+        // an HTTP phase: `hook add` refuses the pairing and `apply` filters by
+        // phase before getting here. A row that predates the check still must
+        // not be a silent no-op.
+        other @ (HookAction::ReplacePayload { .. } | HookAction::SetAnswer { .. }) => {
+            tracing::warn!(
+                action = other.kind(),
+                "this action only acts on a websocket or dns phase; skipping it on an HTTP message"
+            );
+            (false, false)
+        }
     }
+}
+
+/// Replace every occurrence of `find` in `payload`, in place. Returns whether
+/// anything changed.
+///
+/// The no-match case — the common one on a socket where only some messages are
+/// interesting — walks the payload once and allocates NOTHING. An empty needle
+/// matches nothing (rather than inserting between every byte).
+fn replace_in_payload(payload: &mut Vec<u8>, find: &[u8], replace: &[u8]) -> bool {
+    if find.is_empty() || find.len() > payload.len() {
+        return false;
+    }
+    let Some(first) = find_bytes(payload, find, 0) else {
+        return false;
+    };
+    let mut out = Vec::with_capacity(payload.len());
+    let mut cursor = 0;
+    let mut at = Some(first);
+    while let Some(pos) = at {
+        out.extend_from_slice(&payload[cursor..pos]);
+        out.extend_from_slice(replace);
+        cursor = pos + find.len();
+        at = find_bytes(payload, find, cursor);
+    }
+    out.extend_from_slice(&payload[cursor..]);
+    *payload = out;
+    true
+}
+
+/// Index of the first occurrence of `needle` in `haystack` at or after `from`.
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
 }
 
 /// Substitute `{}` in the template and apply the injection. Public so the CLI's
@@ -1869,6 +2102,258 @@ mod tests {
         let mut m = msg();
         engine.pre_request(None, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // --- websocket -----------------------------------------------------------
+
+    fn ws_hook(id: i64, phase: HookPhase, action: HookAction) -> Hook {
+        let mut h = hook(id, phase, action);
+        h.scope.host = "chat.example.com".into();
+        h
+    }
+
+    fn replace(find: &str, with: &str) -> HookAction {
+        HookAction::ReplacePayload {
+            find: find.into(),
+            replace: with.into(),
+        }
+    }
+
+    /// The cost of the feature on a socket nobody wrote a hook for: nothing.
+    /// The pump asks this per read, so it has to be an atomic load and a return.
+    #[tokio::test]
+    async fn an_empty_engine_never_touches_a_websocket_message_or_a_dns_query() {
+        let engine = HookEngine::new();
+        assert!(!engine.any_ws(WsDirection::C2s) && !engine.any_ws(WsDirection::S2c));
+        assert!(!engine.any_dns());
+        let mut payload = b"{\"hello\":\"world\"}".to_vec();
+        let before = payload.clone();
+        let out = engine.ws_message(
+            None,
+            WsDirection::C2s,
+            "chat.example.com",
+            "/ws",
+            &mut payload,
+        );
+        assert_eq!(out, HookOutcome::default());
+        assert_eq!(payload, before);
+        assert_eq!(
+            engine.dns_query(None, "example.com.", "/A"),
+            DnsDecision::Resolve
+        );
+
+        // …and a hook on the OTHER direction leaves this one just as untouched.
+        engine.set_hooks(vec![ws_hook(1, HookPhase::WsS2c, HookAction::Drop)]);
+        assert!(!engine.any_ws(WsDirection::C2s));
+        assert!(engine.any_ws(WsDirection::S2c));
+        assert!(
+            !engine
+                .ws_message(
+                    None,
+                    WsDirection::C2s,
+                    "chat.example.com",
+                    "/ws",
+                    &mut payload
+                )
+                .dropped
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ws_hook_rewrites_a_payload_and_scopes_on_the_upgrade_request() {
+        let engine = HookEngine::new();
+        let mut h = ws_hook(
+            1,
+            HookPhase::WsC2s,
+            replace("\"role\":\"user\"", "\"role\":\"admin\""),
+        );
+        h.scope.path = "/socket".into();
+        engine.set_hooks(vec![h]);
+
+        let mut payload = br#"{"role":"user","id":7}"#.to_vec();
+        let out = engine.ws_message(
+            None,
+            WsDirection::C2s,
+            "chat.example.com",
+            "/socket?v=2",
+            &mut payload,
+        );
+        assert!(out.changed && !out.dropped);
+        assert_eq!(payload, br#"{"role":"admin","id":7}"#);
+
+        // Wrong host, wrong path, wrong direction: all untouched.
+        for (host, path, dir) in [
+            ("other.test", "/socket", WsDirection::C2s),
+            ("chat.example.com", "/telemetry", WsDirection::C2s),
+            ("chat.example.com", "/socket", WsDirection::S2c),
+        ] {
+            let mut payload = br#"{"role":"user"}"#.to_vec();
+            let out = engine.ws_message(None, dir, host, path, &mut payload);
+            assert!(!out.changed, "{host}{path} {dir:?}");
+            assert_eq!(payload, br#"{"role":"user"}"#);
+        }
+    }
+
+    /// A frame payload is BYTES. A rewrite has to work on a binary message and
+    /// on every occurrence, and must not allocate when it matches nothing.
+    #[test]
+    fn payload_replacement_is_binary_safe_and_repeats() {
+        let mut p = vec![0x00, 0xff, b'A', b'B', 0x00, b'A', b'B'];
+        assert!(replace_in_payload(&mut p, b"AB", b"XYZ"));
+        assert_eq!(
+            p,
+            vec![0x00, 0xff, b'X', b'Y', b'Z', 0x00, b'X', b'Y', b'Z']
+        );
+
+        // Deleting is replacing with nothing.
+        let mut p = b"keep-DROPME-keep".to_vec();
+        assert!(replace_in_payload(&mut p, b"DROPME", b""));
+        assert_eq!(p, b"keep--keep");
+
+        // No match: unchanged, and the buffer is not even reallocated.
+        let mut p = b"nothing to see".to_vec();
+        let ptr = p.as_ptr();
+        assert!(!replace_in_payload(&mut p, b"absent", b"x"));
+        assert_eq!(p, b"nothing to see");
+        assert_eq!(p.as_ptr(), ptr, "the no-match path must not allocate");
+
+        // Degenerate needles are refused rather than looping.
+        let mut p = b"abc".to_vec();
+        assert!(!replace_in_payload(&mut p, b"", b"x"));
+        assert!(!replace_in_payload(&mut p, b"abcdef", b"x"));
+        assert_eq!(p, b"abc");
+    }
+
+    #[tokio::test]
+    async fn a_ws_drop_stops_the_message_and_the_hooks_after_it() {
+        let engine = HookEngine::new();
+        engine.set_hooks(vec![
+            ws_hook(1, HookPhase::WsC2s, HookAction::Drop),
+            ws_hook(2, HookPhase::WsC2s, replace("a", "b")),
+        ]);
+        let mut payload = b"aaa".to_vec();
+        let out = engine.ws_message(
+            None,
+            WsDirection::C2s,
+            "chat.example.com",
+            "/ws",
+            &mut payload,
+        );
+        assert!(out.dropped);
+        assert_eq!(payload, b"aaa", "hooks after a drop must not run");
+    }
+
+    /// The recursion guard is not an HTTP-only property: a hook command's own
+    /// WebSocket (and its DNS) must come out completely un-hooked, or a `drop`
+    /// on `*` would make every login macro fail on the hook that needs it.
+    #[tokio::test]
+    async fn hook_originated_traffic_is_never_hooked_on_websockets_or_dns() {
+        let engine = HookEngine::new();
+        let mut ws = ws_hook(1, HookPhase::WsC2s, HookAction::Drop);
+        ws.scope.host = String::new();
+        let mut dns = hook(2, HookPhase::DnsQuery, HookAction::Drop);
+        dns.scope = HookScope::default();
+        engine.set_hooks(vec![ws, dns]);
+
+        let mut payload = b"ping".to_vec();
+        assert!(
+            !engine
+                .ws_message(
+                    Some("hook:abc"),
+                    WsDirection::C2s,
+                    "any.host",
+                    "/ws",
+                    &mut payload
+                )
+                .dropped,
+            "a hook command's own socket must not be hooked"
+        );
+        assert_eq!(
+            engine.dns_query(Some("hook:abc"), "login.example.com.", "/A"),
+            DnsDecision::Resolve,
+            "a hook command that cannot resolve cannot run at all"
+        );
+        // The same traffic without the marker IS hooked, so the test proves the
+        // marker and not an inert engine.
+        assert!(
+            engine
+                .ws_message(None, WsDirection::C2s, "any.host", "/ws", &mut payload)
+                .dropped
+        );
+        assert_eq!(
+            engine.dns_query(None, "login.example.com.", "/A"),
+            DnsDecision::Refuse
+        );
+    }
+
+    /// An action stored for the wrong phase (a hand-edited row, a hook written
+    /// by a newer burpwn) is skipped, not half-applied — and never silently: it
+    /// is the case `hook add` refuses, so reaching it means something is wrong.
+    #[tokio::test]
+    async fn an_action_that_cannot_act_on_the_phase_is_skipped_not_guessed() {
+        let engine = HookEngine::new();
+        engine.set_hooks(vec![
+            ws_hook(1, HookPhase::WsC2s, add_ua()),
+            ws_hook(2, HookPhase::WsC2s, replace("x", "y")),
+        ]);
+        let mut payload = b"xx".to_vec();
+        let out = engine.ws_message(
+            None,
+            WsDirection::C2s,
+            "chat.example.com",
+            "/ws",
+            &mut payload,
+        );
+        assert!(out.changed && !out.dropped);
+        assert_eq!(payload, b"yy", "the valid hook still ran");
+
+        // …and the reverse: a ws action stored on an HTTP phase changes nothing.
+        engine.set_hooks(vec![hook(3, HookPhase::PreRequest, replace("api", "evil"))]);
+        let mut m = msg();
+        let before = m.clone();
+        let out = engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(out, HookOutcome::default());
+        assert_eq!(m, before);
+    }
+
+    // --- dns -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_dns_hook_answers_refuses_or_stands_aside_by_scope() {
+        let engine = HookEngine::new();
+        let mut answer = hook(
+            1,
+            HookPhase::DnsQuery,
+            HookAction::SetAnswer {
+                ip: "10.0.0.5".parse().unwrap(),
+            },
+        );
+        answer.scope.host = "internal.example.com".into();
+        let mut refuse = hook(2, HookPhase::DnsQuery, HookAction::Drop);
+        refuse.scope.host = "telemetry.example.com".into();
+        // Scoped on the record type, which is how the capture renders it.
+        let mut aaaa = hook(3, HookPhase::DnsQuery, HookAction::Drop);
+        aaaa.scope.path = "/AAAA".into();
+        engine.set_hooks(vec![answer, refuse, aaaa]);
+
+        assert_eq!(
+            engine.dns_query(None, "internal.example.com.", "/A"),
+            DnsDecision::Answer("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            engine.dns_query(None, "telemetry.example.com.", "/A"),
+            DnsDecision::Refuse
+        );
+        assert_eq!(
+            engine.dns_query(None, "unrelated.test.", "/AAAA"),
+            DnsDecision::Refuse,
+            "the record-type scope matches on its own"
+        );
+        assert_eq!(
+            engine.dns_query(None, "unrelated.test.", "/A"),
+            DnsDecision::Resolve,
+            "everything else resolves as it always did"
+        );
     }
 
     // --- the declarative subset used by replay / fuzz ------------------------

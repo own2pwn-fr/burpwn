@@ -555,3 +555,316 @@ async fn a_hook_command_that_talks_through_the_proxy_does_not_recurse() {
          ({elapsed:?})"
     );
 }
+
+// --- websocket hooks --------------------------------------------------------
+
+/// A WebSocket origin: completes the handshake with tungstenite, echoes every
+/// data message back with an `echo:` prefix, and answers pings the way any
+/// server does (tungstenite's own auto-pong), so the control-frame path is
+/// exercised for real rather than mocked.
+async fn spawn_ws_origin() -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    use tokio_tungstenite::tungstenite::Message as Wm;
+                    let reply = match msg {
+                        Wm::Text(t) => Wm::Text(format!("echo:{t}")),
+                        Wm::Binary(b) => {
+                            let mut out = b"echo:".to_vec();
+                            out.extend_from_slice(&b);
+                            Wm::Binary(out)
+                        }
+                        // Ping / close are tungstenite's own business.
+                        _ => continue,
+                    };
+                    if ws.send(reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A raw WebSocket client speaking through the explicit proxy: the handshake is
+/// written by hand (absolute-form, so the proxy knows the origin) and the frames
+/// are built with the proxy's own encoder, which keeps the test honest about
+/// what is on the wire — masking included.
+struct RawWsClient {
+    stream: TcpStream,
+    framer: burpwn_proxy::ws::Framer,
+    pending: Vec<burpwn_proxy::ws::Emit>,
+}
+
+impl RawWsClient {
+    async fn connect(proxy: SocketAddr, origin: SocketAddr, path: &str) -> RawWsClient {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        let req = format!(
+            "GET http://{origin}{path} HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        // Read exactly to the end of the response headers, so not one frame
+        // byte is swallowed with them.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = stream.read(&mut byte).await.unwrap();
+            assert!(n == 1, "the proxy closed during the handshake");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        RawWsClient {
+            stream,
+            framer: burpwn_proxy::ws::Framer::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Send one complete message, masked as a client must.
+    async fn send(&mut self, opcode: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let wire =
+            burpwn_proxy::ws::encode_frame(opcode, payload, Some(burpwn_proxy::ws::mask_key()));
+        self.stream.write_all(&wire).await.unwrap();
+    }
+
+    /// Send one message split across three frames, to prove the hook path
+    /// reassembles before it decides and does not corrupt what it forwards.
+    async fn send_fragmented(&mut self, parts: [&[u8]; 3]) {
+        use tokio::io::AsyncWriteExt;
+        for (i, part) in parts.iter().enumerate() {
+            let (opcode, fin) = match i {
+                0 => (burpwn_proxy::ws::OP_TEXT, false),
+                2 => (burpwn_proxy::ws::OP_CONTINUATION, true),
+                _ => (burpwn_proxy::ws::OP_CONTINUATION, false),
+            };
+            let key = burpwn_proxy::ws::mask_key();
+            let mut wire = Vec::new();
+            wire.push((if fin { 0x80 } else { 0 }) | opcode);
+            wire.push(0x80 | part.len() as u8);
+            wire.extend_from_slice(&key);
+            wire.extend(part.iter().enumerate().map(|(j, b)| b ^ key[j & 3]));
+            self.stream.write_all(&wire).await.unwrap();
+        }
+    }
+
+    /// The next thing off the socket, or `None` if nothing arrives in `within`.
+    async fn recv(&mut self, within: Duration) -> Option<burpwn_proxy::ws::Emit> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if !self.pending.is_empty() {
+                return Some(self.pending.remove(0));
+            }
+            let mut buf = vec![0u8; 4096];
+            let n = match tokio::time::timeout(within, self.stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(n)) => n,
+            };
+            self.pending.extend(self.framer.push(&buf[..n]));
+        }
+    }
+
+    /// The next DATA payload (control frames skipped).
+    async fn recv_data(&mut self, within: Duration) -> Option<Vec<u8>> {
+        while let Some(emit) = self.recv(within).await {
+            if let burpwn_proxy::ws::Emit::Data { payload, .. } = emit {
+                return Some(payload);
+            }
+        }
+        None
+    }
+
+    /// Whether a ping is still answered — i.e. whether the socket still works.
+    async fn pings(&mut self) -> bool {
+        self.send(burpwn_proxy::ws::OP_PING, b"alive").await;
+        for _ in 0..4 {
+            match self.recv(Duration::from_secs(5)).await {
+                Some(burpwn_proxy::ws::Emit::Control { opcode, .. })
+                    if opcode == burpwn_proxy::ws::OP_PONG =>
+                {
+                    return true
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+/// The ws messages recorded against the (single) ws flow, once there are at
+/// least `at_least` of them.
+async fn recorded_ws(store: &Store, at_least: usize) -> Vec<burpwn_store::model::WsMessage> {
+    let reader = store.reader();
+    for _ in 0..100 {
+        let flows = reader.list_flows(&FlowFilter::default()).unwrap();
+        if let Some(flow) = flows
+            .iter()
+            .find(|f| f.protocol == burpwn_store::model::Protocol::Ws)
+        {
+            let msgs = reader.ws_messages_for_flow(flow.id).unwrap();
+            if msgs.len() >= at_least {
+                return msgs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("expected at least {at_least} recorded websocket messages");
+}
+
+/// The baseline, and the regression guard for everything below: with NO ws hook
+/// the splice is what it always was — the origin sees what the client sent,
+/// control frames work, and both directions land in `ws_messages`.
+#[tokio::test]
+async fn a_websocket_without_hooks_is_spliced_and_captured_unchanged() {
+    let origin = spawn_ws_origin().await;
+    let (proxy, store, _dir, _handle) = spawn_proxy_handle().await;
+
+    let mut client = RawWsClient::connect(proxy, origin, "/socket").await;
+    client
+        .send(burpwn_proxy::ws::OP_TEXT, br#"{"role":"user"}"#)
+        .await;
+    assert_eq!(
+        client.recv_data(Duration::from_secs(5)).await.unwrap(),
+        br#"echo:{"role":"user"}"#,
+        "the origin must see exactly what the client sent"
+    );
+    assert!(client.pings().await, "a ping must still be answered");
+
+    let msgs = recorded_ws(&store, 2).await;
+    assert!(
+        msgs.iter()
+            .any(|m| m.direction == burpwn_store::model::WsDirection::C2s
+                && m.payload == br#"{"role":"user"}"#),
+        "the client message is captured: {msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.direction == burpwn_store::model::WsDirection::S2c
+                && m.payload == br#"echo:{"role":"user"}"#),
+        "and so is the server's answer: {msgs:?}"
+    );
+}
+
+/// The headline WebSocket case: a hook rewrites a message BEFORE the origin
+/// sees it, inside a socket that is already open. No replay can do that — the
+/// message only exists inside a socket the page keeps open — and the origin's
+/// echo is what proves the rewrite went on the wire and not into the capture.
+#[tokio::test]
+async fn a_ws_hook_rewrites_a_message_before_the_origin_sees_it() {
+    let origin = spawn_ws_origin().await;
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle.hooks().set_hooks(vec![hook(
+        1,
+        HookPhase::WsC2s,
+        HookScope {
+            path: "/socket".into(),
+            ..Default::default()
+        },
+        HookAction::ReplacePayload {
+            find: "\"role\":\"user\"".into(),
+            replace: "\"role\":\"admin\"".into(),
+        },
+    )]);
+
+    let mut client = RawWsClient::connect(proxy, origin, "/socket").await;
+    client
+        .send(burpwn_proxy::ws::OP_TEXT, br#"{"role":"user","id":7}"#)
+        .await;
+    assert_eq!(
+        client.recv_data(Duration::from_secs(5)).await.unwrap(),
+        br#"echo:{"role":"admin","id":7}"#,
+        "the origin must have received the REWRITTEN message"
+    );
+
+    // A binary message that does not match is forwarded untouched: a payload is
+    // bytes, and a hook that does not match must cost it nothing.
+    client
+        .send(burpwn_proxy::ws::OP_BINARY, &[0x00, 0xff, 0x10])
+        .await;
+    assert_eq!(
+        client.recv_data(Duration::from_secs(5)).await.unwrap(),
+        vec![b'e', b'c', b'h', b'o', b':', 0x00, 0xff, 0x10]
+    );
+
+    // A FRAGMENTED message is reassembled before the hook sees it — the match
+    // here straddles two frames — and comes out whole on the other side.
+    client
+        .send_fragmented([br#"{"role"#, br#"":"user""#, br#",-n-:2}"#])
+        .await;
+    assert_eq!(
+        client.recv_data(Duration::from_secs(5)).await.unwrap(),
+        br#"echo:{"role":"admin",-n-:2}"#,
+        "a match straddling a fragment boundary must still be rewritten"
+    );
+
+    // A ping is never hooked and never re-framed: the socket still works.
+    assert!(
+        client.pings().await,
+        "control frames must survive a hooked socket"
+    );
+
+    // The capture records what was actually relayed, not what was typed.
+    let msgs = recorded_ws(&store, 2).await;
+    assert!(
+        msgs.iter()
+            .any(|m| m.payload == br#"{"role":"admin","id":7}"#),
+        "the stored c2s message is the one the origin saw: {msgs:?}"
+    );
+}
+
+/// `drop` on a WebSocket phase: the message never reaches the origin, and the
+/// socket keeps working. Scoped by path, so the same proxy relays another socket
+/// untouched — a drop hook quietly taking down every socket on the host is
+/// exactly the failure this guards against.
+#[tokio::test]
+async fn a_ws_drop_hook_refuses_a_message_and_leaves_the_socket_alive() {
+    let origin = spawn_ws_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    handle.hooks().set_hooks(vec![hook(
+        1,
+        HookPhase::WsC2s,
+        HookScope {
+            path: "/blocked".into(),
+            ..Default::default()
+        },
+        HookAction::Drop,
+    )]);
+
+    let mut blocked = RawWsClient::connect(proxy, origin, "/blocked").await;
+    blocked.send(burpwn_proxy::ws::OP_TEXT, b"secret").await;
+    assert!(
+        blocked
+            .recv_data(Duration::from_millis(400))
+            .await
+            .is_none(),
+        "a dropped message never reaches the origin, so no echo comes back"
+    );
+    assert!(
+        blocked.pings().await,
+        "dropping messages must not tear the socket down"
+    );
+
+    // …and a socket outside the hook's scope is relayed as usual.
+    let mut allowed = RawWsClient::connect(proxy, origin, "/allowed").await;
+    allowed.send(burpwn_proxy::ws::OP_TEXT, b"hello").await;
+    assert_eq!(
+        allowed.recv_data(Duration::from_secs(5)).await.unwrap(),
+        b"echo:hello"
+    );
+}

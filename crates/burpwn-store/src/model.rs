@@ -333,12 +333,19 @@ impl MatchKind {
     }
 }
 
-/// Which side of a flow a hook fires on.
+/// Which point of the proxy pipeline a hook fires on.
 ///
 /// Deliberately NOT a `from_db` that falls back on a default: a hook whose
 /// stored phase is not understood must be an error, because guessing would run
 /// an action on the wrong side of the wire. Same contract as
 /// [`MatchKind::from_db`].
+///
+/// The four non-HTTP phases carry a message that is NOT an HTTP request: a
+/// WebSocket frame has no headers and no target, a DNS query has neither. Which
+/// actions each phase accepts is therefore not a matter of taste, and is
+/// answered once by [`HookAction::allowed_on`] — the write paths (CLI, MCP)
+/// refuse the combination up front rather than let it become a silent no-op on
+/// the hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookPhase {
@@ -346,27 +353,63 @@ pub enum HookPhase {
     PreRequest,
     /// After the response headers/body arrive, before they go downstream.
     PostResponse,
+    /// On a complete WebSocket message travelling client→server, before it is
+    /// relayed to the origin.
+    WsC2s,
+    /// On a complete WebSocket message travelling server→client, before it is
+    /// relayed to the browser.
+    WsS2c,
+    /// On a DNS query received by the shim, before it is resolved upstream.
+    DnsQuery,
 }
 
 impl HookPhase {
-    /// DB string (`pre-request` / `post-response`).
+    /// DB string.
     pub fn as_str(self) -> &'static str {
         match self {
             HookPhase::PreRequest => "pre-request",
             HookPhase::PostResponse => "post-response",
+            HookPhase::WsC2s => "ws-c2s",
+            HookPhase::WsS2c => "ws-s2c",
+            HookPhase::DnsQuery => "dns-query",
         }
+    }
+
+    /// Every phase, in the order the surfaces list them.
+    pub const ALL: [HookPhase; 5] = [
+        HookPhase::PreRequest,
+        HookPhase::PostResponse,
+        HookPhase::WsC2s,
+        HookPhase::WsS2c,
+        HookPhase::DnsQuery,
+    ];
+
+    /// Whether this phase carries an HTTP message (headers + a target).
+    pub fn is_http(self) -> bool {
+        matches!(self, HookPhase::PreRequest | HookPhase::PostResponse)
+    }
+
+    /// Whether this phase carries a WebSocket message.
+    pub fn is_ws(self) -> bool {
+        matches!(self, HookPhase::WsC2s | HookPhase::WsS2c)
     }
 
     /// Parse from the DB string. An unknown value is an ERROR, never a default.
     pub fn from_db(s: &str) -> crate::Result<HookPhase> {
-        match s {
-            "pre-request" => Ok(HookPhase::PreRequest),
-            "post-response" => Ok(HookPhase::PostResponse),
-            other => Err(crate::StoreError::UnsupportedRow {
+        HookPhase::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s)
+            .ok_or_else(|| crate::StoreError::UnsupportedRow {
                 table: "hooks",
-                detail: format!("unknown phase {other:?} (expected pre-request|post-response)"),
-            }),
-        }
+                detail: format!(
+                    "unknown phase {s:?} (expected {})",
+                    HookPhase::ALL
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+            })
     }
 }
 
@@ -439,10 +482,15 @@ impl HookInjectKind {
 
 /// What a hook DOES to the message it matched.
 ///
-/// The first five are **declarative**: pure byte edits, no process, no I/O — the
-/// only kind that may run on every request without a cost. [`HookAction::Exec`]
-/// is the escape hatch: it runs a command in the sandbox, pulls a value out of
-/// its stdout with a one-capture-group regex, and injects it declaratively.
+/// All but the last are **declarative**: pure byte edits, no process, no I/O —
+/// the only kind that may run on every message without a cost.
+/// [`HookAction::Exec`] is the escape hatch: it runs a command in the sandbox,
+/// pulls a value out of its stdout with a one-capture-group regex, and injects
+/// it declaratively.
+///
+/// Not every action means something on every [`HookPhase`] — a WebSocket frame
+/// has no headers — which [`HookAction::allowed_on`] answers once, for the
+/// write paths to refuse on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum HookAction {
@@ -475,8 +523,30 @@ pub enum HookAction {
         value: String,
     },
     /// Refuse the message: the request is never forwarded / the response never
-    /// returned (the client gets a `403` from burpwn).
+    /// returned (the client gets a `403` from burpwn), the WebSocket frame is
+    /// never relayed, the DNS query is answered `REFUSED` instead of resolved.
     Drop,
+    /// Rewrite every occurrence of `find` in a WebSocket message payload.
+    ///
+    /// The WebSocket phases' equivalent of match/replace, and the only mutation
+    /// that makes sense on a frame: there is no header to add and no target to
+    /// edit. Deliberately a LITERAL, not a regex: a frame payload is bytes (a
+    /// binary message is not text), and a literal search over the payload costs
+    /// nothing when it does not match — which matters on a phase that fires per
+    /// message on a chatty socket.
+    ReplacePayload {
+        /// The literal byte sequence to look for.
+        find: String,
+        /// What replaces it.
+        replace: String,
+    },
+    /// Answer a DNS query with this address instead of resolving it upstream.
+    SetAnswer {
+        /// The address served for the queried name. Only a query whose type
+        /// matches the family (`A` for v4, `AAAA` for v6) is answered; anything
+        /// else is forwarded upstream untouched.
+        ip: std::net::IpAddr,
+    },
     /// Run `cmd` in the sandbox, extract a value from its stdout with `extract`
     /// (one capture group), and inject it per `inject`.
     Exec {
@@ -498,13 +568,54 @@ impl HookAction {
             HookAction::RemoveHeader { .. } => "remove-header",
             HookAction::SetQueryParam { .. } => "set-query-param",
             HookAction::Drop => "drop",
+            HookAction::ReplacePayload { .. } => "replace-payload",
+            HookAction::SetAnswer { .. } => "set-answer",
             HookAction::Exec { .. } => "exec",
         }
     }
 
+    /// Every action kind, for the surfaces that have to list them.
+    pub const VALID: [&'static str; 8] = [
+        "add-header",
+        "set-header",
+        "remove-header",
+        "set-query-param",
+        "drop",
+        "replace-payload",
+        "set-answer",
+        "exec",
+    ];
+
     /// Whether this action can run without spawning anything (see the type doc).
     pub fn is_declarative(&self) -> bool {
         !matches!(self, HookAction::Exec { .. })
+    }
+
+    /// Whether this action means anything on `phase`.
+    ///
+    /// The single source of truth behind `hook add`'s refusal, because the
+    /// alternative — accepting the row and discovering on the hot path that
+    /// there is no header to add to a WebSocket frame — is exactly the silent
+    /// fallback [`MatchKind::from_db`] was fixed to stop doing. The rules:
+    ///
+    /// - the header/query edits need an HTTP message, and `set-query-param`
+    ///   needs a REQUEST target (so it is request-side only);
+    /// - `replace-payload` needs a WebSocket payload, `set-answer` a DNS query;
+    /// - `exec` is barred from the WebSocket and DNS phases on COST, not on
+    ///   meaning: those fire per message on a socket that may carry thousands,
+    ///   and one hook command is one sandbox — see [`HookPhase`];
+    /// - `drop` is the only action that means the same thing everywhere.
+    pub fn allowed_on(&self, phase: HookPhase) -> bool {
+        match self {
+            HookAction::AddHeader { .. }
+            | HookAction::SetHeader { .. }
+            | HookAction::RemoveHeader { .. } => phase.is_http(),
+            HookAction::SetQueryParam { .. } => phase == HookPhase::PreRequest,
+            HookAction::Drop => true,
+            HookAction::ReplacePayload { .. } => phase.is_ws(),
+            HookAction::SetAnswer { .. } => phase == HookPhase::DnsQuery,
+            HookAction::Exec { .. } => phase.is_http(),
+        }
     }
 
     /// The DB `params` column: a JSON object holding the variant's fields (the
@@ -518,6 +629,10 @@ impl HookAction {
             }
             HookAction::RemoveHeader { name } => serde_json::json!({ "name": name }),
             HookAction::Drop => serde_json::json!({}),
+            HookAction::ReplacePayload { find, replace } => {
+                serde_json::json!({ "find": find, "replace": replace })
+            }
+            HookAction::SetAnswer { ip } => serde_json::json!({ "ip": ip.to_string() }),
             HookAction::Exec {
                 cmd,
                 extract,
@@ -564,6 +679,22 @@ impl HookAction {
                 value: field("value")?,
             }),
             "drop" => Ok(HookAction::Drop),
+            "replace-payload" => Ok(HookAction::ReplacePayload {
+                find: field("find")?,
+                replace: field("replace")?,
+            }),
+            // A stored address that does not parse is a row this build cannot
+            // act on: refusing it is the same contract as an unknown kind, and
+            // far better than resolving a name to something arbitrary.
+            "set-answer" => {
+                let raw = field("ip")?;
+                Ok(HookAction::SetAnswer {
+                    ip: raw.parse().map_err(|_| crate::StoreError::UnsupportedRow {
+                        table: "hooks",
+                        detail: format!("action \"set-answer\" has an unparseable ip {raw:?}"),
+                    })?,
+                })
+            }
             "exec" => Ok(HookAction::Exec {
                 cmd: field("cmd")?,
                 extract: field("extract")?,
@@ -891,6 +1022,16 @@ mod tests {
                 value: "1".into(),
             },
             HookAction::Drop,
+            HookAction::ReplacePayload {
+                find: "\"role\":\"user\"".into(),
+                replace: "\"role\":\"admin\"".into(),
+            },
+            HookAction::SetAnswer {
+                ip: "127.0.0.1".parse().unwrap(),
+            },
+            HookAction::SetAnswer {
+                ip: "::1".parse().unwrap(),
+            },
             HookAction::Exec {
                 cmd: "get-token.sh".into(),
                 extract: r#""token":"([^"]+)""#.into(),
@@ -920,6 +1061,65 @@ mod tests {
             HookPhase::from_db("post-response").unwrap(),
             HookPhase::PostResponse
         );
+        // An address a newer burpwn could store but this one cannot parse is a
+        // refusal too — resolving a name to "whatever parses" is not an option.
+        assert!(HookAction::from_db("set-answer", r#"{"ip":"nowhere"}"#).is_err());
+        assert!(HookAction::from_db("replace-payload", r#"{"find":"a"}"#).is_err());
+    }
+
+    /// Every phase round-trips through the DB string, and the string is the one
+    /// the CLI/MCP surfaces spell.
+    #[test]
+    fn every_hook_phase_round_trips_through_its_db_string() {
+        for phase in HookPhase::ALL {
+            assert_eq!(HookPhase::from_db(phase.as_str()).unwrap(), phase);
+        }
+        assert_eq!(HookPhase::WsC2s.as_str(), "ws-c2s");
+        assert_eq!(HookPhase::WsS2c.as_str(), "ws-s2c");
+        assert_eq!(HookPhase::DnsQuery.as_str(), "dns-query");
+        assert!(HookPhase::WsC2s.is_ws() && !HookPhase::WsC2s.is_http());
+        assert!(!HookPhase::DnsQuery.is_ws() && !HookPhase::DnsQuery.is_http());
+    }
+
+    /// The pairing table. An action that means nothing on a phase must be a
+    /// refusal at `hook add` time, so this is the fact the CLI and MCP both ask.
+    #[test]
+    fn an_action_is_only_allowed_on_the_phases_it_means_something_on() {
+        let add_header = HookAction::AddHeader {
+            name: "X".into(),
+            value: "1".into(),
+        };
+        let replace = HookAction::ReplacePayload {
+            find: "a".into(),
+            replace: "b".into(),
+        };
+        let answer = HookAction::SetAnswer {
+            ip: "127.0.0.1".parse().unwrap(),
+        };
+        let exec = HookAction::Exec {
+            cmd: "x".into(),
+            extract: "(.)".into(),
+            inject: HookInject {
+                kind: HookInjectKind::SetHeader,
+                name: "A".into(),
+                value_template: "{}".into(),
+            },
+        };
+        let param = HookAction::SetQueryParam {
+            name: "a".into(),
+            value: "1".into(),
+        };
+        for phase in HookPhase::ALL {
+            // There is no header on a frame or a query, and no sandbox command
+            // on a per-message phase.
+            assert_eq!(add_header.allowed_on(phase), phase.is_http());
+            assert_eq!(exec.allowed_on(phase), phase.is_http());
+            assert_eq!(replace.allowed_on(phase), phase.is_ws());
+            assert_eq!(answer.allowed_on(phase), phase == HookPhase::DnsQuery);
+            assert_eq!(param.allowed_on(phase), phase == HookPhase::PreRequest);
+            // Refusing a message is the one thing every phase can do.
+            assert!(HookAction::Drop.allowed_on(phase));
+        }
     }
 
     // `heder` must not become a body rule. Every accepted spelling round-trips,
