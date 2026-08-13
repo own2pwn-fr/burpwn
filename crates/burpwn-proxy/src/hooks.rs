@@ -19,6 +19,22 @@
 //! namespace) per run — which is why its value is cached per hook and why the
 //! declarative path never touches any of that machinery.
 //!
+//! # What is NOT hooked
+//!
+//! Hooks are an HTTP-message primitive: they act on a request before it is
+//! forwarded and on a response before it is returned. Deliberately outside that:
+//!
+//! - **WebSocket frames** (`crate::ws`). After the `101` the proxy splices two
+//!   byte streams; there is no request/response to act on, and a per-frame hook
+//!   is a different feature with a different cost model. The `Upgrade` request
+//!   ITSELF is a normal request and IS hooked — which is what matters for
+//!   authenticating a socket.
+//! - **Raw TCP** (`crate::rawtcp`) and **TLS passthrough** (`crate::passthrough`):
+//!   nothing there is parsed, by design. There is no header to add.
+//! - **DNS** (`crate::dns`): a different protocol entirely.
+//! - `req replay` and `fuzz` run the DECLARATIVE subset only — see
+//!   [`apply_declarative`].
+//!
 //! # Recursion: the guarantee, in two layers
 //!
 //! An `exec` hook's command runs in the sandbox, so its own traffic comes back

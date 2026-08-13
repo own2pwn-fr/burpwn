@@ -240,6 +240,10 @@ inject what it prints.
   after. No live traffic. For an `exec` hook the command really runs, so this is
   also how you check the extraction regex still matches.
 
+Not hooked: WebSocket FRAMES (the upgrade request itself is), raw TCP, TLS
+passthrough and DNS — a hook acts on an HTTP request/response, and none of those
+have one.
+
 Notes: hooks run after match/replace and before the intercept, on both phases.
 `exec` hooks run **one command at a time for the whole proxy** — a second request
 that needs a fresh value while one is running is forwarded un-hooked rather than
