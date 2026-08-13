@@ -694,6 +694,11 @@ impl Reader {
     /// Same posture as the hook refresher keeping its previous snapshot: a
     /// single bad row must neither silently rewrite the wrong part of a message
     /// nor make every other rule disappear from the proxy.
+    ///
+    /// The WARN names the id on purpose: it is what a skipped rule leaves the
+    /// operator to act on, and `match-replace rm <id>` still removes it (the CLI
+    /// logs at `info` by default, so the line shows up under a `match-replace
+    /// list` that came back one rule short).
     pub fn list_match_replace(&self) -> Result<Vec<MatchReplaceRule>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(

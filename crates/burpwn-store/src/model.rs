@@ -68,7 +68,12 @@ pub struct FlowStart {
     pub scheme: String,
     /// Wire protocol.
     pub protocol: Protocol,
-    /// Whether this flow was intercepted (held) by the proxy.
+    /// Whether this flow was actually PARKED (held) by the proxy — interception
+    /// enabled AND the scope filter matching, not the global toggle.
+    ///
+    /// ⚠️ Only ever `true` on a flow that was held and then RELEASED: a request
+    /// the operator drops never reaches `flow_start` (the handler answers 403
+    /// and returns), so a dropped intercept leaves no row at all.
     pub intercepted: bool,
 }
 
