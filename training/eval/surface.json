@@ -129,7 +129,8 @@
       "compare": [
         "flow_a",
         "flow_b",
-        "what"
+        "what",
+        "max_lines"
       ],
       "encode": [
         "scheme",
