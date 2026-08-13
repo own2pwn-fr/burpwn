@@ -3,7 +3,7 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-14
 
 ### Added — hooks reach the socket the page keeps open, and the names it resolves
 Hooks stopped where HTTP stopped. That is a real boundary for raw TCP and TLS passthrough, and it
@@ -245,8 +245,11 @@ Three consequences worth stating plainly:
 - **The `AuthWatcher` is gone; the `401` trigger is not.** A token that expires *inside* its TTL
   still needs handling, so the engine now drops the cached value of the `exec` hooks in scope for a
   host that answers `401`/`403`, and the next request re-mints synchronously. That is the whole of
-  what the watcher did, minus the channel, the detached child and the zombie reaping (the fix below
-  for which is therefore moot — the code it fixed no longer exists), and minus a debounce doing
+  what the watcher did, minus the channel and minus the detached child — which had been leaking one
+  `<defunct>` entry per refresh for the life of the daemon, because `setsid` detaches a child's
+  *session* and not its parentage, so nothing ever collected the exit status. That leak was fixed
+  during this cycle and then deleted along with the child itself; it is recorded here rather than as
+  its own entry because no release ever shipped the process it afflicted. And minus a debounce doing
   double duty as a recursion guard. It could not do that job anyway: it was 30 s against a login
   command with a 60 s timeout, so the window reopened while the login was still running. Recursion
   stays the `hook:` marker's job, which is structural rather than temporal. What is left is a *rate*
@@ -306,21 +309,6 @@ then treats it as the envelope channel. Nothing else can be mistaken for it late
 answer is taken before this process owns a single descriptor. Unprobed — a test binary, an
 embedder — means "not ours", and the envelope goes to stderr, exactly as it already did when fd 3
 was closed. The documented `3>envelope.json` and the MCP pipe are unaffected: both are inherited.
-
-### Fixed — the auth auto-refresh left a zombie behind on every 401
-The daemon spawns `burpwn session auth refresh` when it sees a 401/403 on a host that has an auth
-profile, detached with `setsid` so a slow login command can never block the proxy. It then dropped
-the child handle and never called `wait()`. `setsid` detaches the child's *session*, not its
-parentage: the daemon stays its parent, the kernel keeps the exit status around waiting to be
-collected, and the process table gains one `<defunct>` entry per refresh — for the whole life of
-the daemon. Against a target that expires tokens on a schedule, that is exactly one zombie per
-expiry, forever.
-
-The child is now owned by a task that does an **async** `wait()`, so the property the detachment
-buys is untouched: the daemon still never waits on a login command, a task parked on `SIGCHLD`
-does. Shutdown is not a race either way — if the runtime goes down first the task is dropped, the
-child is reparented to init, and init reaps it. The exit status stops being thrown away too: a
-refresh that fails now says so at `WARN` instead of vanishing.
 
 ### Fixed — a typo in a match/replace kind made a body rule, silently
 `burpwn match-replace add '*.api' heder '^Authorization:.*' 'Authorization: Bearer x'` used to
