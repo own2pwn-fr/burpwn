@@ -72,6 +72,88 @@ shells out to `tcpdump` where the machine has it and skips where it does not.
 There is deliberately **no `export_pcap` MCP tool**, for the same reason `export har` has none: the
 artefact is a binary file for a human's Wireshark, and an agent cannot read it. Archival an agent
 *can* act on remains `session_export`.
+### Changed — the login macro is a hook now, and can finally put a header on a request that has none (schema v8)
+`session auth` was written before hooks existed, out of the only primitive there was, and it
+inherited that primitive's hole. A refresh minted a token and wrote it into a generated
+match/replace rule — and match/replace REWRITES text a message already carries. `^Authorization:.*`
+matches nothing on a request that never sent one, so the first call of a fresh session went upstream
+bare and came back `401`. The module said as much in its own doc comment. Everything around it
+existed to compensate: a proxy-side watcher that debounced `401`/`403` hosts, a daemon consumer that
+spawned a *detached* `session auth refresh`, a `token` column so the rule had a literal to
+substitute. And the request that took the `401` was never the one that got fixed — it was already
+gone.
+
+A `pre-request` hook with an `exec` action is the same sentence describing the same thing: run a
+command, pull a value out of its stdout with a one-capture-group regex, put it in a header. It just
+does not have the hole. The injection is `set-header`, so the header is **synthesized when absent**
+and replaced when stale, and it happens **to the request that is parked waiting for it**. Nobody has
+to take a `401` to make the next call work.
+
+**Schema v8** rewrites every `auth_profiles` row into exactly that hook — named `auth:<host>`, or
+`auth:*` when unscoped — and drops the table. The generated match/replace rule goes with it: leaving
+it behind would inject the header a second time with a token frozen at migration time. A profile
+whose header template cannot be expressed as an injection (no colon, no `{}`; only reachable by
+hand-editing the database, since `session auth set` validates all of it) is migrated **disabled**
+rather than dropped, because the login command is the part that took work to write.
+
+**`session auth` stays**, as a façade over the hooks, for two reasons. `session auth set --login …
+--header 'Authorization: Bearer {}'` says what an operator means, where assembling the equivalent
+`hook add --action exec --inject-header …` by hand does not. And it now builds its hook *through*
+the same validator `hook add` uses, so the façade cannot produce a hook the direct command would
+have refused — there is one code path and one storage, not two systems that drift. What it writes is
+an ordinary hook: `hook list` shows it, `hook test <id> --flow <id>` debugs it, `hook disable` turns
+it off. `session auth status` reports that hook rather than a model of its own.
+
+Three consequences worth stating plainly:
+
+- **A session file no longer holds a bearer token.** The token was in `auth_profiles.token` only
+  because the generated rule needed a literal to substitute. The hook mints its own and the daemon
+  keeps it in memory for the hook's TTL, so there is nothing at rest to leak — and `--redact` has
+  one less thing to erase. The migration zeroes the pages it frees, so the token that WAS there does
+  not linger in the file either.
+- **`session auth refresh` no longer runs the login command.** The hook does that, on demand. Refresh
+  is now "drop what the daemon cached, so the next request re-mints" — a new `HookCacheClear` control
+  request, because that in-memory cache is the only place a minted token exists. Run with no daemon
+  up, there is nothing cached and it says so instead of starting one to clear an empty cache.
+- **The `AuthWatcher` is gone; the `401` trigger is not.** A token that expires *inside* its TTL
+  still needs handling, so the engine now drops the cached value of the `exec` hooks in scope for a
+  host that answers `401`/`403`, and the next request re-mints synchronously. That is the whole of
+  what the watcher did, minus the channel, the detached child and the zombie reaping (the fix below
+  for which is therefore moot — the code it fixed no longer exists), and minus a debounce doing
+  double duty as a recursion guard. It could not do that job anyway: it was 30 s against a login
+  command with a 60 s timeout, so the window reopened while the login was still running. Recursion
+  stays the `hook:` marker's job, which is structural rather than temporal. What is left is a *rate*
+  question — how often may a `401` cost a fresh mint — and it is answered on the value itself: one
+  minted less than 30 s ago is kept, so a target that refuses everything costs one command per hook
+  per 30 s instead of one per request.
+
+One bug fell out of writing this. `HookEngine::set_hooks` claimed in its doc comment to drop the
+value cached for a hook "whose definition changed", and compared **ids**. Re-setting a profile is a
+DELETE plus an INSERT, and SQLite hands the freed rowid straight back — so the id was identical, and
+the previous login command's token stayed cached and in use. It compares definitions now.
+
+Nothing on the hot path was traded away for any of this: the engine still sits behind one relaxed
+atomic load, the new `401` handling returns on that load before it looks at anything else, the
+marker and the one-command-at-a-time claim are untouched, and every `exec` hook still fails open on
+timeout or error. `BW-NETWORK-002` ("the session-auth login macro failed") is retired, because an
+`exec` hook whose command fails or whose regex does not match fails OPEN with a `WARN` — there is no
+longer a failure there to give an exit code to.
+
+### Fixed — `--redact` overwrote the login command and left it in the page it freed
+`export session --redact` is the command you run before handing a session to someone else, and its
+promise is that the credentials burpwn stored are not in the file. It kept that promise at the
+**row** level only. `UPDATE hooks SET params = '(redacted…)'` makes the row read redacted, while
+SQLite hands the old cell to the freelist with its contents intact — so `grep hunter2 bundle.db`
+still found the login command, argv password and all, in a file whose entire purpose is to travel.
+The test asserted what the rows said, which is why nobody saw it.
+
+`PRAGMA secure_delete` makes the engine zero what it frees, and it has to be set *before* the
+updates: it governs how they are applied, it does not clean up afterwards. The test now reads the
+staged database as **bytes** and fails if the password appears anywhere in it, which is the property
+the flag actually promises. The v8 migration got the same treatment where it drops `auth_profiles`
+(with the pragma restored afterwards — that connection is the store's long-lived writer, and the
+capture path should not pay for the zero-fill).
+
 ### Fixed — `exec --json` could write its envelope into an unrelated open file
 `write_json_envelope` decided where the `--json` exec envelope goes by asking `fcntl(3, F_GETFD)
 >= 0` — *"is descriptor 3 open right now?"* — and, on that answer alone, wrote the envelope there.

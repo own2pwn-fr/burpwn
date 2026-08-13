@@ -75,7 +75,7 @@ burpwn fuzz show <attack_id> --sort anomaly    # per-payload results
 burpwn compare 42 43 --what all                # structured diff + reflection check
 burpwn decode jwt <token>                      # encode/decode base64(url)/url/hex/jwt
 burpwn session auth set --login 'curl -s https://target.example/login -d u=a' \
-  --extract '"token":"([^"]+)"' --header 'Authorization: Bearer {}'  # login-macro refresh on 401/403
+  --extract '"token":"([^"]+)"' --header 'Authorization: Bearer {}'  # login macro: a hook that mints on demand
 burpwn hook add ua --action add-header --header 'User-Agent: burpwn'  # on EVERY request
 burpwn hook add token --action exec --host api.target.example \
   --cmd './mint-token.sh' --extract '"access_token":"([^"]+)"' \
@@ -142,10 +142,10 @@ manifest saying where it came from, zstd-compressed behind a `BURPWNBUNDLE` head
 migrated on the way in, and one from a newer burpwn is refused rather than half-read.
 
 > ⚠️ **A bundle is a credential store.** By default it holds the session exactly as captured: the
-> stored auth tokens and login commands, and every `Authorization` / `Cookie` header recorded in the
-> traffic — that is what makes the session replayable. `--redact` drops the stored auth profiles and
-> match/replace replacements; it does **not** scrub credentials captured inside recorded requests and
-> responses. Bundles are written `0600`; move them the way you would move the credentials inside.
+> stored login commands (an auth profile's, an exec hook's) and every `Authorization` / `Cookie` header
+> recorded in the traffic — that is what makes the session replayable. `--redact` drops those login
+> commands and the match/replace replacements, bytes included; it does **not** scrub credentials
+> captured inside recorded requests and responses. Bundles are written `0600`; move them the way you would move the credentials inside.
 > The CA private key is never included.
 
 ## `export pcap`: a capture burpwn never took

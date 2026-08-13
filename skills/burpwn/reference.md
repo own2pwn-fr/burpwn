@@ -273,6 +273,27 @@ the loser is forwarded un-hooked at once. Repeater (`req replay`) and Intruder (
 apply the **declarative** hooks only; they have no sandbox, and 500 fuzz requests
 must not be 500 commands.
 
+## session auth (login macro)
+A named `pre-request` `exec` hook, with the flags an authenticated engagement
+actually has. `session auth set` writes the hook `auth:<HOST>` (`auth:*` when
+unscoped); `hook list` / `hook show` / `hook test` / `hook rm` all work on it.
+- `burpwn session auth set --login <CMD> --extract <REGEX> --header 'Name: {}'
+  [--host <SUBSTRING>] [--session <SESSION>] [--json]` — same contract as
+  `hook add --action exec`: `--extract` needs exactly one capture group,
+  `--header` needs the `{}` the token replaces. The injection is add-or-replace,
+  so a request that carries NO auth header gets one (which is what a
+  match/replace rule could never do). Re-running it for the same host REPLACES
+  that profile. Defaults: `--ttl 300000`, `--timeout 10000`.
+- `burpwn session auth status [--session <SESSION>] [--json]` — the profiles:
+  hook id, host scope, injected header, login command, TTL. There is no token
+  field: the token is minted on demand and held only in the running daemon.
+- `burpwn session auth refresh [--host <HOST>] [--session <SESSION>] [--json]` —
+  drop the cached token so the NEXT request through the proxy runs the login
+  command again. Rarely needed: a 401/403 already drops it (a value minted less
+  than 30 s ago is kept, so a target that refuses everything cannot turn into one
+  sandbox per request). With no daemon running there is nothing cached and it
+  says so.
+
 ## workspace
 - `burpwn workspace new <NAME> [--json]`
 - `burpwn workspace list [--json]`
@@ -299,11 +320,13 @@ workspace and every subcommand takes the NAME, not an id.
   session as one portable file (default `<session>.burpwn` in the current directory, created `0600`,
   never overwritten without `--force`): every flow with its bodies, plus workspaces, groups, tags,
   notes, attacks and rules. `burpwn session import` opens it on another machine.
-  **The bundle is RAW by default**: it carries the stored auth tokens, the login commands (argv
-  credentials included) and the Authorization / Cookie headers captured in the traffic, so that the
-  session replays identically. `--redact` drops the stored auth tokens, login commands and
-  match/replace replacements — it does **not** scrub credentials captured inside recorded requests
-  and responses. Treat a bundle like the credentials it contains.
+  **The bundle is RAW by default**: it carries the login commands of the auth profiles / exec hooks
+  (argv credentials included) and the Authorization / Cookie headers captured in the traffic, so that
+  the session replays identically. `--redact` drops those login commands and the match/replace
+  replacements, bytes included (the freed pages are zeroed, not just the rows) — it does **not**
+  scrub credentials captured inside recorded requests and responses. Treat a bundle like the
+  credentials it contains. A minted session token is not in there at all: since schema v8 it lives
+  in the daemon's memory, never in the session file.
 - `burpwn export pcap [--session <NAME>] [--workspace <NAME|ID>] [--group <GROUP>] [-o <OUTPUT>]
   [--force] [--json]` — a **synthetic** pcapng (default `<session>.pcapng` in the current directory,
   never overwritten without `--force`). Always a file: a pcapng is binary, so unlike `export har`
