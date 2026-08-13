@@ -573,17 +573,31 @@ fn migrate_v8(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // The generated injection rules (whose replacement holds the token as a
-    // literal). Guarded: a step must survive being replayed on a file whose
-    // `match_replace_rules` was never created.
-    if table_exists(conn, "match_replace_rules")? {
-        conn.execute_batch(
-            "DELETE FROM match_replace_rules WHERE id IN
-                (SELECT rule_id FROM auth_profiles WHERE rule_id IS NOT NULL);",
-        )?;
-    }
-    conn.execute_batch("DROP TABLE auth_profiles;")?;
-    Ok(())
+    // What is about to be deleted is a token and a password, so delete them
+    // PROPERLY: by default SQLite hands the pages to the freelist with their
+    // contents intact, and a `grep` over session.db would still find the token
+    // long after the table that held it was dropped — which would make a poor
+    // job of "burpwn no longer keeps your bearer token at rest". Restored
+    // afterwards: this is the store's long-lived write connection, and the
+    // zero-fill is not something the capture path should pay for.
+    let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+    conn.pragma_update(None, "secure_delete", "ON")?;
+    let purge = || -> Result<()> {
+        // The generated injection rules (whose replacement holds the token as a
+        // literal). Guarded: a step must survive being replayed on a file whose
+        // `match_replace_rules` was never created.
+        if table_exists(conn, "match_replace_rules")? {
+            conn.execute_batch(
+                "DELETE FROM match_replace_rules WHERE id IN
+                    (SELECT rule_id FROM auth_profiles WHERE rule_id IS NOT NULL);",
+            )?;
+        }
+        conn.execute_batch("DROP TABLE auth_profiles;")?;
+        Ok(())
+    };
+    let outcome = purge();
+    conn.pragma_update(None, "secure_delete", secure_delete)?;
+    outcome
 }
 
 /// The hook name a session-auth profile for `host` is stored under. Kept in sync
