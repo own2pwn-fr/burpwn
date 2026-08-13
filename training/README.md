@@ -51,12 +51,12 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-**1,532** deduplicated examples by default (`546 cli`, `326 mcp`, `660 shell`), of
+**1,534** deduplicated examples by default (`546 cli`, `327 mcp`, `661 shell`), of
 which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
-(split 1,456 train / 76 validation). The split is a deterministic,
+(split 1,458 train / 76 validation). The split is a deterministic,
 **style-stratified** 95/5 split (all three styles appear in each split). The
 default emitted set is balanced to ~50% multi-turn by deterministically
-subsampling single-turn records; the **full corpus is 3,352 examples**
+subsampling single-turn records; the **full corpus is 3,359 examples**
 (`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
@@ -192,7 +192,7 @@ The 42 MCP tools are: `session_list`, `session_current`, `session_stats`,
 All 42 appear as real tool calls in the emitted `dataset.jsonl` **and** in
 `dataset.train.jsonl` — `python generate.py --validate` fails if any is missing,
 and prints the count it measured (`42/42 MCP tools exercised`). Only
-`dataset.validation.jsonl` is partial (12/42), which is expected of a 5% held-out
+`dataset.validation.jsonl` is partial (9/42), which is expected of a 5% held-out
 sample and is therefore exempt from the check.
 
 That guarantee is recent, and it is worth knowing what it replaced. The emitted
@@ -211,6 +211,17 @@ multi-turn fraction are unchanged. `split_dataset` applies the same idea to the
 train/validation cut, so a tool's last demonstration cannot be drawn into
 validation and leave the model with nothing to learn it from.
 
+That floor could only see MCP tools, and the same raffle deleted features too.
+A `cli` or `shell` example calls no burpwn tool — there is nothing structural to
+count — so when the 0.4.0 WebSocket/DNS hook examples were added, **four of the
+seven were raffled out of the emitted file**, including one of the two refusal
+lessons. `CAPABILITY_TAGS` + `COVERAGE_MIN_PER_CAPABILITY` close that: a family
+*declares* the capability an example demonstrates by tagging it, those tags are
+reserved on the same terms in both subsampling stages and in the split, and
+`--validate` asserts and reports them (`6/6 capabilities`). The tag set is a
+list of claims that a feature must survive subsampling, not a list of every tag
+in use.
+
 Depth is a separate axis from coverage: several tools are still demonstrated by
 only two or three records (see `fam_mcp_housekeeping_convos`, added to give the
 housekeeping half of the surface a second, realistic demonstration each). A
@@ -225,8 +236,11 @@ well-taught.
 Every command name, flag, JSON envelope and MCP tool name was verified against
 the **real binary** (`target/debug/burpwn`, built from the checkout) and the MCP
 server source (`crates/burpwn-mcp/src/{params,server,handlers}.rs`), most
-recently on 2026-08-13 at version 0.3.4, by *running the binary* and capturing
-the actual envelopes.
+recently on 2026-08-14 at version 0.4.0, by *running the binary* and capturing
+the actual envelopes — and, for the MCP shapes, by driving the real `burpwn mcp`
+stdio server over JSON-RPC (`tools/list` + `tools/call`) rather than reading the
+handlers alone. That is what caught `session_auth_set` returning `{id,host}`
+where the CLI's data carries `{id,hook_id,host}`.
 
 The guard that keeps this true is `eval/surface.py --check`, and it is worth
 saying what it now does, because it previously did not. It derives the surface
@@ -285,10 +299,28 @@ Notable grounded facts encoded:
   can call it unconditionally before each `group add`; **`session import` always
   creates a new session** — it never merges and never overwrites, and `--as`
   renames on the way in.
-* **`--redact` has a narrow scope**, and the dataset says so rather than
-  implying the bundle becomes safe to hand over: it drops the stored auth
-  profiles' `token`/`login_cmd` and match/replace `replacement` values, and does
-  **not** scrub credentials captured inside recorded requests and responses.
+* **`--redact` matches credential SHAPES**, and the dataset says so rather than
+  implying the bundle becomes safe to hand over. Since 0.4.0 it scrubs the
+  capture as well as what burpwn stored: it drops the stored login/exec command
+  lines and match/replace `replacement` values, and masks `Authorization`,
+  `Proxy-Authorization`, `Cookie` and `Set-Cookie` headers and
+  `password`/`token`/`api_key`-style parameters in the recorded traffic. What
+  survives is anything that does not *look* like a credential — a secret under
+  an unrecognised name, one baked into a URL path, one inside a binary or
+  compressed body, or the target's own PII in a response body. (Before 0.4.0 it
+  touched nothing in the traffic at all; the examples that taught that were
+  rewritten, not deleted — the limit moved, it did not disappear.)
+* **A session-auth profile is a hook, and the token is stored nowhere.**
+  `session auth set` builds a `pre-request`/`exec` hook named `auth:<host>`;
+  `session auth status` has no `token`/`token_set`/`rule_id` field to inspect,
+  and `session auth refresh` does *not* run the login command — it asks the
+  daemon to drop the value it cached, so the next in-scope request re-mints.
+* **A hook's phase decides which actions exist.** `replace-payload` needs a
+  WebSocket message, `set-answer` a DNS query, and `exec` is refused on both
+  (one hook command is one sandbox, and those phases fire per message).
+  `hook add` rejects the pairing up front (`BW-INPUT-001`) instead of storing a
+  row that becomes a silent no-op, and `hook test` refuses a non-HTTP hook
+  (`BW-INPUT-009`) instead of reporting a comparison it never made.
 * **A hook's `add-header` synthesises a header that is absent**, which
   match/replace structurally cannot do (it only substitutes into what is already
   there) — the distinction that decides which of the two to reach for.
@@ -328,14 +360,27 @@ flags and phrasings, then deduplicated):
   only the label, never the captures. Both CLI and MCP, where the shapes of
   `group_add`/`group_list`/`group_rm` genuinely differ from the CLI's.
 * **Session bundle**: `export session` / `session import`, that import **always**
-  creates a new session (`--as` to rename, `--use` to switch), and an honest
-  treatment of `--redact`'s limited scope — it drops stored tokens/login commands
-  and match/replace replacements, not the credentials captured in the traffic.
-* **Hooks**: `hook add/list/test/enable/disable/rm`, the `add-header`
+  creates a new session (`--as` to rename, `--use` to switch) and migrates an
+  older bundle forward (`migrated_from`), and an honest treatment of `--redact` —
+  which since 0.4.0 masks the credential-shaped values in the captured traffic
+  too, so the limit taught is that it matches *shapes*, not that it leaves the
+  traffic alone.
+* **Hooks**: `hook add/list/show/test/enable/disable/rm`, the `add-header`
   vs. match/replace distinction (synthesise an absent header vs. rewrite an
   existing one), `hook test` as a dry-run against a captured flow, and the `exec`
   hook that re-mints an expiring token and injects it before the request leaves
   (with `--ttl` caching and the fail-open `--timeout` behaviour).
+* **WebSocket / DNS hooks** (0.4.0, `fam_hooks_ws_dns`): `replace-payload` on
+  `ws-c2s`/`ws-s2c` (literal `--find`, binary-safe, one reassembled message) and
+  `set-answer`/`drop` on `dns-query` (A/AAAA only; `--host` is the queried name
+  and `--path` the record type). Plus the two refusals, which are the half an
+  agent walks into: `exec` is barred from these phases on cost, and `hook test`
+  cannot replay them at all.
+* **Session auth as a façade over hooks** (0.4.0): a profile *is* a
+  `pre-request`/`exec` hook named `auth:<host>`, `refresh` clears the daemon's
+  cached token rather than minting one, and the token itself is persisted
+  nowhere — so `match_replace_list` showing nothing auth-related is the correct
+  answer, not a dead end.
 * **Capped `compare` diffs**: noticing `body.truncated` and re-asking with a
   negative `max_lines`, so a truncated diff is never mistaken for the whole one.
 * **`Bash` tool-call (style `shell`)**: single-turn recon (`exec` a tool, read
@@ -356,8 +401,9 @@ flags and phrasings, then deduplicated):
   substring match caught by mistake; forging a JWT payload with `encode`/`decode`
   and reporting the `401 invalid signature` as a real negative result that rules
   out a class; and diagnosing a 401 wall as an expired injected token via
-  `match_replace_list` + `session_auth_*` (where `refresh` supersedes the stale
-  rule rather than deleting it).
+  `match_replace_list` + `hook_list` + `session_auth_*` (where the rule listing
+  correctly shows *nothing* auth-related, because the injection is a hook, and
+  `refresh` drops the daemon's cached token rather than minting a new one).
 * **Framework integration** (CLI-only admin): `skill install`/`list`/`uninstall`
   (drop the burpwn agent-workflow skill into Claude Code, Cursor, Cline, Gemini,
   Codex, Copilot, … in each one's native format, at `--project`/`--global` scope,
@@ -372,8 +418,8 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (1,532 records, ~50% multi-turn)
-python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,352 records)
+python generate.py                     # writes dataset.jsonl + splits (1,534 records, ~50% multi-turn)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,359 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
 python generate.py --seed 7            # change the deterministic RNG seed
@@ -385,10 +431,12 @@ deterministically subsampling single-turn records (it never drops multi-turn, an
 keeps the per-style mix); the families remain the source of truth, so the full
 single-turn corpus is always one flag (`--multiturn-frac 0`) away.
 
-Both this and `--target` are constrained by `COVERAGE_MIN_PER_TOOL`: every MCP
-tool keeps at least that many demonstrations (or all of them, where the families
-provide fewer), so no setting of these flags can silently drop a tool off the
-emitted surface. Full coverage holds down to `--target 400`.
+Both this and `--target` are constrained by `COVERAGE_MIN_PER_TOOL` and
+`COVERAGE_MIN_PER_CAPABILITY`: every MCP tool and every declared capability
+keeps at least that many demonstrations (or all of them, where the families
+provide fewer), so no setting of these flags can silently drop a tool or a
+feature off the emitted surface. Full coverage holds down to `--target 400`, and
+across seeds 1337/1/42/99/2026/7777.
 
 The generator is deterministic (no network, stdlib only, fixed default seed) so
 regeneration is **byte-identical** and the diff is reviewable.
