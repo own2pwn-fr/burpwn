@@ -591,7 +591,12 @@ impl HookEngine {
     ///
     /// Cheap when it does nothing: one relaxed atomic load before anything else,
     /// so a proxy with no hooks does not even look at the status.
-    pub fn observe_status(&self, exec_id: Option<&str>, host: &str, status: u16) {
+    ///
+    /// `m` is the REQUEST's own match context (host/method/path, `status: None`)
+    /// — the one the pre-request phase matched on — so a hook narrowed to
+    /// `--method POST` or a path prefix is invalidated by a refusal of the
+    /// requests it actually injects into, and not by any other flow to that host.
+    pub fn observe_status(&self, exec_id: Option<&str>, m: &MatchCtx, status: u16) {
         if status != 401 && status != 403 {
             return;
         }
@@ -605,12 +610,6 @@ impl HookEngine {
         if is_hook_traffic(exec_id) {
             return;
         }
-        let m = MatchCtx {
-            host,
-            method: "",
-            path: "",
-            status: None,
-        };
         let stale: Vec<i64> = self
             .snapshot()
             .iter()
@@ -618,7 +617,7 @@ impl HookEngine {
                 h.enabled
                     && h.phase == HookPhase::PreRequest
                     && !h.action.is_declarative()
-                    && scope_matches(&h.scope, &m)
+                    && scope_matches(&h.scope, m)
             })
             .map(|h| h.id)
             .collect();
@@ -637,7 +636,7 @@ impl HookEngine {
             if cache.remove(&id).is_some() {
                 tracing::info!(
                     hook = id,
-                    %host,
+                    host = %m.host,
                     status,
                     "the target refused a request carrying this hook's value; \
                      dropping it so the next request re-mints"
@@ -1661,7 +1660,7 @@ mod tests {
         // cooldown: a value that has been in use IS what this is for, and the
         // test must not depend on wall-clock sleeps.)
         backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
-        engine.observe_status(None, "api.example.com", 401);
+        engine.observe_status(None, &ctx_for("api.example.com"), 401);
 
         let mut m = msg();
         engine.pre_request(None, "GET", &mut m).await;
@@ -1690,7 +1689,7 @@ mod tests {
             let mut m = msg();
             engine.pre_request(None, "GET", &mut m).await;
             // Every single one of them comes back 401.
-            engine.observe_status(None, "api.example.com", 401);
+            engine.observe_status(None, &ctx_for("api.example.com"), 401);
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1700,17 +1699,18 @@ mod tests {
 
         // Once the value is old enough, the next 401 does invalidate it.
         backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
-        engine.observe_status(None, "api.example.com", 401);
+        engine.observe_status(None, &ctx_for("api.example.com"), 401);
         let mut m = msg();
         engine.pre_request(None, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// Scoping and the recursion guard, on the response side this time: a 401
-    /// for another host is none of this hook's business, and a 401 the hook's
-    /// OWN login command took says nothing about the client's token.
+    /// on a flow this hook does not inject into is none of its business, and a
+    /// 401 the hook's OWN login command took says nothing about the client's
+    /// token.
     #[tokio::test]
-    async fn observe_status_ignores_other_hosts_other_statuses_and_hook_traffic() {
+    async fn observe_status_ignores_out_of_scope_flows_other_statuses_and_hook_traffic() {
         let engine = HookEngine::new();
         let calls = Arc::new(AtomicUsize::new(0));
         engine.set_runner(Arc::new(CountingRunner {
@@ -1720,6 +1720,7 @@ mod tests {
         }));
         let mut h = token_hook(1, 3_600_000);
         h.scope.host = "api.example.com".into();
+        h.scope.path = "/v1/".into();
         engine.set_hooks(vec![h]);
 
         let mut m = msg();
@@ -1727,10 +1728,22 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
 
-        engine.observe_status(None, "api.example.com", 200);
-        engine.observe_status(None, "api.example.com", 500);
-        engine.observe_status(None, "unrelated.test", 401);
-        engine.observe_status(Some("hook:abc"), "api.example.com", 401);
+        engine.observe_status(None, &ctx_for("api.example.com"), 200);
+        engine.observe_status(None, &ctx_for("api.example.com"), 500);
+        engine.observe_status(None, &ctx_for("unrelated.test"), 401);
+        engine.observe_status(Some("hook:abc"), &ctx_for("api.example.com"), 401);
+        // A refusal of a request this hook does not inject into (it is scoped
+        // to /v1/) says nothing about the value it holds.
+        engine.observe_status(
+            None,
+            &MatchCtx {
+                host: "api.example.com",
+                method: "GET",
+                path: "/public/health",
+                status: None,
+            },
+            401,
+        );
         let mut m = msg();
         engine.pre_request(None, "GET", &mut m).await;
         assert_eq!(
@@ -1740,7 +1753,7 @@ mod tests {
         );
 
         // …and the one that does apply, does.
-        engine.observe_status(None, "api.example.com", 403);
+        engine.observe_status(None, &ctx_for("api.example.com"), 403);
         let mut m = msg();
         engine.pre_request(None, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1751,7 +1764,7 @@ mod tests {
     #[tokio::test]
     async fn observe_status_on_an_empty_engine_is_a_no_op() {
         let engine = HookEngine::new();
-        engine.observe_status(None, "api.example.com", 401);
+        engine.observe_status(None, &ctx_for("api.example.com"), 401);
         assert!(engine.invalidate(&[]).is_empty());
     }
 
@@ -1776,6 +1789,16 @@ mod tests {
         assert_eq!(engine.invalidate(&[1]), vec![1]);
         assert!(engine.invalidate(&[1]).is_empty(), "nothing left to drop");
         assert_eq!(engine.invalidate(&[]), vec![2], "empty = every hook");
+    }
+
+    /// The request context a response carries back to `observe_status`.
+    fn ctx_for(host: &str) -> MatchCtx<'_> {
+        MatchCtx {
+            host,
+            method: "GET",
+            path: "/v1/users?id=5",
+            status: None,
+        }
     }
 
     /// Age a cached value by rewriting its `minted_at`, so the cooldown can be

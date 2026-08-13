@@ -421,7 +421,15 @@ async fn handle_inner(
     // buffering fork — so it covers both response paths.
     ctx.hooks.observe_status(
         ctx.exec_id.as_deref(),
-        &msg.host,
+        // The REQUEST's context (the one the pre-request phase matched on), so a
+        // narrowly-scoped hook is only invalidated by a refusal of the requests
+        // it actually injects into.
+        &MatchCtx {
+            host: &msg.host,
+            method: &method,
+            path: &msg.url,
+            status: None,
+        },
         resp_parts.status.as_u16(),
     );
 

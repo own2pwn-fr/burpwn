@@ -1245,7 +1245,7 @@ async fn cmd_session_auth_refresh(
     let ids: Vec<i64> = targets.iter().map(|h| h.id).collect();
 
     let cleared = match crate::control::ControlClient::connect(paths.control_sock(&session)).await {
-        Ok(mut client) => match client.hook_cache_clear(ids.clone()).await? {
+        Ok(mut client) => match client.hook_cache_clear(ids).await? {
             ControlResponse::HookCache { cleared } => cleared,
             ControlResponse::Error { message } => {
                 crate::fail!(ErrorCode::DaemonRejected, "{message}")
