@@ -5,6 +5,28 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — a typo in a match/replace kind made a body rule, silently
+`burpwn match-replace add '*.api' heder '^Authorization:.*' 'Authorization: Bearer x'` used to
+succeed. `MatchKind::from_db` fell through to `Body` on anything it did not recognise, so the rule
+went in — enabled, listed, applied — rewriting *bodies* while the operator believed they had a
+header rule. The pattern then never matched anything, and the thing you debug longest is the
+rewrite that quietly does nothing.
+
+The kind is now parsed, not guessed. `header|body|url|host` and nothing else, at the point of
+entry — the CLI and the MCP `match_replace_add` both refuse an unknown value with `BW-INPUT-001`
+and the accepted set in the message, so the correction is in the error. This is the contract
+`HookPhase` already had and said so in its doc comment, which named `MatchKind::from_db` as the
+counter-example it was deliberately not copying; the two agree now.
+
+On the READ side a stored row is not user input, and refusing to open the store over one is the
+wrong trade. A rule whose kind this build cannot decode is **skipped, with a WARN naming its id**,
+and every other rule still loads — the same posture the hook refresher takes when it keeps its
+previous snapshot rather than applying a half-decoded policy. What it will not do is come back as
+a body rule.
+
+`Protocol::from_db` keeps its fallback on purpose: it classifies traffic burpwn *observed*, where
+an unknown wire protocol really is best-effort, not a value someone typed.
+
 ### Removed — the `intercepts` table, which nothing ever wrote (schema v7)
 The schema carried an `intercepts` table since v1, and the store exposed `enqueue_intercept`,
 `resolve_intercept`, `list_intercepts` and `pending_intercepts` against it. No production caller

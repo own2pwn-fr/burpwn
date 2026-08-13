@@ -275,22 +275,46 @@ impl MatchKind {
         }
     }
 
-    /// Parse from DB string; defaults to `Body` on unknown input.
-    pub fn from_db(s: &str) -> MatchKind {
+    /// The accepted spellings, in the order they are shown to a user.
+    pub const VALID: [&'static str; 4] = ["header", "body", "url", "host"];
+
+    /// Parse a user-supplied kind. `None` means "not one of [`MatchKind::VALID`]".
+    ///
+    /// Callers on the WRITE path (CLI / MCP) must surface that `None` as an
+    /// error: a typo'd `heder` used to fall through to `Body`, so the rule went
+    /// in silently rewriting bodies while the operator believed they had a
+    /// header rule — the rewrite that never fires is the one you debug longest.
+    pub fn parse(s: &str) -> Option<MatchKind> {
         match s {
-            "header" => MatchKind::Header,
-            "url" => MatchKind::Url,
-            "host" => MatchKind::Host,
-            _ => MatchKind::Body,
+            "header" => Some(MatchKind::Header),
+            "body" => Some(MatchKind::Body),
+            "url" => Some(MatchKind::Url),
+            "host" => Some(MatchKind::Host),
+            _ => None,
         }
+    }
+
+    /// Parse from the DB string. An unknown value is an ERROR, never a default —
+    /// same contract as [`HookPhase::from_db`]. The reader turns this into a
+    /// skipped row + a WARN naming the rule id rather than a failed listing, so
+    /// one corrupt row cannot hide every other rule.
+    pub fn from_db(s: &str) -> crate::Result<MatchKind> {
+        MatchKind::parse(s).ok_or_else(|| crate::StoreError::UnsupportedRow {
+            table: "match_replace_rules",
+            detail: format!(
+                "unknown match_kind {s:?} (expected {})",
+                MatchKind::VALID.join("|")
+            ),
+        })
     }
 }
 
 /// Which side of a flow a hook fires on.
 ///
-/// Deliberately NOT a `from_db` that falls back on a default (unlike the older
-/// [`MatchKind::from_db`]): a hook whose stored phase is not understood must be
-/// an error, because guessing would run an action on the wrong side of the wire.
+/// Deliberately NOT a `from_db` that falls back on a default: a hook whose
+/// stored phase is not understood must be an error, because guessing would run
+/// an action on the wrong side of the wire. Same contract as
+/// [`MatchKind::from_db`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookPhase {
@@ -889,8 +913,7 @@ mod tests {
     }
 
     // A row this build cannot understand must be refused, not coerced onto some
-    // default action — the whole reason `HookAction::from_db` is fallible where
-    // `MatchKind::from_db` is not.
+    // default action.
     #[test]
     fn unknown_hook_action_or_phase_is_an_error_not_a_default() {
         let err = HookAction::from_db("teleport", "{}").unwrap_err();
@@ -902,6 +925,33 @@ mod tests {
             HookPhase::from_db("post-response").unwrap(),
             HookPhase::PostResponse
         );
+    }
+
+    // `heder` must not become a body rule. Every accepted spelling round-trips,
+    // and anything else is an error on both the parse and the DB path.
+    #[test]
+    fn unknown_match_kind_is_an_error_not_body() {
+        for kind in [
+            MatchKind::Header,
+            MatchKind::Body,
+            MatchKind::Url,
+            MatchKind::Host,
+        ] {
+            assert_eq!(MatchKind::parse(kind.as_str()), Some(kind));
+            assert_eq!(MatchKind::from_db(kind.as_str()).unwrap(), kind);
+            assert!(MatchKind::VALID.contains(&kind.as_str()));
+        }
+        assert_eq!(MatchKind::parse("heder"), None);
+        assert_eq!(MatchKind::parse("HEADER"), None);
+        assert_eq!(MatchKind::parse(""), None);
+        let err = MatchKind::from_db("heder").unwrap_err();
+        assert!(matches!(err, crate::StoreError::UnsupportedRow { .. }));
+        // The message must name the accepted set: the operator has to know what
+        // to type next.
+        let msg = err.to_string();
+        for v in MatchKind::VALID {
+            assert!(msg.contains(v), "{msg} should list {v}");
+        }
     }
 }
 

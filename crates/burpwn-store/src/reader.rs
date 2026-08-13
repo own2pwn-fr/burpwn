@@ -24,6 +24,11 @@ type RequestRow = (String, String, String, String, Option<i64>, Option<i64>);
 /// body_blob_id, timing_ms).
 type ResponseRow = (i64, String, Option<i64>, Option<i64>, Option<i64>);
 
+/// Raw column tuple for a `match_replace_rules` row: (id, enabled, scope,
+/// match_kind, pattern, replacement, on_request). The kind stays a `String` here
+/// because decoding it is fallible and must not abort the whole listing.
+type MatchReplaceRow = (i64, bool, String, String, String, String, bool);
+
 /// Read-only view over the session store.
 #[derive(Clone)]
 pub struct Reader {
@@ -683,6 +688,12 @@ impl Reader {
     }
 
     /// List all match/replace rules.
+    ///
+    /// A row whose `match_kind` this build cannot decode is SKIPPED with a WARN
+    /// naming its id, not coerced onto a default and not fatal to the listing.
+    /// Same posture as the hook refresher keeping its previous snapshot: a
+    /// single bad row must neither silently rewrite the wrong part of a message
+    /// nor make every other rule disappear from the proxy.
     pub fn list_match_replace(&self) -> Result<Vec<MatchReplaceRule>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -690,18 +701,41 @@ impl Reader {
              FROM match_replace_rules ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
-            let kind: String = r.get(3)?;
-            Ok(MatchReplaceRule {
-                id: r.get(0)?,
-                enabled: r.get::<_, i64>(1)? != 0,
-                scope: r.get(2)?,
-                match_kind: MatchKind::from_db(&kind),
-                pattern: r.get(4)?,
-                replacement: r.get(5)?,
-                on_request: r.get::<_, i64>(6)? != 0,
-            })
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)? != 0,
+            ))
         })?;
-        collect(rows)
+        let raw: Vec<MatchReplaceRow> = collect(rows)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (id, enabled, scope, kind, pattern, replacement, on_request) in raw {
+            let match_kind = match MatchKind::from_db(&kind) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        rule_id = id,
+                        error = %e,
+                        "skipping match/replace rule with an undecodable match_kind"
+                    );
+                    continue;
+                }
+            };
+            out.push(MatchReplaceRule {
+                id,
+                enabled,
+                scope,
+                match_kind,
+                pattern,
+                replacement,
+                on_request,
+            });
+        }
+        Ok(out)
     }
 
     // ---- session-auth profiles (schema v4) ----

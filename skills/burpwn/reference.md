@@ -216,7 +216,8 @@ cannot use them (WSL). `--quick` skips the live probe.
 ## match-replace
 - `burpwn match-replace add <SCOPE> <KIND> <PATTERN> <REPLACEMENT> [--on <ON>] [--json]`
   - `<SCOPE>` — scope expression (e.g. host glob; empty string = all).
-  - `<KIND>` — what to match: `header`, `body`, `url`, `host`.
+  - `<KIND>` — what to match: `header`, `body`, `url`, `host`. Anything else is
+    refused with `BW-INPUT-001` (a typo is never silently treated as `body`).
   - `<PATTERN>` / `<REPLACEMENT>` — match pattern and replacement string.
   - `--on <ON>` — apply to `request` (default) or `response`.
 - `burpwn match-replace list [--json]`

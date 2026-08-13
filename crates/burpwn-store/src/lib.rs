@@ -759,6 +759,47 @@ mod tests {
         assert!(reader.list_match_replace().unwrap().is_empty());
     }
 
+    /// A rule row carrying a `match_kind` this build cannot decode (an older
+    /// burpwn's typo'd write, a hand-edited DB) must not take the whole rule set
+    /// down with it, and must not quietly come back as a BODY rule either.
+    #[tokio::test]
+    async fn undecodable_match_kind_row_is_skipped_not_coerced() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        let store = Store::open(&db).unwrap();
+        let good = store
+            .writer()
+            .add_match_replace(NewMatchReplaceRule {
+                enabled: true,
+                scope: "api.test".into(),
+                match_kind: MatchKind::Header,
+                pattern: "^X-A:.*".into(),
+                replacement: "X-A: 1".into(),
+                on_request: true,
+            })
+            .await
+            .unwrap();
+
+        // Poke a rotten row in behind the writer's back.
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        raw.execute(
+            "INSERT INTO match_replace_rules(enabled, scope, match_kind, pattern, replacement, on_request)
+             VALUES (1, '', 'heder', '^X-B:.*', 'X-B: 2', 1)",
+            [],
+        )
+        .unwrap();
+        drop(raw);
+
+        let rules = store.reader().list_match_replace().unwrap();
+        assert_eq!(rules.len(), 1, "the rotten row must be skipped, not fatal");
+        assert_eq!(rules[0].id, good);
+        assert_eq!(rules[0].match_kind, MatchKind::Header);
+        assert!(
+            !rules.iter().any(|r| r.match_kind == MatchKind::Body),
+            "an undecodable kind must never surface as a body rule"
+        );
+    }
+
     #[tokio::test]
     async fn hook_crud_roundtrip_and_ordering() {
         use crate::model::{HookAction, HookPhase, HookScope, NewHook};
