@@ -5,6 +5,26 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — `exec --json` could write its envelope into an unrelated open file
+`write_json_envelope` decided where the `--json` exec envelope goes by asking `fcntl(3, F_GETFD)
+>= 0` — *"is descriptor 3 open right now?"* — and, on that answer alone, wrote the envelope there.
+
+That is not the question the fd-3 convention asks. What makes descriptor 3 the envelope channel is
+that the CALLER wired one (`burpwn exec --json … 3>envelope.json`, or the pipe the MCP `run_exec`
+dup2s into place before exec). Descriptor 3 is also simply the first slot the kernel hands out
+after stdio, so in any process that has opened files of its own it is routinely something else
+entirely — and burpwn would write a JSON line straight into it. Since SQLite writes with `pwrite`,
+its descriptors sit at offset 0, so the envelope landed exactly on page 1: the file stopped being
+a database. That is not hypothetical — it is what made two workspace tests look flaky under load.
+Any embedder linking `burpwn-cli`, or any caller that keeps a descriptor of its own around, was
+exposed to the same thing.
+
+burpwn now records **once, as the first thing `main` does**, whether fd 3 was *inherited*, and only
+then treats it as the envelope channel. Nothing else can be mistaken for it later, because the
+answer is taken before this process owns a single descriptor. Unprobed — a test binary, an
+embedder — means "not ours", and the envelope goes to stderr, exactly as it already did when fd 3
+was closed. The documented `3>envelope.json` and the MCP pipe are unaffected: both are inherited.
+
 ### Fixed — the auth auto-refresh left a zombie behind on every 401
 The daemon spawns `burpwn session auth refresh` when it sees a 401/403 on a host that has an auth
 profile, detached with `setsid` so a slow login command can never block the proxy. It then dropped

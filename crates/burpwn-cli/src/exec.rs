@@ -10,8 +10,9 @@
 //! # Output contract
 //!
 //! In normal mode the child inherits the real stdio. In `--json` mode, the JSON
-//! envelope is written to **fd 3** when it is open, else to stderr — never
-//! intermixed with the child's stdout (see [`write_json_envelope`]).
+//! envelope is written to **fd 3** when the CALLER wired one there (see
+//! [`probe_envelope_fd`]), else to stderr — never intermixed with the child's
+//! stdout (see [`write_json_envelope`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -485,33 +486,75 @@ pub fn exec_envelope(result: &ExecResult) -> Envelope {
     Envelope::ok(data)
 }
 
-/// Write the JSON envelope to fd 3 if it is open, else to stderr. NEVER stdout:
-/// the child's stdout passed through there in normal mode and machine consumers
-/// read the envelope off a dedicated channel.
+/// The descriptor the envelope goes to when the CALLER wired one there: the
+/// shell's `3>envelope.json`, or the MCP `run_exec`'s pipe write-end.
+const ENVELOPE_FD: std::os::fd::RawFd = 3;
+
+/// Whether descriptor 3 was already open when this process STARTED, i.e. the
+/// caller handed it to us. `None` until [`probe_envelope_fd`] has run.
+static ENVELOPE_FD_INHERITED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record whether fd 3 was inherited. Call this FIRST in `main`, before opening
+/// anything — the answer is only meaningful before the process has descriptors
+/// of its own.
 ///
-/// Uses `fcntl(3, F_GETFD)` to probe whether fd 3 is open without consuming it,
-/// then writes via a borrowed `File` we explicitly `mem::forget` so we don't
-/// close fd 3 on drop (the parent owns it).
+/// Idempotent; the first call wins.
+pub fn probe_envelope_fd() {
+    // SAFETY: F_GETFD only inspects the descriptor table; it transfers no
+    // ownership and cannot fail destructively. A negative return means fd 3 is
+    // closed/invalid.
+    let open = unsafe { libc::fcntl(ENVELOPE_FD, libc::F_GETFD) } >= 0;
+    let _ = ENVELOPE_FD_INHERITED.set(open);
+}
+
+/// Where the envelope goes: `Some(3)` only when the caller inherited it to us,
+/// `None` (⇒ stderr) otherwise.
+///
+/// This used to ask `fcntl(3, F_GETFD) >= 0` at WRITE time — "is descriptor 3
+/// open *right now*". That is a different question, and answering it yes for a
+/// descriptor we opened ourselves means writing an envelope into somebody
+/// else's file. Descriptor 3 is the first slot the kernel hands out after
+/// stdio, so in any process that is more than a bare `burpwn exec` — the test
+/// binary, an embedder linking this crate — it is routinely a live database,
+/// log or socket. Since SQLite writes with `pwrite`, its file offset stays at
+/// 0, so an envelope lands squarely on page 1 and the file stops being a
+/// database.
+///
+/// The inherited/self-opened distinction is the whole fix, and it is only
+/// answerable at startup, hence [`probe_envelope_fd`]. Unprobed ⇒ not ours.
+fn envelope_fd() -> Option<std::os::fd::RawFd> {
+    ENVELOPE_FD_INHERITED
+        .get()
+        .copied()
+        .unwrap_or(false)
+        .then_some(ENVELOPE_FD)
+}
+
+/// Write the JSON envelope to the caller's fd 3 when there is one, else to
+/// stderr. NEVER stdout: the child's stdout passed through there in normal mode
+/// and machine consumers read the envelope off a dedicated channel.
 pub fn write_json_envelope(env: &Envelope) {
+    write_envelope_line(&format!("{}\n", env.to_json_line()), envelope_fd());
+}
+
+/// Write `line` to `fd`, or to stderr when `fd` is `None`.
+///
+/// The descriptor is BORROWED: the `File` wrapper is `mem::forget`ten so its
+/// destructor never closes a descriptor the caller owns.
+fn write_envelope_line(line: &str, fd: Option<std::os::fd::RawFd>) {
     use std::io::Write;
     use std::os::fd::FromRawFd;
 
-    let line = format!("{}\n", env.to_json_line());
-
-    // SAFETY: F_GETFD only inspects the descriptor table; it does not transfer
-    // ownership. A negative return means fd 3 is closed/invalid.
-    let fd3_open = unsafe { libc::fcntl(3, libc::F_GETFD) } >= 0;
-
-    if fd3_open {
-        // SAFETY: fd 3 is open (checked above). We must not run its destructor
-        // (which would close it), so we forget the File after writing.
-        let mut file = unsafe { std::fs::File::from_raw_fd(3) };
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
-        std::mem::forget(file);
-    } else {
+    let Some(fd) = fd else {
         let _ = std::io::stderr().write_all(line.as_bytes());
-    }
+        return;
+    };
+    // SAFETY: `fd` is open (it was probed at startup, or supplied by a caller
+    // that owns it). We must not run the destructor, so the File is forgotten.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = file.write_all(line.as_bytes());
+    let _ = file.flush();
+    std::mem::forget(file);
 }
 
 #[cfg(test)]
@@ -738,5 +781,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec![mine1, mine2]);
+    }
+
+    /// The envelope must never be written to a descriptor this process opened
+    /// for itself. Nothing calls [`probe_envelope_fd`] in a unit-test binary
+    /// (only `main` does), so the target must be stderr — even though fd 3 is,
+    /// as always in a busy process, wide open and pointing at somebody's file.
+    ///
+    /// This is the regression guard for the corruption: the old code asked
+    /// `fcntl(3, F_GETFD) >= 0` at write time and, on that answer alone, wrote
+    /// the envelope over page 1 of whatever lived there — reproducibly, another
+    /// test's `session.db`, which then failed to open with "file is not a
+    /// database".
+    ///
+    /// Deliberately no "and fd 3 really is open right now" precondition: that
+    /// state belongs to whichever sibling test last opened a file, so asserting
+    /// on it would make THIS test flaky — the exact disease being cured. The
+    /// invariant that matters holds by construction: unprobed ⇒ never fd 3.
+    #[test]
+    fn envelope_never_targets_an_fd_we_opened_ourselves() {
+        assert_eq!(
+            envelope_fd(),
+            None,
+            "an fd 3 this process opened itself is NOT the caller's envelope channel"
+        );
+    }
+
+    /// `write_envelope_line` writes the line to the descriptor it was given and
+    /// leaves that descriptor OPEN — the caller owns it, so the borrowed `File`
+    /// must not be closed on drop.
+    #[test]
+    fn write_envelope_line_writes_to_its_fd_and_does_not_close_it() {
+        use std::io::Read;
+
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-element array; pipe2 fills it.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        write_envelope_line("{\"ok\":true}\n", Some(write_fd));
+        // Still open: writing again must succeed, and only then do we close it
+        // so the reader sees EOF.
+        assert!(
+            unsafe { libc::fcntl(write_fd, libc::F_GETFD) } >= 0,
+            "the borrowed fd must not have been closed"
+        );
+        unsafe { libc::close(write_fd) };
+
+        // SAFETY: read_fd is open and owned by us from here on.
+        let mut r = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(read_fd) };
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "{\"ok\":true}\n");
     }
 }

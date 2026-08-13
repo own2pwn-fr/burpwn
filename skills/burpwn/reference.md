@@ -183,7 +183,7 @@ cannot use them (WSL). `--quick` skips the live probe.
 - `--workspace <id>` — attribute captured flows to a workspace.
 - `--timeout <secs>` — wall-clock timeout for the command.
 - `--session <n>` — session to run under (defaults to the active session).
-- With `--json`, the `{exit_code, exec_id, captured_request_ids}` envelope is written to **fd 3**, keeping the command's own stdout clean.
+- With `--json`, the `{exit_code, exec_id, captured_request_ids}` envelope is written to **fd 3**, keeping the command's own stdout clean. fd 3 must be *inherited* (`3>file`, or a pipe wired by the caller); if burpwn did not start with one, the envelope goes to stderr instead.
 
 ## req
 - `burpwn req list [OPTIONS] [--json]`

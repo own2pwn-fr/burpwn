@@ -3,6 +3,15 @@
 //! `__netns-agent` re-exec helper.
 
 fn main() {
+    // FIRST, before this process opens a single descriptor of its own: record
+    // whether the caller handed us fd 3 for the `--json` exec envelope (the
+    // shell's `3>envelope.json`, the MCP `run_exec` pipe). Asked any later, the
+    // question stops being answerable — descriptor 3 is simply the first slot
+    // the kernel reuses, so "is it open?" would start meaning "did WE open
+    // something?", and the envelope would be written over it. See
+    // `burpwn_cli::exec::probe_envelope_fd`.
+    burpwn_cli::exec::probe_envelope_fd();
+
     // Internal re-exec path: when launched as `burpwn __netns-agent` by the
     // sandbox runtime, run the in-namespace helper directly — no tokio runtime,
     // no clap parsing (this process was execve'd inside a fresh userns+netns and
