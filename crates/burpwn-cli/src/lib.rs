@@ -61,6 +61,7 @@ pub mod hooks;
 pub mod initcheck;
 pub mod mcpreg;
 pub mod paths;
+pub mod render;
 pub mod replay;
 pub mod skill;
 pub mod wrap_hook;
@@ -137,7 +138,7 @@ fn terminate(json: bool, paths: &Paths, result: Result<i32>) -> i32 {
     if json {
         println!("{}", envelope::Envelope::diagnostic(&diag).to_json_line());
     } else {
-        eprintln!("{}", diag.render());
+        eprintln!("{}", render::error_block(&diag.render()));
     }
     diag.exit_code()
 }
@@ -149,7 +150,7 @@ fn report_without_paths(json: bool, err: &anyhow::Error) -> i32 {
     if json {
         println!("{}", envelope::Envelope::diagnostic(&diag).to_json_line());
     } else {
-        eprintln!("{}", diag.render());
+        eprintln!("{}", render::error_block(&diag.render()));
     }
     diag.exit_code()
 }

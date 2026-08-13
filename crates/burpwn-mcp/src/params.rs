@@ -42,9 +42,10 @@ pub struct ReqListParams {
 pub struct ReqShowParams {
     /// Flow id to fetch.
     pub id: i64,
-    /// When true, include the verbatim request/response head + body bytes as
-    /// lossy UTF-8 `raw_request` / `raw_response` fields in addition to the
-    /// decoded view.
+    /// When true, return the verbatim request/response head + body bytes as
+    /// lossy UTF-8 `raw_request` / `raw_response` INSTEAD of the decoded
+    /// `headers`/`body` (which would be the same bytes a second time). The
+    /// decoded metadata — method, path, status, timings — comes back either way.
     #[serde(default)]
     pub raw: bool,
 }

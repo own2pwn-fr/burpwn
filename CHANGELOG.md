@@ -5,6 +5,63 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — output has a shape now, and it depends on who is reading
+Every command wrote its output with `println!` and a hard-coded width: 123 of them in
+`commands.rs`, thirty-one of which open-coded their own `if json { … } else { … }`. There were two
+consequences. A human got columns that only lined up until the first long URL, because `{:>6}` is a
+guess and not a measurement. And an **agent** — which reads the same text, since a tool call
+captures stdout — paid for column headers, alignment padding, footers and `(no flows)` in tokens,
+on every turn it kept the result in context.
+
+The output layer now decides once, at startup, what stdout actually is:
+- **A terminal** gets columns measured on the data, headers, semantic colour and a summary footer,
+  with the longest column ellipsised so a row never wraps. Colour means something: HTTP status
+  classes, the fuzz anomaly gradient, `yes`/`NO` in `doctor`, and the tag colour that has been
+  sitting in the `tags` table since v1 colouring precisely nothing.
+- **A pipe, a file, or an agent's capture buffer** gets the data and nothing else: one record per
+  line, TAB-separated, no header, no footer, no padding, no colour — and no truncation, so the
+  value comes out **whole** where a terminal would have cut it. `awk` splits on the tab by default
+  and `cut -f` uses it as its delimiter; an empty field is emitted as `-` so column positions never
+  shift. An empty listing prints nothing at all rather than `(no flows)`, which is a line a parser
+  would otherwise have to know about.
+- **`--json` is untouched**: one envelope line on stdout and nothing else. A test now drives the
+  real binary to assert exactly that, for both a success and a failure.
+
+This is not "colour when it is a TTY". Colour is the least of it — headers, footers and padding are
+comfort a person reads and a program pays for, so what changes between the two modes is the
+*structure*. Concretely: `doctor` prints its checks in both modes but keeps the `NOT ready —` line
+and the remediation arrows for the terminal (the exit code and the `--json` payload already carry
+them); `req replay` drops its `replayed flow 42 -> 200` line and hands over just the response bytes;
+`compare` and `decode jwt` come back as rows instead of the re-indented JSON blob they used to print
+at a human.
+- `NO_COLOR` (present, any value) disables colour; `CLICOLOR_FORCE` (present, not `0`) forces it
+  even in a pipe; `COLUMNS` overrides the detected terminal width. Two new direct dependencies,
+  `anstyle` and `anstream` — both already in the lockfile via clap, so the build costs nothing.
+- The error block on stderr is coloured **only** when stderr is a terminal, and only by adding
+  escape codes: piped or redirected it is byte-for-byte the text the README documents and
+  `burpwn-error`'s own test asserts.
+- Fixed on the way past: the two Intruder tables interpolated `serde_json::Value`s directly, so
+  `{:>6}` padded nothing at all (`Display` for a `Value` ignores the formatter width) and a string
+  payload printed with its JSON quotes still attached. The ranked results now align, and the
+  anomaly score carries the gradient — this is the one listing whose whole point is that the
+  outlier is seen before it is read.
+
+### Changed — MCP replies stop charging the agent for nothing
+A tool result is not a screen, it is context: whatever comes back is carried for the rest of the
+conversation and paid for on every subsequent turn.
+- `req_show --raw` sent the request and response **twice** — once decoded, once verbatim. The raw
+  form now replaces the decoded `headers`/`body` instead of being added to them, halving the reply
+  for the biggest payload in the whole tool surface. The decoded metadata (method, path, status,
+  timings) still comes back either way, because that is what the agent branches on without reading
+  the bytes.
+- Listings drop their `null` members (`req_list`, `group_show`, `fuzz_list`, `fuzz_results`,
+  `hook_list`, `tag_list`, `workspace_list`, `match_replace_list`, `session_auth_status`). A null
+  costs a key, a colon, four letters and a comma to say exactly what an absent key says; a capture
+  full of DNS and raw-TCP flows is mostly nulls, and such a listing shrinks by about a third.
+  Nothing is renamed or reshaped — a consumer reading `row.sni` gets `undefined` instead of `null`.
+- `fuzz_results` no longer repeats the `attack_id` on every result row: it is the argument the
+  caller just passed in.
+
 ### Added — hooks: do something to every request, not just rewrite one
 Everything burpwn could do to traffic in flight, it did by *substitution*. A match/replace rule
 rewrites text that is already in the message, which leaves two holes big enough to walk through.
