@@ -272,11 +272,15 @@ fn why_not(action: &HookAction, phase: HookPhase) -> String {
     match action {
         HookAction::Exec { .. } => format!(
             "an exec hook runs a command in a sandbox, and a {} hook fires on every \
-             message on the wire — one command per websocket frame (or per name a \
-             page resolves) would cost more than the traffic it watches. Put the \
-             exec hook on pre-request and let the socket inherit the token from \
-             its upgrade request",
-            phase.as_str()
+             {} — one sandbox each would cost more than the traffic it watches. \
+             Put the exec hook on pre-request: a socket inherits what its upgrade \
+             request carried",
+            phase.as_str(),
+            if phase.is_ws() {
+                "message the socket carries"
+            } else {
+                "name the workload resolves"
+            }
         ),
         HookAction::ReplacePayload { .. } => {
             "it rewrites a websocket payload, so it needs --phase ws-c2s or ws-s2c".into()

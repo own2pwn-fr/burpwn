@@ -86,7 +86,8 @@ pub enum Command {
         action: MatchReplaceAction,
     },
 
-    /// Hooks: run an action before a request / after a response.
+    /// Hooks: run an action on a request, a response, a WebSocket message or a
+    /// DNS query the proxy is about to relay.
     Hook {
         /// Hook subcommand.
         #[command(subcommand)]
@@ -773,6 +774,13 @@ pub struct HookAddArgs {
 /// hook can put in what is not there (`add-header`), take it out, refuse the
 /// flow (`drop`), or park the request behind a command whose output it injects
 /// (`exec` — a token mint, a request signer).
+///
+/// The phase decides what the message is, and therefore which actions mean
+/// anything: `pre-request`/`post-response` carry an HTTP message, `ws-c2s`/
+/// `ws-s2c` one complete WebSocket message on an open socket
+/// (`drop`/`replace-payload`), `dns-query` one name before it is resolved
+/// (`drop`/`set-answer`). A pairing that could not work is refused by
+/// `hook add`, not ignored on the wire.
 // `Add` carries every flag of the richest command in the tree; boxing it to
 // even out the variants would cost an allocation on a one-shot CLI parse for
 // nothing, and clap's derive wants the args by value.

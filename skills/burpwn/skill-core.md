@@ -226,7 +226,7 @@ burpwn match-replace list
 burpwn match-replace disable <id>          # also: enable <id>, rm <id>
 ```
 
-## Hooks (act on every request / response)
+## Hooks (act on every message the proxy relays)
 
 A rule REWRITES what is already in a message. A hook can add what is not there,
 take it out, refuse the flow, or run a command and inject what it prints.
@@ -253,6 +253,31 @@ only one hook command runs at a time, so a hook whose command talks to the targe
 cannot trigger itself; concurrent requests on a cold `--ttl` wait for that one
 command (bounded) and are all hooked with its value. `req replay` and `fuzz`
 apply the declarative hooks only.
+
+Hooks also reach past HTTP, on phases where the message is not a request:
+
+```sh
+# flip a field in every message the page sends over its socket, live —
+# there is no replaying a message that only exists inside an open socket
+burpwn hook add esc --phase ws-c2s --host chat.target.com --path /socket \
+  --action replace-payload --find '"role":"user"' --replace '"role":"admin"'
+
+# block one direction of a socket, or force a name to resolve where you want
+burpwn hook add mute --phase ws-s2c --path /telemetry --action drop
+burpwn hook add pin --phase dns-query --host internal.target.com \
+  --action set-answer --answer 10.0.0.5
+```
+
+`ws-c2s`/`ws-s2c` fire on each COMPLETE message (fragments are reassembled
+first, the direction is the one `req show` prints) and take `drop` and
+`replace-payload`; `dns-query` fires on each name before it is resolved and
+takes `drop` (answers `REFUSED`) and `set-answer` (`A`/`AAAA` only, anything
+else still goes upstream). The header actions and `exec` are REFUSED on those
+phases rather than ignored — a frame has no headers, and a phase that fires per
+message must not run a sandbox per message. Control frames (ping/pong/close) and
+a socket that negotiated `permessage-deflate` are always spliced verbatim: see
+`reference.md` for why, along with why raw TCP and TLS passthrough have nothing
+a hook could act on.
 
 ## Organize: workspaces, groups, tags, notes, export
 

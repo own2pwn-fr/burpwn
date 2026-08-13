@@ -5,6 +5,69 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — hooks reach the socket the page keeps open, and the names it resolves
+Hooks stopped where HTTP stopped. That is a real boundary for raw TCP and TLS passthrough, and it
+was never one for WebSockets: an application that does its work over a socket — the chat, the
+trading UI, the live console — put every interesting message out of reach, and "the upgrade request
+is hooked" answers a different question. Worse, a message that only exists inside a socket a page
+is holding open cannot be replayed either, so there was nothing else to reach for. DNS had the same
+shape: the shim watched every name the sandbox resolved and could do nothing about any of them,
+while "make this name resolve here" is a standing pentest need.
+
+A hook now fires on four more phases. `--phase ws-c2s` / `ws-s2c` act on each COMPLETE WebSocket
+message (fragments reassembled first) in one direction, and `--phase dns-query` acts on each name
+before it is resolved:
+
+```sh
+burpwn hook add esc --phase ws-c2s --host chat.target.com --path /socket \
+  --action replace-payload --find '"role":"user"' --replace '"role":"admin"'
+burpwn hook add mute --phase ws-s2c --path /telemetry --action drop
+burpwn hook add pin --phase dns-query --host internal.target.com \
+  --action set-answer --answer 10.0.0.5
+```
+
+The direction is spelled the way the capture already spells it: `req show` labels every message
+`c2s`/`s2c`, so a hook can be written from what was just read (`ws-send`/`ws-recv` are accepted as
+aliases, because "sent by whom" has two answers and a phase must not).
+
+**An action that means nothing on a phase is now an error, not a hook that never fires.** A frame
+has no headers and a query has no target, so `add-header` there is not a no-op waiting to happen —
+`hook add` refuses it, names the phase, and says what the phase can do instead. `exec` is refused on
+the new phases too, and on cost rather than on meaning: they fire per message, and one hook command
+is one sandbox. Both new paths are synchronous in the engine, which makes a command there impossible
+rather than merely forbidden.
+
+The guarantees are the ones the HTTP phases already had, and they are what most of the work went
+into. With nothing configured the cost is one relaxed atomic load per socket read and per query, and
+the splice is byte-for-byte what it was. With a hook configured, a message nobody changed is relayed
+as the exact bytes it arrived as — masking and fragmentation included — and only a payload something
+rewrote is re-framed; the pump switches between the two only at a message boundary, so a hook added
+mid-socket still applies without a byte being forwarded twice or lost. A hook command's own socket
+and its own DNS bypass the engine on the same `hook:` marker as its requests, or a `dns-query` drop
+would break the login macro of the hook that needs it. And a `set-answer` that cannot be honoured —
+an `A` hook asked for an `MX` record, a query that will not decode — resolves upstream instead of
+inventing a record.
+
+Two things stay verbatim on purpose. Control frames (ping/pong/close) are never hooked: dropping a
+`close` leaks the socket and rewriting a `ping` breaks the pong echo the peer owes. And a socket that
+negotiated `permessage-deflate` is not hooked at all, loudly, because its payloads are a shared
+DEFLATE stream — a `--find` would compare against compressed bytes, and rewriting one message would
+desynchronize the peer's decompressor for every message after it.
+
+There is deliberately no `dns-response` phase. Rewriting an answer that came back means re-encoding
+records burpwn did not make (CNAME chains, EDNS(0), DNSSEC material), while the case anyone actually
+wants is served by answering the query instead of asking. What burpwn synthesizes it builds from the
+query — same id, same question, one record, `REFUSED` for a drop rather than a silence the client
+spends seconds retrying — and it says in the docs what such an answer is not: no OPT record, no
+signature, so a client that validates DNSSEC will correctly refuse it. Raw TCP and TLS passthrough
+stay out for reasons that are now written down rather than asserted: for raw TCP there is no message
+to scope on (the class exists because nothing parsed), and for passthrough burpwn never had the
+plaintext at all.
+
+No migration: `phase` and `action` are TEXT and `params` is JSON, so the new hooks fit schema v8 as
+it stands. An older burpwn reading a session that has one skips the row with a warning, which is what
+`HookPhase::from_db` has always done rather than guess.
+
 ### Fixed — `--protocol` answered a question nobody asked
 `Protocol::from_db` maps an unknown value to `RawTcp`, which is the right reading of a label a
 newer burpwn wrote into the store and the wrong reading of a value a human typed. The `--protocol`

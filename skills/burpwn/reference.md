@@ -231,13 +231,34 @@ a hook can add what is not there, remove it, drop the flow, or run a command and
 inject what it prints.
 - `burpwn hook add <NAME> --action <ACTION> [OPTIONS] [--json]`
   - `--action` — `add-header` (only if absent), `set-header` (add-or-replace),
-    `remove-header`, `set-query-param`, `drop`, `exec`.
-  - `--phase <pre-request|post-response>` — default `pre-request`.
+    `remove-header`, `set-query-param`, `drop`, `exec`, `replace-payload`,
+    `set-answer`.
+  - `--phase` — default `pre-request`. One of:
+    - `pre-request` / `post-response` (aliases `req` / `resp`) — an HTTP
+      message. Every action except `replace-payload` and `set-answer`.
+    - `ws-c2s` / `ws-s2c` (aliases `ws-send` / `ws-recv`) — one COMPLETE
+      WebSocket message, client→server / server→client, after the upgrade.
+      The direction is the one `req show` prints per message. Actions:
+      `drop`, `replace-payload`.
+    - `dns-query` (alias `dns`) — one name the sandbox resolves, before it is
+      resolved. Actions: `drop` (answer `REFUSED`), `set-answer`.
+  - An action that does not apply to the phase is an ERROR at `hook add` time,
+    not a hook that silently never fires. `exec` is HTTP-only: these phases fire
+    per message, and one command is one sandbox.
   - Scope (every non-empty field must match; all optional): `--host <SUBSTRING>`
     (`*.example.com` accepted), `--method <METHOD>`, `--path <SUBSTRING>`,
-    `--status <CODE>` (post-response only).
+    `--status <CODE>` (post-response only). On `ws-*` the host/path are the
+    UPGRADE request's, and `--method`/`--status` are refused. On `dns-query`
+    `--host` is the queried NAME and `--path` the record type (`/A`, `/AAAA`) —
+    the spelling `req list` renders (`dns://example.com./A`).
   - `--header 'Name: value'` for the header actions (a bare `Name` for
     `remove-header`), `--param name=value` for `set-query-param`.
+  - `replace-payload` only: `--find <TEXT>` (literal, not a regex — a payload is
+    bytes) and `--replace <TEXT>` (omit to delete the match). Every occurrence in
+    the message is replaced.
+  - `set-answer` only: `--answer <IP>`. Only a query whose type matches the
+    family (`A` for v4, `AAAA` for v6) is answered; anything else still goes
+    upstream.
   - `exec` only: `--cmd <COMMAND>` (run as `sh -c` IN THE SANDBOX, so its traffic
     is captured — and never re-hooked), `--extract <REGEX>` (exactly one capture
     group), and one of `--inject-header 'Name: prefix {}'` /
@@ -254,13 +275,38 @@ inject what it prints.
 - `burpwn hook test <ID> --flow <FLOW_ID> [--json]` — replay the hook against a
   CAPTURED flow and report `matched` / `changed` / `dropped` plus the before and
   after. No live traffic. For an `exec` hook the command really runs, so this is
-  also how you check the extraction regex still matches.
+  also how you check the extraction regex still matches. HTTP phases only: a
+  `ws-*`/`dns-query` hook has no captured request to replay against and is
+  refused rather than guessed at — watch it live (`req list --protocol ws|dns`).
 
-Not hooked: WebSocket FRAMES (the upgrade request itself is), raw TCP, TLS
-passthrough and DNS — a hook acts on an HTTP request/response, and none of those
-have one.
+Not hooked, and why:
+- **WebSocket control frames** (ping/pong/close) — forwarded verbatim. Dropping
+  a `close` leaks the socket; rewriting a `ping` breaks the pong echo the peer
+  is required to send back.
+- **A WebSocket that negotiated `permessage-deflate`** — the payloads are a
+  shared DEFLATE stream, so a `--find` would compare against compressed bytes
+  and a rewrite would desynchronize the peer's decompressor for every message
+  after it. Such a socket is spliced verbatim and a WARN says so.
+- **DNS responses** — there is no `dns-response` phase. Rewriting an answer that
+  came back means re-encoding records burpwn did not make (CNAME chains,
+  EDNS(0), DNSSEC); "force this name to resolve here" is served by `set-answer`
+  on the query instead. A synthesized answer carries no OPT record and no
+  signature, so a client that validates DNSSEC will (correctly) refuse it.
+- **Raw TCP** (`--protocol rawtcp`) — burpwn has the bytes and nothing else: the
+  class exists because the stream matched no protocol it can parse. There is no
+  message to scope on and no field to edit.
+- **TLS passthrough** (`--protocol tls-passthru`) — burpwn never had the
+  plaintext. That flow is the case where MITM was skipped or refused (a pinned
+  certificate), so the bytes are ciphertext under a key it does not hold. No
+  hook and no match/replace rule can touch it; the fix is to make the flow
+  MITM-able.
 
-Notes: hooks run after match/replace and before the intercept, on both phases.
+Notes: hooks run after match/replace and before the intercept, on both HTTP
+phases. A `ws-*` hook applies to sockets that are ALREADY OPEN (at the next
+message boundary), and a message no hook changed is relayed as the exact bytes
+it arrived as — masking and fragmentation included; only a payload something
+rewrote is re-framed. A dropped WebSocket message is not relayed and not
+recorded, the way a dropped request never becomes a flow.
 `exec` hooks run **one command at a time for the whole proxy** — a second request
 that needs a fresh value while one is running never starts its own command. It
 waits for the running one and reads the value out of the TTL cache, so a burst on
