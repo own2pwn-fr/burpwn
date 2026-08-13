@@ -333,7 +333,10 @@ async fn handle_inner(
         headers: msg.headers.clone(),
         body: msg.body.clone(),
     };
-    let intercepted = ctx.intercept.is_enabled();
+    // Recorded on the flow below: "this request was actually parked", not the
+    // global toggle — a scope filter that never matched this host would still
+    // have flagged every flow as intercepted.
+    let intercepted = ctx.intercept.would_park(&idata);
     match ctx
         .intercept
         .intercept(InterceptKind::Request, idata.clone())

@@ -166,8 +166,8 @@ impl r2d2::CustomizeConnection<Connection, rusqlite::Error> for ReadOnlyCustomiz
 mod tests {
     use super::*;
     use crate::model::{
-        FlowFilter, FlowStart, InterceptState, MatchKind, NewAttack, NewAttackResult,
-        NewMatchReplaceRule, Protocol, RequestData, ResponseData, WsDirection,
+        FlowFilter, FlowStart, MatchKind, NewAttack, NewAttackResult, NewMatchReplaceRule,
+        Protocol, RequestData, ResponseData, WsDirection,
     };
     use tempfile::TempDir;
 
@@ -502,21 +502,6 @@ mod tests {
             Some("login form -> POST /login")
         );
         assert_eq!(groups[0].created_at, 42);
-
-        // Intercept queue.
-        let intercept_id = w.enqueue_intercept(flow_id, 500).await.unwrap();
-        let pending = reader.pending_intercepts().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, intercept_id);
-        w.resolve_intercept(intercept_id, InterceptState::Forwarded, 600)
-            .await
-            .unwrap();
-        assert!(reader.pending_intercepts().unwrap().is_empty());
-        let forwarded = reader
-            .list_intercepts(Some(InterceptState::Forwarded))
-            .unwrap();
-        assert_eq!(forwarded.len(), 1);
-        assert_eq!(forwarded[0].resolved_at, Some(600));
     }
 
     /// Flow groups end to end: membership, the `group_id` filter, and the

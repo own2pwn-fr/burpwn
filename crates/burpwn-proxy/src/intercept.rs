@@ -225,6 +225,20 @@ impl InterceptController {
         }
     }
 
+    /// Whether a message with this `data` would actually be PARKED right now —
+    /// i.e. interception is on AND the scope filter matches. Exactly the
+    /// condition [`InterceptController::intercept`] tests before it parks.
+    ///
+    /// The proxy records this on `flows.intercepted`. It used to record bare
+    /// [`is_enabled`](Self::is_enabled), which claims every flow captured while
+    /// interception was armed was held — including the ones the scope filter
+    /// waved straight through. Evaluated immediately before the `intercept`
+    /// call, so the only way the two can disagree is an enable/disable toggle
+    /// landing in that instant.
+    pub fn would_park(&self, data: &InterceptData) -> bool {
+        self.is_enabled() && self.inner.scope.lock().matches(data)
+    }
+
     /// The intercept entry point called by the proxy handler. Returns a decision
     /// the handler acts on. Disabled/out-of-scope ⇒ immediate `Forward(None)`.
     pub async fn intercept(&self, kind: InterceptKind, data: InterceptData) -> InterceptDecision {
@@ -299,6 +313,40 @@ mod tests {
             .intercept(InterceptKind::Request, data("example.com", "GET", "/"))
             .await;
         assert_eq!(d, InterceptDecision::Forward(None));
+    }
+
+    /// `would_park` is what the proxy stamps on `flows.intercepted`, so it must
+    /// track the PARK decision (enabled AND in scope), not the global toggle.
+    #[tokio::test]
+    async fn would_park_tracks_the_park_decision_not_the_global_toggle() {
+        let c = InterceptController::new();
+        let in_scope = data("target.test", "GET", "/");
+        let out_of_scope = data("example.com", "GET", "/");
+
+        // Disabled: nothing parks.
+        assert!(!c.would_park(&in_scope));
+
+        // Enabled, no scope filter: everything parks.
+        c.set_enabled(true);
+        assert!(c.would_park(&in_scope));
+        assert!(c.would_park(&out_of_scope));
+
+        // Enabled WITH a scope filter: only what the filter selects parks —
+        // this is the case the old `is_enabled()` got wrong.
+        c.set_scope(InterceptScope {
+            host_contains: "target.test".into(),
+            ..Default::default()
+        });
+        assert!(c.would_park(&in_scope));
+        assert!(
+            !c.would_park(&out_of_scope),
+            "an out-of-scope flow is forwarded untouched; it was never intercepted"
+        );
+        // And it agrees with what `intercept` actually does with that flow.
+        assert_eq!(
+            c.intercept(InterceptKind::Request, out_of_scope).await,
+            InterceptDecision::Forward(None)
+        );
     }
 
     #[tokio::test]

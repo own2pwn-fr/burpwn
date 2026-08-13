@@ -586,56 +586,11 @@ pub struct NewHook {
     pub ttl_ms: i64,
 }
 
-/// State of an intercepted flow held in the intercept queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InterceptState {
-    /// Waiting for an operator/agent decision.
-    Pending,
-    /// Released unchanged.
-    Forwarded,
-    /// Dropped without forwarding.
-    Dropped,
-    /// Released after edits.
-    Modified,
-}
-
-impl InterceptState {
-    /// DB string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            InterceptState::Pending => "pending",
-            InterceptState::Forwarded => "forwarded",
-            InterceptState::Dropped => "dropped",
-            InterceptState::Modified => "modified",
-        }
-    }
-
-    /// Parse from DB string; defaults to `Pending`.
-    pub fn from_db(s: &str) -> InterceptState {
-        match s {
-            "forwarded" => InterceptState::Forwarded,
-            "dropped" => InterceptState::Dropped,
-            "modified" => InterceptState::Modified,
-            _ => InterceptState::Pending,
-        }
-    }
-}
-
-/// A row in the intercept queue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Intercept {
-    /// Intercept id.
-    pub id: i64,
-    /// Flow being intercepted.
-    pub flow_id: i64,
-    /// Current state.
-    pub state: InterceptState,
-    /// When the intercept was created.
-    pub created_at: i64,
-    /// When it was resolved, if it has been.
-    pub resolved_at: Option<i64>,
-}
+// An intercept is a SYNCHRONOUS, in-flight decision: the proxy handler parks on
+// a oneshot inside `burpwn_proxy::InterceptController` and unblocks the moment an
+// operator forwards, edits or drops. Nothing outlives the flow, so there is no
+// `Intercept` row type here (and no `intercepts` table — dropped in schema v7).
+// What DID survive is `flows.intercepted`, recorded at flow start.
 
 /// Filter for [`crate::Reader::list_flows`]. All fields are optional; `None`
 /// means "no constraint on this dimension".

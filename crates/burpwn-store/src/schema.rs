@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
@@ -27,6 +27,7 @@ const MIGRATIONS: &[(i64, MigrationStep)] = &[
     (4, migrate_v4),
     (5, migrate_v5),
     (6, migrate_v6),
+    (7, migrate_v7),
 ];
 
 /// Apply pending migrations, stamp the version, and ensure the default
@@ -221,15 +222,9 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
         -- The proxy reads hooks by phase, in application order.
         CREATE INDEX IF NOT EXISTS idx_hooks_phase ON hooks(phase, ord, id);
 
-        CREATE TABLE IF NOT EXISTS intercepts (
-            id          INTEGER PRIMARY KEY,
-            flow_id     INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
-            state       TEXT NOT NULL DEFAULT 'pending',
-            created_at  INTEGER NOT NULL,
-            resolved_at INTEGER
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_intercepts_state ON intercepts(state);
+        -- (`intercepts` used to be created here; it was never written outside its
+        -- own tests and is dropped by migrate_v7. Interception is a synchronous
+        -- in-flight decision, so it has no persistent form.)
 
         -- FTS5 index over decoded message text. We feed it decoded text
         -- (url + host + bodies, status + headers + bodies) keyed by the flow id
@@ -465,6 +460,25 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v7: drop `intercepts`. The table promised a persistent intercept history that
+/// never existed — nothing outside the store's own tests ever inserted a row.
+/// Interception is a SYNCHRONOUS decision: the proxy handler parks on a oneshot
+/// inside `burpwn_proxy::InterceptController` and unblocks the instant an
+/// operator forwards / edits / drops. There was no consumer for a persisted
+/// queue (not the CLI, not MCP, not the export bundle), and an empty table in
+/// the schema is an invitation to write a feature against a queue nobody fills.
+///
+/// The one durable trace of an intercept stays where it belongs: `flows.intercepted`.
+///
+/// Destructive but lossless in practice (only ever empty in the field), and
+/// `IF NOT EXISTS`-guarded so the step is a no-op on the fresh-create replay —
+/// where the v1 baseline no longer creates the table at all — and on a bundle
+/// exported before v7, which is migrated here during staging like any old file.
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS intercepts;")?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -540,7 +554,6 @@ mod tests {
             "notes",
             "match_replace_rules",
             "hooks",
-            "intercepts",
             "flows_fts",
             "ws_messages",
             "attacks",
@@ -550,6 +563,9 @@ mod tests {
         ] {
             assert!(table_exists(&conn, t), "missing table {t}");
         }
+
+        // v7: a fresh file must NOT carry the dead intercept queue.
+        assert!(!table_exists(&conn, "intercepts"));
 
         // v3 TLS columns present on a fresh create.
         for c in ["tls_version", "tls_cipher", "tls_alpn", "origin_cert_fp"] {
@@ -960,6 +976,69 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM hooks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn migrates_v6_to_v7_drops_the_dead_intercept_queue() {
+        // A file in the real v6 shape: everything v6 shipped, `intercepts`
+        // included (with a row, as an old test-built file could have), stamped
+        // at user_version = 6.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE intercepts (
+                id          INTEGER PRIMARY KEY,
+                flow_id     INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+                state       TEXT NOT NULL DEFAULT 'pending',
+                created_at  INTEGER NOT NULL,
+                resolved_at INTEGER
+            );
+            CREATE INDEX idx_intercepts_state ON intercepts(state);
+            INSERT INTO workspaces(id, name, created_at) VALUES (1, 'default', 0);
+            INSERT INTO flows(id, workspace_id, ts_start, client_addr, dst_ip, dst_port, scheme, protocol)
+                VALUES (7, 1, 111, '127.0.0.1:1', '10.0.0.1', 443, 'https', 'h1');
+            INSERT INTO intercepts(flow_id, state, created_at) VALUES (7, 'pending', 5);
+            INSERT INTO match_replace_rules(id, enabled, scope, match_kind, pattern, replacement, on_request)
+                VALUES (1, 1, 'api.test', 'header', '^Authorization:.*', 'Authorization: Bearer x', 1);
+            "#,
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        assert!(table_exists(&conn, "intercepts"));
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(!table_exists(&conn, "intercepts"), "v7 must drop the table");
+        assert!(!index_exists(&conn, "idx_intercepts_state"));
+
+        // Nothing else is disturbed: the flow and the rule are still there.
+        let flows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(flows, 1);
+        let pattern: String = conn
+            .query_row(
+                "SELECT pattern FROM match_replace_rules WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pattern, "^Authorization:.*");
+
+        // Idempotent second init.
+        init(&conn).unwrap();
     }
 
     #[test]

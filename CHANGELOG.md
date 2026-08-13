@@ -5,6 +5,33 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed — the `intercepts` table, which nothing ever wrote (schema v7)
+The schema carried an `intercepts` table since v1, and the store exposed `enqueue_intercept`,
+`resolve_intercept`, `list_intercepts` and `pending_intercepts` against it. No production caller
+ever touched any of them: the proxy handler parks on a oneshot inside `InterceptController` and
+unblocks the instant an operator forwards, edits or drops it. Interception is a **synchronous
+decision taken in flight** — nothing about it outlives the flow it belongs to.
+
+So the table was a promise the code never kept. Reading the schema, an intercept history looks
+persisted; it never was, and the CLI, the MCP surface and the export bundle all read it exactly
+zero times. Nothing wanted it either: an audit trail of "which flows were held" is already
+`flows.intercepted`, and replay works off `flows`/`requests`, not off a decision queue. An empty
+table sitting in the schema is not neutral — it is where the next feature gets written against a
+queue nobody fills.
+
+Schema **v7** drops it. Old files are migrated in place on open; a session bundle exported before
+v7 still imports, because staging runs the same migration on the unpacked copy before it is moved
+into place.
+
+### Fixed — `flows.intercepted` said "interception was armed", not "this flow was held"
+The column was written from `InterceptController::is_enabled()` — the GLOBAL toggle. With a scope
+filter set (`intercept scope --host api.target`), every flow captured while interception was on
+was flagged as intercepted, including the ones the filter waved straight through untouched. The
+one column that is supposed to answer "was this request held?" answered a different question.
+
+It is now written from the actual park decision, enabled **and** in scope, evaluated immediately
+before the intercept call — the same condition `intercept()` itself tests.
+
 ### Changed — the MCP `compare` tool stops handing over a whole page of diff
 `compare` returns the body diff as two lists of lines, one per side. Two HTML pages that differ
 share almost no lines, so those lists are routinely thousands of lines long — and unlike every

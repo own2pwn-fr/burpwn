@@ -12,9 +12,8 @@ use crate::blob::get_blob;
 use crate::error::Result;
 use crate::model::{
     Attack, AttackResult, AuthProfile, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow,
-    Group, Hook, HookAction, HookPhase, HookScope, Intercept, InterceptState, MatchKind,
-    MatchReplaceRule, Note, Protocol, RequestData, ResponseData, Tag, Workspace, WsDirection,
-    WsMessage,
+    Group, Hook, HookAction, HookPhase, HookScope, MatchKind, MatchReplaceRule, Note, Protocol,
+    RequestData, ResponseData, Tag, Workspace, WsDirection, WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -703,44 +702,6 @@ impl Reader {
             })
         })?;
         collect(rows)
-    }
-
-    /// List intercepts, optionally filtered by state. Newest first.
-    pub fn list_intercepts(&self, state: Option<InterceptState>) -> Result<Vec<Intercept>> {
-        let conn = self.conn()?;
-        let mapper = |r: &rusqlite::Row| {
-            let s: String = r.get(2)?;
-            Ok(Intercept {
-                id: r.get(0)?,
-                flow_id: r.get(1)?,
-                state: InterceptState::from_db(&s),
-                created_at: r.get(3)?,
-                resolved_at: r.get(4)?,
-            })
-        };
-        match state {
-            Some(st) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, flow_id, state, created_at, resolved_at FROM intercepts
-                     WHERE state = ?1 ORDER BY id DESC",
-                )?;
-                let rows = stmt.query_map([st.as_str()], mapper)?;
-                collect(rows)
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, flow_id, state, created_at, resolved_at FROM intercepts
-                     ORDER BY id DESC",
-                )?;
-                let rows = stmt.query_map([], mapper)?;
-                collect(rows)
-            }
-        }
-    }
-
-    /// Pending intercept queue (convenience over [`list_intercepts`]).
-    pub fn pending_intercepts(&self) -> Result<Vec<Intercept>> {
-        self.list_intercepts(Some(InterceptState::Pending))
     }
 
     // ---- session-auth profiles (schema v4) ----
