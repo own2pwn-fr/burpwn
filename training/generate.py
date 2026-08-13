@@ -222,10 +222,12 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       {"action":"replace-payload",find,replace} or {"action":"set-answer",ip}
       (``ip`` is a STRING, and the key is ``ip`` — not ``answer``, which is only
       the flag/param name that sets it).
-    * 0.3.x session_export → {path,bytes,flows,redacted} plus a ``warning``
-      member ONLY when redacted is false. The CLI's ``export session`` data
-      carries more (schema_version, session, and a longer warning) — another
-      CLI/MCP divergence.
+    * session_export → {path,bytes,flows,redacted,warning}. The ``warning`` is
+      now emitted on EVERY export, redacted or not, and in the CLI's own
+      wording (0.4.0 — it used to appear only on a raw bundle, so its presence
+      is no longer a "this one is raw" signal; read ``redacted`` for that). The
+      CLI's ``export session`` data still carries more (``schema_version``,
+      ``session``) — the divergence is in those members, not in the warning.
 
   prune_nulls (0.3.x): MCP applies it to req_list, workspace_list, tag_list,
     match_replace_list, hook_list, group_show, fuzz_list, fuzz_results and
@@ -307,10 +309,23 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     * ``export session [-o F] [--redact] [--force]`` → data {path,bytes,flows,
       redacted,schema_version,session,warning}; refuses an existing file without
       ``--force``. ``session import <file> [--as NAME] [--use]`` → data
-      {session,active,flows,groups,tags,notes,attacks,redacted,migrated_from,
-      from:{session,burpwn_version,schema_version,exported_at,ca_sha256},
-      warning}. Import ALWAYS creates a new session — it never merges into and
-      never overwrites an existing one.
+      {session,active,flows,workspaces,groups,tags,notes,attacks,redacted,
+      migrated_from,from:{session,burpwn_version,schema_version,exported_at,
+      ca_sha256},warning}. Import ALWAYS creates a new session — it never merges
+      into and never overwrites an existing one. ``warning`` is present ONLY on a
+      raw bundle here (the opposite of the MCP ``session_export`` tool, which
+      always emits it). ``migrated_from`` is the bundle's schema version when it
+      was older than the current one (store SCHEMA_VERSION is 8 at 0.4.0) and
+      ``null`` when it already matched; a bundle from a NEWER burpwn is refused,
+      never downgraded.
+    * 0.4.0 ``--redact`` scrubs the CAPTURE too, not only what burpwn stored: it
+      drops the stored login/exec command lines and match/replace replacements
+      AND masks Authorization / Proxy-Authorization / Cookie / Set-Cookie
+      headers and password / token / api_key-style parameters in the recorded
+      requests and responses. Its honest limit is now "it matches credential
+      SHAPES" — an unrecognised name, a secret in a URL path, or one inside a
+      binary/compressed body survives. (Before 0.4.0 it touched nothing in the
+      traffic at all; any example still teaching that is wrong.)
     * ``doctor --quick`` skips the live sandbox probe (``sandbox_probe:null``).
     * ``debug bundle [-o F] [--no-probe]``, ``debug list``, ``debug show [PATH]``.
 """
@@ -4454,15 +4469,19 @@ def fam_encode_decode() -> list[dict[str, Any]]:
 
 
 def fam_session_auth() -> list[dict[str, Any]]:
-    """`session auth` — persist a login macro + token-injection rule and refresh
-    when the target starts returning 401s. Multi-turn where it fits."""
+    """`session auth` — the login macro, which since 0.4.0 (schema v8) is a
+    FAÇADE over the hook engine rather than its own machine.
+
+    The load-bearing lesson is what `refresh` does: it no longer runs the login
+    command, so an agent that calls it expecting a token back has misunderstood
+    where the token lives. It does not live anywhere on disk."""
     out: list[dict[str, Any]] = []
     t = _t("auth")
     login = ("curl -s https://auth.fintrack.dev/login -d user=analyst "
              "-d pass=s3cr3t")
     out.append(
         cli_example(
-            tags=["session", "auth", "login-macro", "multi-turn", t.key],
+            tags=["session", "auth", "login-macro", "hook", "multi-turn", t.key],
             turns=[
                 (
                     "user",
@@ -4477,34 +4496,57 @@ def fam_session_auth() -> list[dict[str, Any]]:
                     f"--login '{login}' "
                     "--extract '\"token\":\"([^\"]+)\"' "
                     "--header 'Authorization: Bearer {}' --host fintrack.dev\n```\n\nReturns "
-                    + _ok({"host": "fintrack.dev", "id": 1})
-                    + ". The profile is stored but no token is minted yet — run "
-                    "`session auth refresh` to fetch one.",
+                    + _ok({"host": "fintrack.dev", "hook_id": 1, "id": 1})
+                    + ".\n\nThat is already the whole setup — there is no second step to "
+                    "'activate' it. A profile IS a `pre-request` hook with an `exec` action, "
+                    "stored under the name `auth:fintrack.dev`, and it mints the token **on "
+                    "the request that is waiting**: the first in-scope request parks on the "
+                    "login command, then goes upstream carrying the fresh header. Nobody has "
+                    "to eat a 401 to make the next call work.\n\n`id` and `hook_id` are the "
+                    "same number because they are the same row — `burpwn hook list` shows it "
+                    "alongside your other hooks.",
                 ),
-                ("user", "Right, mint the token now and wire up the injection."),
+                ("user", "So what does `session auth refresh` do then?"),
                 (
                     "assistant",
-                    "```\nburpwn --json session auth refresh --host fintrack.dev\n```\n\n"
-                    "Runs the login command **through the sandbox**, extracts the token with "
-                    "your regex, and installs/updates a match-replace rule that injects "
-                    "`Authorization: Bearer <token>` into in-scope requests:\n\n```json\n"
-                    + _ok({"refreshed": [{"host": "fintrack.dev", "rule_id": 3,
-                                          "token": "eyJ0…q8Zg"}]})
-                    + "\n```\n\nThe token is masked in output. Re-run `session auth refresh` "
-                    "whenever 401s reappear — it's idempotent and updates the same rule.",
+                    "It throws away the token the daemon has **cached**, so the next in-scope "
+                    "request runs the login command again:\n\n```\n"
+                    "burpwn --json session auth refresh --host fintrack.dev\n```\n\n```json\n"
+                    + _ok({"cleared": [1],
+                           "profiles": [{"cleared": True, "hook_id": 1,
+                                         "host": "fintrack.dev"}]})
+                    + "\n```\n\nIt does **not** run your login command and it does not hand "
+                    "you a token — there is no token in that output because there is no token "
+                    "to report. The value a profile mints is held in the running daemon's "
+                    "memory for the hook's TTL (300000 ms by default) and is written nowhere; "
+                    "`refresh` is a request to that daemon to forget it early.\n\nSo you only "
+                    "need it when the token went stale *before* its TTL expired — a "
+                    "server-side logout, a rotated secret. `cleared:[1]` lists the hooks whose "
+                    "cached value was actually dropped; with no daemon running you get "
+                    "`cleared:[]` and `cleared:false` per profile, which is success, not "
+                    "failure: nothing was cached, so the next request already mints.",
                 ),
-                ("user", "How do I check what's stored and whether a token is live?"),
+                ("user", "How do I check what's stored?"),
                 (
                     "assistant",
                     "```\nburpwn --json session auth status\n```\n\n```json\n"
                     + _ok({"profiles": [{
-                        "id": 1, "host": "fintrack.dev", "login_cmd": login,
+                        "enabled": True,
                         "header_template": "Authorization: Bearer {}",
-                        "token_set": True, "token": "eyJ0…q8Zg", "rule_id": 3,
+                        "hook_id": 1, "host": "fintrack.dev", "id": 1,
+                        "login_cmd": login, "name": "auth:fintrack.dev",
+                        "timeout_ms": 10000, "ttl_ms": 300000,
                     }]})
-                    + "\n```\n\n`token_set:true` with a masked `token` means injection is "
-                    "live via `rule_id 3`; `token_set:false` means you still need a "
-                    "`refresh`. The raw token value is never printed.",
+                    + "\n```\n\nWhat is stored is the *recipe*, not a credential: the login "
+                    "command, the header template, the host scope and the hook's budgets. "
+                    "There is deliberately no `token` field to inspect — asking 'is a token "
+                    "live?' is asking about daemon memory, not about the session file.\n\n"
+                    "`enabled:false` would mean the profile is muted (`burpwn hook disable 1` "
+                    "and `hook enable 1` work on it, because it is just a hook). Re-running "
+                    "`session auth set` for the same host REPLACES this profile rather than "
+                    "stacking a second login command onto every request.\n\nOne opsec note: "
+                    "`login_cmd` holds your credentials in plaintext in the session store. "
+                    "`burpwn export session --redact` drops it.",
                 ),
             ],
         )
@@ -4811,37 +4853,47 @@ def fam_mcp_offensive() -> list[dict[str, Any]]:
                 "args": {"login": login, "extract": '"token":"([^"]+)"',
                          "header": "Authorization: Bearer {}", "host": "fintrack.dev"},
                 "result": {"id": 1, "host": "fintrack.dev"},
-                "final": "Profile 1 saved for fintrack.dev. It won't inject anything until you "
-                         "call `session_auth_refresh` (which runs the login command in the "
-                         "sandbox and installs the injection rule).",
+                "final": "Profile 1 is saved and already active for fintrack.dev — there is no "
+                         "second call to activate it. The profile is a `pre-request` hook with "
+                         "an `exec` action, so the first in-scope request parks on the login "
+                         "command and goes upstream carrying the fresh `Authorization` "
+                         "header.\n\nNote this result is `{id,host}`: unlike the CLI's `session "
+                         "auth set`, the MCP tool does not echo a `hook_id`. Use "
+                         "`session_auth_status` (or `hook_list`) if you need it.",
             }],
         )
     )
     out.append(
         mcp_example(
             tags=["mcp", "session_auth_refresh", "session_auth_status"],
-            user="Mint a fresh token for fintrack.dev and confirm it's live.",
+            user="The token for fintrack.dev was revoked server-side. Force a new one.",
             steps=[
                 {
-                    "preamble": "Refresh runs the stored login command and (re)installs the "
-                    "injection rule.",
+                    "preamble": "Refresh drops the token the daemon has cached, so the next "
+                    "in-scope request mints a new one. It does not run the login command "
+                    "itself.",
                     "tool": "session_auth_refresh", "args": {"host": "fintrack.dev"},
-                    "result": {"refreshed": [{"host": "fintrack.dev", "rule_id": 3,
-                                              "token": "eyJ0…q8Zg"}]},
-                    "final": "Token minted and rule 3 installed (token masked). Let me confirm "
-                             "the stored profile.",
+                    "result": {"cleared": [1],
+                               "profiles": [{"cleared": True, "hook_id": 1,
+                                             "host": "fintrack.dev"}]},
+                    "final": "Cached value dropped (`cleared:[1]`). There is no token in this "
+                             "result because none is reported — and none is stored. Let me "
+                             "show what the profile actually holds.",
                 },
                 {
-                    "preamble": "Check the profile status.",
+                    "preamble": "Check the stored profile.",
                     "tool": "session_auth_status", "args": {},
-                    "result": {"profiles": [{"id": 1, "host": "fintrack.dev",
-                                             "login_cmd": login,
+                    "result": {"profiles": [{"enabled": True,
                                              "header_template": "Authorization: Bearer {}",
-                                             "token_set": True, "token": "eyJ0…q8Zg",
-                                             "rule_id": 3}]},
-                    "final": "`token_set:true` via `rule_id 3` — injection is live; the token "
-                             "value stays masked. Re-run `session_auth_refresh` when 401s "
-                             "reappear.",
+                                             "hook_id": 1, "host": "fintrack.dev", "id": 1,
+                                             "login_cmd": login,
+                                             "name": "auth:fintrack.dev",
+                                             "timeout_ms": 10000, "ttl_ms": 300000}]},
+                    "final": "The profile stores the *recipe* — login command, header "
+                             "template, host scope, TTL — and no credential. There is no "
+                             "`token` or `token_set` field to check: the minted value lives "
+                             "only in the daemon's memory for `ttl_ms` (300 s here). Retry the "
+                             "requests that were 401ing; the first one will re-run the login.",
                 },
             ],
         )
@@ -4962,7 +5014,7 @@ def fam_mcp_housekeeping_convos() -> list[dict[str, Any]]:
     These conversations add a second, realistic demonstration where the tool has
     an honest role in a workflow, rather than as a standalone "call X" drill.
 
-    Every result shape here was captured from the real 0.3.4 stdio MCP server
+    Every result shape here was captured from the real 0.4.0 stdio MCP server
     (see README.md "Grounding / accuracy"); note the MCP envelopes differ from
     the CLI ones (`workspace_new` → `{workspace_id}` not `{id,name}`,
     `workspace_list`/`tag_list`/`match_replace_list` wrap their arrays in
@@ -5384,7 +5436,7 @@ def fam_mcp_housekeeping_convos() -> list[dict[str, Any]]:
     # --- 6. Rewrite-rule + auth-injection audit. -------------------------------
     out.append(
         mcp_conversation(
-            tags=["mcp", "multi-turn", "match_replace_list", "match_replace_add",
+            tags=["mcp", "multi-turn", "match_replace_list", "hook_list",
                   "session_auth_status", "session_auth_refresh", "auth"],
             exchanges=[
                 {
@@ -5396,78 +5448,94 @@ def fam_mcp_housekeeping_convos() -> list[dict[str, Any]]:
                             "tool": "match_replace_list", "args": {},
                             "result": {"rules": [
                                 {"id": 1, "scope": "", "match_kind": "header",
-                                 "pattern": "User-Agent", "replacement": "burpwn/0.3.4",
+                                 "pattern": "User-Agent", "replacement": "burpwn/0.4.0",
                                  "on_request": True, "enabled": True},
-                                {"id": 2, "scope": "auth.fintrack.dev",
-                                 "match_kind": "header", "pattern": "Authorization",
-                                 "replacement": "Bearer eyJ0…q8Zg", "on_request": True,
-                                 "enabled": True},
                             ]},
-                            "interp": "Two enabled request-side rules: a global User-Agent "
-                                      "override, and rule 2 injecting a bearer token on "
-                                      "`auth.fintrack.dev`. Rule 2 is the suspect — an "
-                                      "injected token that has since expired produces "
-                                      "exactly the 401 wall you are seeing. Note the rule "
-                                      "is still `enabled:true`; a stale token fails "
-                                      "loudly, not silently.",
+                            "interp": "One rule, and it only overrides the User-Agent — "
+                                      "nothing here touches `Authorization`. That is the "
+                                      "expected answer, not a dead end: **auth injection "
+                                      "is not a match/replace rule.** A rule can only "
+                                      "rewrite text the request already carries, so it "
+                                      "could never add a bearer header to a request that "
+                                      "was sent without one. The login macro lives on the "
+                                      "hook engine instead. Looking there.",
                         },
                         {
-                            "preamble": "Check the auth profile behind that rule.",
+                            "preamble": "Auth profiles are hooks, so list the hooks.",
+                            "tool": "hook_list", "args": {},
+                            "result": {"hooks": [
+                                {"action": {"action": "exec",
+                                            "cmd": "curl -s https://auth.fintrack.dev/login "
+                                                   "-d user=analyst -d pass=s3cr3t",
+                                            "extract": "\"token\":\"([^\"]+)\"",
+                                            "inject": {"kind": "set-header",
+                                                       "name": "Authorization",
+                                                       "value_template": "Bearer {}"}},
+                                 "created_at": 1786648290831, "enabled": True, "id": 3,
+                                 "name": "auth:auth.fintrack.dev", "order": 0,
+                                 "phase": "pre-request",
+                                 "scope": {"host": "auth.fintrack.dev", "method": "",
+                                           "path": ""},
+                                 "timeout_ms": 10000, "ttl_ms": 300000},
+                            ]},
+                            "interp": "There it is: hook 3, named `auth:auth.fintrack.dev`. "
+                                      "The `auth:` prefix is exactly what makes it a "
+                                      "session-auth profile — `session auth set` builds "
+                                      "this hook, and nothing else. Read the action: it "
+                                      "runs the login command, pulls the token out with "
+                                      "`extract`, and injects it as `set-header` (which "
+                                      "is add-or-replace, so a bare request gets the "
+                                      "header created).\n\nIt is `enabled:true`, so the "
+                                      "401s are not a disabled hook. The likely cause is "
+                                      "the cached value: `ttl_ms:300000` means a minted "
+                                      "token is reused for 5 minutes, and a token revoked "
+                                      "server-side inside that window keeps being sent.",
+                        },
+                        {
+                            "preamble": "Confirm it via the auth-facing view of the same "
+                                        "hook.",
                             "tool": "session_auth_status", "args": {},
                             "result": {"profiles": [{
-                                "id": 1, "host": "auth.fintrack.dev",
+                                "enabled": True,
+                                "header_template": "Authorization: Bearer {}",
+                                "hook_id": 3, "host": "auth.fintrack.dev", "id": 3,
                                 "login_cmd": "curl -s https://auth.fintrack.dev/login "
                                              "-d user=analyst -d pass=s3cr3t",
-                                "header_template": "Authorization: Bearer {}",
-                                "token_set": True, "token": "eyJ0…q8Zg", "rule_id": 3,
+                                "name": "auth:auth.fintrack.dev",
+                                "timeout_ms": 10000, "ttl_ms": 300000,
                             }]},
-                            "interp": "Confirmed: profile 1 owns the injection. Note "
-                                      "`rule_id:3` here versus rule 2 in the list above — "
-                                      "the profile points at the rule id it *last* "
-                                      "installed, so a mismatch means the rule was "
-                                      "recreated (each `refresh` can install a new one). "
-                                      "The token is masked in output and never printed in "
-                                      "full.",
+                            "interp": "Same row, read as a profile: `id` and `hook_id` are "
+                                      "both 3 because they are the same object. Note what "
+                                      "is NOT here — there is no `token` or `token_set` "
+                                      "field, because the minted value is never written "
+                                      "to the session. It exists only in the running "
+                                      "daemon's memory for `ttl_ms`. So 'is my token "
+                                      "still good?' is not a question this store can "
+                                      "answer; the fix is to drop what is cached.",
                         },
                     ],
                 },
                 {
-                    "user": "Mint a fresh one.",
+                    "user": "Drop it then.",
                     "steps": [
                         {
-                            "preamble": "Re-run the stored login through the sandbox.",
-                            "tool": "session_auth_refresh", "args": {"host": "auth.fintrack.dev"},
-                            "result": {"refreshed": [{"host": "auth.fintrack.dev",
-                                                      "rule_id": 4, "token": "eyJ0…7bQx"}]},
-                            "interp": "New token minted and installed as rule 4. The login "
-                                      "command runs **inside the sandbox**, so the "
-                                      "authentication exchange is itself captured — "
-                                      "convenient, but remember your credentials are now "
-                                      "in the session store too.",
-                        },
-                        {
-                            "preamble": "Re-read the rules to see the effect.",
-                            "tool": "match_replace_list", "args": {},
-                            "result": {"rules": [
-                                {"id": 1, "scope": "", "match_kind": "header",
-                                 "pattern": "User-Agent", "replacement": "burpwn/0.3.4",
-                                 "on_request": True, "enabled": True},
-                                {"id": 2, "scope": "auth.fintrack.dev",
-                                 "match_kind": "header", "pattern": "Authorization",
-                                 "replacement": "Bearer eyJ0…q8Zg", "on_request": True,
-                                 "enabled": False},
-                                {"id": 4, "scope": "auth.fintrack.dev",
-                                 "match_kind": "header", "pattern": "Authorization",
-                                 "replacement": "Bearer eyJ0…7bQx", "on_request": True,
-                                 "enabled": True},
-                            ]},
-                            "interp": "Rule 4 is live with the new token and the stale "
-                                      "rule 2 is now `enabled:false` — `refresh` "
-                                      "supersedes rather than deletes, so the history "
-                                      "stays visible. Retry the requests that were 401ing. "
-                                      "There is no MCP tool to remove a rule: the store "
-                                      "exposes add and list only, so rules accumulate for "
-                                      "the life of the session.",
+                            "preamble": "Clear the daemon's cached value for that profile.",
+                            "tool": "session_auth_refresh",
+                            "args": {"host": "auth.fintrack.dev"},
+                            "result": {"cleared": [3],
+                                       "profiles": [{"cleared": True, "hook_id": 3,
+                                                     "host": "auth.fintrack.dev"}]},
+                            "interp": "`cleared:[3]` — the daemon dropped the value it was "
+                                      "holding for hook 3. Note what this call did *not* "
+                                      "do: it did not run your login command, and it "
+                                      "returned no token. The mint happens on the next "
+                                      "in-scope request, which parks on the login command "
+                                      "and then goes upstream with the fresh header — so "
+                                      "just retry the requests that were 401ing, no "
+                                      "further call needed.\n\nIf `cleared` had come back "
+                                      "`[]` with `cleared:false`, that is still success: "
+                                      "it means no daemon was running and nothing was "
+                                      "cached, so the next request already mints.",
                         },
                     ],
                 },
@@ -5654,21 +5722,29 @@ def fam_shell_offensive() -> list[dict[str, Any]]:
                         "command": "burpwn --json session auth set --login "
                         f"'{login}' --extract '\"token\":\"([^\"]+)\"' "
                         "--header 'Authorization: Bearer {}' --host fintrack.dev",
-                        "result": _ok({"host": "fintrack.dev", "id": 1}),
-                        "interp": "Profile 1 stored. Now mint the first token and install the "
-                        "injection rule.",
+                        "result": _ok({"host": "fintrack.dev", "hook_id": 1, "id": 1}),
+                        "interp": "Profile 1 stored and already live — nothing else to run. It "
+                        "is a `pre-request` hook (`auth:fintrack.dev`, visible in `burpwn hook "
+                        "list`), so the first in-scope request parks on the login command and "
+                        "goes upstream with the header already injected. `id` and `hook_id` "
+                        "are the same row.",
                     }],
                 },
                 {
-                    "user": "Refresh it.",
+                    "user": "The creds got rotated. Force it to log in again.",
                     "steps": [{
-                        "preamble": "Run the login through the sandbox and install the rule.",
+                        "preamble": "Drop the token the daemon cached; the next request "
+                        "re-mints.",
                         "command": "burpwn --json session auth refresh --host fintrack.dev",
-                        "result": _ok({"refreshed": [{"host": "fintrack.dev", "rule_id": 3,
-                                                      "token": "eyJ0…q8Zg"}]}),
-                        "interp": "Token minted (masked) and `rule_id 3` now injects "
-                        "`Authorization: Bearer <token>` into in-scope requests. Re-run this "
-                        "whenever 401s come back — it's idempotent.",
+                        "result": _ok({"cleared": [1],
+                                       "profiles": [{"cleared": True, "hook_id": 1,
+                                                     "host": "fintrack.dev"}]}),
+                        "interp": "`cleared:[1]` — the cached value is gone. This did not run "
+                        "your login command and returned no token: the token is never stored, "
+                        "it lives in the daemon for the hook's TTL only. The mint happens on "
+                        "the next in-scope request, so just carry on. You only need `refresh` "
+                        "when a token dies *before* its TTL — a rotation or a server-side "
+                        "logout.",
                     }],
                 },
             ],
@@ -5703,7 +5779,7 @@ def fam_shell_offensive() -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # 0.3.x surface: flow groups, the portable session bundle, and the hook engine.
 #
-# All envelopes below were captured from the 0.3.4 debug binary run against a
+# All envelopes below were captured from the 0.4.0 debug binary run against a
 # seeded store in a throwaway XDG root. Three facts are worth teaching rather
 # than merely listing, because an agent that does not know them writes wrong
 # commands:
@@ -5903,29 +5979,48 @@ def fam_groups() -> list[dict[str, Any]]:
     return out
 
 
+# The bundle warnings, verbatim from `burpwn_cli::bundle::{RAW_WARNING,
+# REDACTED_WARNING}` as emitted by the 0.4.0 binary. Module-level because both
+# the CLI family and the MCP one have to quote the SAME text — the MCP tool
+# reuses the CLI's wording deliberately, and paraphrasing it in one of the two
+# is how the dataset previously came to teach a `--redact` scope that no longer
+# existed.
+RAW_BUNDLE_WARNING = (
+    "this bundle holds the session exactly as captured: stored auth tokens and "
+    "login commands (credentials and all), plus every Authorization / Cookie / "
+    "Set-Cookie header recorded in the traffic. Anyone who opens it can replay "
+    "them — move it the way you would move the credentials themselves. "
+    "`--redact` drops the stored credentials and masks the credential-shaped "
+    "values in the capture."
+)
+REDACTED_BUNDLE_WARNING = (
+    "--redact dropped the stored auth tokens, the login and exec command lines "
+    "and the match/replace replacements, and masked the Authorization / "
+    "Proxy-Authorization / Cookie / Set-Cookie headers and the password / token "
+    "/ api_key-style parameters in the captured requests and responses. It "
+    "matches credential SHAPES: a secret under a name it cannot recognise, one "
+    "baked into a URL path, or one inside a binary or compressed body is STILL "
+    "in this file. Read the bundle before you hand it over."
+)
+
+
 def fam_session_bundle() -> list[dict[str, Any]]:
     """`export session` / `session import` — moving a whole engagement to another
-    machine, and being honest about what `--redact` does and does not cover."""
+    machine, and being honest about what `--redact` does and does not cover.
+
+    0.4.0 moved that line: `--redact` now scrubs the CAPTURE too, not just what
+    burpwn itself stored. The honest limit is no longer "it does not touch the
+    traffic" but "it matches credential SHAPES", which is a different — and
+    easier to get wrong — thing to reason about."""
     out: list[dict[str, Any]] = []
 
-    raw_warning = (
-        "this bundle holds the session exactly as captured: stored auth tokens and "
-        "login commands (credentials and all), plus every Authorization / Cookie / "
-        "Set-Cookie header recorded in the traffic. Anyone who opens it can replay "
-        "them — move it the way you would move the credentials themselves. "
-        "`--redact` drops the stored auth profiles and match/replace replacements."
-    )
-    redacted_warning = (
-        "--redact dropped the stored auth tokens, login commands and match/replace "
-        "replacements. It does NOT scrub credentials captured inside recorded "
-        "requests and responses (Authorization / Cookie headers, login bodies) — "
-        "those are still in this file."
-    )
+    raw_warning = RAW_BUNDLE_WARNING
+    redacted_warning = REDACTED_BUNDLE_WARNING
     exp_raw = {"bytes": 481203, "flows": 214, "path": "northwind.burpwn",
-               "redacted": False, "schema_version": 6, "session": "northwind",
+               "redacted": False, "schema_version": 8, "session": "northwind",
                "warning": raw_warning}
-    exp_red = {"bytes": 480914, "flows": 214, "path": "northwind.burpwn",
-               "redacted": True, "schema_version": 6, "session": "northwind",
+    exp_red = {"bytes": 412774, "flows": 214, "path": "northwind.burpwn",
+               "redacted": True, "schema_version": 8, "session": "northwind",
                "warning": redacted_warning}
 
     out.append(
@@ -5967,26 +6062,32 @@ def fam_session_bundle() -> list[dict[str, Any]]:
                 ),
                 (
                     "assistant",
-                    "Not safe to hand over — **less** dangerous, and the difference "
-                    "matters here.\n\n```\nburpwn --json export session -o northwind."
-                    "burpwn --redact --force\n```\n\n```json\n" + _ok(exp_red) + "\n```\n\n"
-                    "What `--redact` actually drops is narrow: the stored auth profiles' "
-                    "`token` and `login_cmd`, and the `replacement` field of your "
-                    "match/replace rules. That's it.\n\nWhat stays in the file:\n\n"
-                    "* every `Authorization:` and `Cookie:` header **captured in the "
-                    "recorded traffic**\n"
-                    "* every `Set-Cookie` the target sent back\n"
-                    "* login request bodies — the username and password you actually "
-                    "posted\n"
-                    "* anything sensitive in a response body (tokens, PII, keys)\n\n"
-                    "Notice the size barely moved (`481203` → `480914` bytes): the "
-                    "credentials live in the traffic, and the traffic is the point of the "
-                    "bundle. `--redact` protects against leaking your *tooling's* stored "
-                    "secrets, not against leaking the target's. For an external "
-                    "handover, export the specific evidence instead — `export har --group "
-                    "<name>` for one reviewed scenario — or treat the bundle as a "
-                    "credential-bearing artifact and move it over a channel you'd trust "
-                    "with the password itself.",
+                    "Safer, but not certified clean — and the gap is worth understanding "
+                    "before you press send.\n\n```\nburpwn --json export session -o "
+                    "northwind.burpwn --redact --force\n```\n\n```json\n" + _ok(exp_red)
+                    + "\n```\n\n`--redact` works on two layers:\n\n"
+                    "* **what burpwn stored** — dropped outright: the auth profiles' login "
+                    "commands, the recorded `burpwn exec` command lines, and the "
+                    "`replacement` field of your match/replace rules.\n"
+                    "* **what burpwn captured** — masked in the recorded requests and "
+                    "responses: `Authorization`, `Proxy-Authorization`, `Cookie` and "
+                    "`Set-Cookie` headers, plus `password`/`token`/`api_key`-style "
+                    "parameters.\n\nSo the captured traffic *is* scrubbed now. The honest "
+                    "limit is a different one: **it matches credential SHAPES.** A secret "
+                    "it cannot recognise as one stays in the file — for example:\n\n"
+                    "* a token under a bespoke parameter or header name (`X-Acme-Sig`, "
+                    "`sess`, `k`)\n"
+                    "* a credential baked into a URL path rather than a parameter "
+                    "(`/reset/8f21c…`)\n"
+                    "* anything inside a binary or compressed body, which it does not "
+                    "decode to search\n"
+                    "* the target's own secrets in a response body — PII, private keys, "
+                    "internal tokens — which are not credential-shaped at all\n\n"
+                    "The size drop (`481203` → `412774` bytes) tells you masking happened; "
+                    "it does not tell you it was exhaustive. Read the bundle before you "
+                    "hand it over, as its own `warning` says. For an external handover I'd "
+                    "still prefer exporting the specific evidence — `export har --group "
+                    "<name>` for one reviewed scenario — over shipping the whole session.",
                 ),
             ],
         )
@@ -5998,8 +6099,9 @@ def fam_session_bundle() -> list[dict[str, Any]]:
                  "ca_sha256": "45b325297a75293d07a019d5962304db7749662a35830ce96199874e0c62b410",
                  "exported_at": 1786648302621, "schema_version": 6,
                  "session": "northwind"},
-        "groups": 3, "migrated_from": None, "notes": 7, "redacted": False,
+        "groups": 3, "migrated_from": 6, "notes": 7, "redacted": False,
         "session": "northwind-2", "tags": 11, "warning": raw_warning,
+        "workspaces": 2,
     }
     out.append(
         cli_example(
@@ -6017,13 +6119,18 @@ def fam_session_bundle() -> list[dict[str, Any]]:
                     "is taken, give it another with `--as`:\n\n```\nburpwn --json session "
                     "import northwind.burpwn --as northwind-2 --use\n```\n\n```json\n"
                     + _ok(imp) + "\n```\n\nYour existing `northwind` is untouched. The "
-                    "import reports what came across (214 flows, 3 groups, 11 tags, 7 "
-                    "notes, 2 attacks) and `from` records the provenance: which session it "
-                    "was exported from, by which burpwn version, when, and the CA "
-                    "fingerprint. `--use` switched the active session to the imported one; "
-                    "drop it to import without switching (`active:false`). If you genuinely "
-                    "want the two sets of captures in one place, import and then compare "
-                    "them side by side — there is no merge operation.",
+                    "import reports what came across (214 flows in 2 workspaces, 3 groups, "
+                    "11 tags, 7 notes, 2 attacks) and `from` records the provenance: which "
+                    "session it was exported from, by which burpwn version, when, and the "
+                    "CA fingerprint.\n\n`migrated_from:6` is worth reading: this bundle was "
+                    "written by 0.3.4 at store schema 6 and was migrated forward to the "
+                    "current schema on the way in. It is `null` when the bundle already "
+                    "matched. Import migrates forward only — a bundle from a *newer* burpwn "
+                    "than the one you are running is refused rather than downgraded.\n\n"
+                    "`--use` switched the active session to the imported one; drop it to "
+                    "import without switching (`active:false`). If you genuinely want the "
+                    "two sets of captures in one place, import and then compare them side "
+                    "by side — there is no merge operation.",
                 ),
             ],
         )
@@ -6560,21 +6667,22 @@ def fam_mcp_groups_hooks() -> list[dict[str, Any]]:
                     "user": "Export this session so I can carry it to another machine.",
                     "steps": [{
                         "tool": "session_export", "args": {"output": "northwind.burpwn"},
-                        # MCP's session_export result is leaner than the CLI's data,
-                        # and `warning` appears only when redacted is false.
+                        # MCP's session_export result is leaner than the CLI's data
+                        # (no session/schema_version), but it carries the CLI's own
+                        # warning wording, and it carries it on EVERY export.
                         "result": {"bytes": 481203, "flows": 214,
                                    "path": "northwind.burpwn", "redacted": False,
-                                   "warning": "raw bundle: stored auth tokens/login "
-                                              "commands and captured Authorization/Cookie "
-                                              "headers are inside"},
+                                   "warning": RAW_BUNDLE_WARNING},
                         "interp": "Wrote `northwind.burpwn` — 214 flows with their bodies, "
                                   "plus the groups, tags, notes, attacks and rules. "
-                                  "`redacted:false` and the `warning` member say what you "
-                                  "are carrying: stored auth tokens, login commands and "
-                                  "every captured `Authorization`/`Cookie` header. Move it "
-                                  "like a credential. Open it elsewhere with `burpwn "
-                                  "session import <file>`, which always creates a new "
-                                  "session rather than merging into one.",
+                                  "`redacted:false` and the `warning` say what you are "
+                                  "carrying: stored auth tokens, login commands and every "
+                                  "captured `Authorization`/`Cookie` header. Move it like "
+                                  "a credential. Open it elsewhere with `burpwn session "
+                                  "import <file>`, which always creates a new session "
+                                  "rather than merging into one.\n\nNote this result is "
+                                  "leaner than the CLI's `export session` data — no "
+                                  "`session`, no `schema_version`.",
                     }],
                 },
                 {
@@ -6583,20 +6691,25 @@ def fam_mcp_groups_hooks() -> list[dict[str, Any]]:
                         "tool": "session_export",
                         "args": {"force": True, "output": "northwind.burpwn",
                                  "redact": True},
-                        "result": {"bytes": 480914, "flows": 214,
-                                   "path": "northwind.burpwn", "redacted": True},
-                        "interp": "Done — and the `warning` member is gone, because "
-                                  "`redacted:true`. But be careful what you conclude from "
-                                  "that: `redact` drops the **stored** auth profiles' "
-                                  "tokens and login commands and your match/replace "
-                                  "replacements, and nothing else. Every "
-                                  "`Authorization`/`Cookie`/`Set-Cookie` header captured "
-                                  "in the recorded traffic, and every login body you "
-                                  "posted, is still in the file — see the size, which "
-                                  "barely moved (481203 → 480914 bytes). For an external "
-                                  "handover I'd send `export har --group <name>` for the "
-                                  "reviewed scenario instead, and still treat this bundle "
-                                  "as credential-bearing.",
+                        "result": {"bytes": 412774, "flows": 214,
+                                   "path": "northwind.burpwn", "redacted": True,
+                                   "warning": REDACTED_BUNDLE_WARNING},
+                        "interp": "Done — and note the `warning` is still there. It is "
+                                  "emitted on **every** export, redacted or not; a "
+                                  "redacted bundle is not a bundle that stopped needing a "
+                                  "warning, so do not read the presence of this member as "
+                                  "'raw' or its absence as 'clean'. Read `redacted` for "
+                                  "that.\n\nWhat it now says is the real scope: the stored "
+                                  "login/exec command lines and rule replacements are "
+                                  "dropped, and the `Authorization`/`Proxy-Authorization`/"
+                                  "`Cookie`/`Set-Cookie` headers and `password`/`token`/"
+                                  "`api_key`-style parameters in the captured traffic are "
+                                  "masked. The limit is that it matches credential "
+                                  "SHAPES — a secret under a name it does not recognise, "
+                                  "one in a URL path, or one in a binary or compressed "
+                                  "body is still in the file. For an external handover I'd "
+                                  "send `export har --group <name>` for the reviewed "
+                                  "scenario instead.",
                     }],
                 },
             ],
