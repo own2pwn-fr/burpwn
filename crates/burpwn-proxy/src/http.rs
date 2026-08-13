@@ -403,9 +403,19 @@ async fn handle_inner(
     // websocket` (and the Sec-WebSocket-Key/Version) or it never returns 101.
     let upstream_req = build_upstream_request(&parts, &method, &msg, version, is_ws)?;
 
-    // WebSocket: hand off to the splice path after the handshake.
+    // WebSocket: hand off to the splice path after the handshake. The host and
+    // target go with it: they are what a `ws-c2s`/`ws-s2c` hook scopes on, and
+    // after the `101` there is no request left to read them from.
     if is_ws {
-        return websocket_forward(upstream_req, ctx, flow_id, downstream_upgrade).await;
+        return websocket_forward(
+            upstream_req,
+            ctx,
+            flow_id,
+            downstream_upgrade,
+            msg.host.clone(),
+            msg.url.clone(),
+        )
+        .await;
     }
 
     // --- forward: open upstream + read the response HEADERS (streaming body) ---
@@ -1228,15 +1238,53 @@ fn version_str(v: Version) -> &'static str {
     }
 }
 
+/// Everything a spliced WebSocket needs to consult the hook engine: the scope
+/// the socket was opened with, the recursion marker, and whether hooks may run
+/// on this socket at all.
+struct WsHookCtx {
+    engine: HookEngine,
+    /// The connection's exec correlation id: a hook command's own socket is
+    /// never hooked, exactly as its requests are not.
+    exec_id: Option<String>,
+    /// Upgrade request host, for `--host` scoping.
+    host: String,
+    /// Upgrade request target, for `--path` scoping.
+    path: String,
+    /// `false` when the handshake negotiated a `Sec-WebSocket-Extensions`.
+    ///
+    /// With `permessage-deflate` the payload on the wire is a DEFLATE stream
+    /// with a shared context across messages: burpwn neither reads nor rebuilds
+    /// it, so a `replace-payload` would compare against compressed bytes (never
+    /// matching) and re-encoding one message would desynchronize the
+    /// decompressor for every message after it. Refusing to hook such a socket
+    /// — loudly, once — is the only honest answer.
+    allowed: bool,
+}
+
+impl WsHookCtx {
+    /// Whether this direction is hooked right now. One relaxed atomic load in
+    /// the common case, and re-read per socket read so a hook added while the
+    /// socket is open still takes effect (at the next message boundary).
+    fn active(&self, direction: WsDirection) -> bool {
+        self.allowed
+            && !crate::hooks::is_hook_traffic(self.exec_id.as_deref())
+            && self.engine.any_ws(direction)
+    }
+}
+
 /// WebSocket forwarding: open a plain/TLS upstream H1 connection, replay the
-/// upgrade request, and on a `101` splice the two upgraded byte streams. The
-/// bytes are forwarded verbatim on the wire; a COPY of each direction is parsed
-/// into structured, complete WebSocket messages and persisted (see [`splice_ws`]).
+/// upgrade request, and on a `101` splice the two upgraded byte streams. With no
+/// `ws-c2s`/`ws-s2c` hook the bytes are forwarded verbatim on the wire and a
+/// COPY of each direction is parsed into structured, complete WebSocket messages
+/// and persisted; with one, the same parse also decides what is relayed (see
+/// [`splice_ws`]).
 async fn websocket_forward(
     req: Request<Full<Bytes>>,
     ctx: HttpContext,
     flow_id: i64,
     downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    host: String,
+    path: String,
 ) -> anyhow::Result<Response<ProxyBody>> {
     let (up_parts, up_upgrade) = match &ctx.upstream {
         Upstream::Plain { addr } => {
@@ -1271,6 +1319,32 @@ async fn websocket_forward(
     *builder.headers_mut().unwrap() = up_parts.headers.clone();
     let downstream_resp = builder.body(full_body(Bytes::new()))?;
 
+    // An extension (in practice `permessage-deflate`) makes the payloads opaque
+    // to us: capture already stored the compressed bytes, and hooks must not
+    // pretend otherwise. Say so once, here, where the operator can see it.
+    let extensions = up_parts
+        .headers
+        .get("sec-websocket-extensions")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    if let Some(ext) = &extensions {
+        if ctx.hooks.any_ws(WsDirection::C2s) || ctx.hooks.any_ws(WsDirection::S2c) {
+            tracing::warn!(
+                %host, %path, extensions = %ext,
+                "this websocket negotiated an extension, so its payloads are not \
+                 plaintext: the ws hooks are skipped for this socket and the \
+                 frames are spliced verbatim"
+            );
+        }
+    }
+    let hook_ctx = Arc::new(WsHookCtx {
+        engine: ctx.hooks.clone(),
+        exec_id: ctx.exec_id.clone(),
+        host,
+        path,
+        allowed: extensions.is_none(),
+    });
+
     // Splice both upgraded streams once they're ready.
     let writer = ctx.writer.clone();
     tokio::spawn(async move {
@@ -1284,21 +1358,21 @@ async fn websocket_forward(
                 return;
             }
         };
-        splice_ws(down, up, writer.clone(), flow_id).await;
+        splice_ws(down, up, writer.clone(), flow_id, hook_ctx).await;
         let _ = writer.flow_end(flow_id, now_millis()).await;
     });
 
     Ok(downstream_resp)
 }
 
-/// Splice two upgraded WebSocket streams. Each direction is forwarded verbatim
-/// (the wire is never altered) while a COPY is fed to a [`ws::Scanner`] that
-/// parses frames, unmasks client→server frames, reassembles continuation
-/// fragments, and persists each COMPLETE message via [`WriteOp::InsertWsMessage`]
-/// with the right direction + opcode/fin. Control frames (ping/pong/close) are
-/// recorded with their opcode but never treated as data.
-async fn splice_ws<D, U>(downstream: D, upstream: U, writer: WriteHandle, flow_id: i64)
-where
+/// Splice two upgraded WebSocket streams, per direction (see [`pump_ws`]).
+async fn splice_ws<D, U>(
+    downstream: D,
+    upstream: U,
+    writer: WriteHandle,
+    flow_id: i64,
+    hooks: Arc<WsHookCtx>,
+) where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1306,54 +1380,165 @@ where
     let (ur, uw) = tokio::io::split(upstream);
 
     let w1 = writer.clone();
-    let c2s = tokio::spawn(pump_ws(dr, uw, w1, flow_id, WsDirection::C2s));
+    let h1 = hooks.clone();
+    let c2s = tokio::spawn(pump_ws(dr, uw, w1, flow_id, WsDirection::C2s, h1));
     let w2 = writer.clone();
-    let s2c = tokio::spawn(pump_ws(ur, dw, w2, flow_id, WsDirection::S2c));
+    let s2c = tokio::spawn(pump_ws(ur, dw, w2, flow_id, WsDirection::S2c, hooks));
     join_half_open(c2s, s2c, SPLICE_DRAIN_GRACE).await;
 }
 
-/// Pump one WebSocket direction: forward every byte to `w` verbatim, and feed a
-/// copy through a frame [`ws::Scanner`], persisting each completed message.
+/// Pump one WebSocket direction, in one of two modes.
+///
+/// **Verbatim** (no hook on this direction — the case for every socket on a
+/// proxy nobody configured). Every byte is written to `w` the moment it is read,
+/// before anything else looks at it, and a copy is fed to a [`ws::Framer`] that
+/// parses frames, unmasks client→server frames, reassembles continuation
+/// fragments and persists each COMPLETE message via [`WriteOp::InsertWsMessage`].
+/// This is byte-for-byte what the splice did before hooks reached WebSockets;
+/// the whole cost of the feature on such a socket is one relaxed atomic load per
+/// read.
+///
+/// **Framed** (a `ws-c2s`/`ws-s2c` hook is enabled). The pump can no longer
+/// forward bytes it has not interpreted, so it forwards what the framer hands
+/// back instead:
+/// - control frames (ping/pong/close) go out verbatim and are never hooked — a
+///   dropped `close` leaks the socket and a rewritten `ping` breaks the pong
+///   echo RFC6455 §5.5.2 requires;
+/// - a data message no hook changed goes out as the exact bytes it arrived as,
+///   so masking and fragmentation survive untouched;
+/// - a payload a hook rewrote is re-encoded as ONE unmasked (s2c) or freshly
+///   masked (c2s) frame — the only case where the wire shape changes;
+/// - a dropped message is not relayed and not recorded, which mirrors an HTTP
+///   request dropped by a hook (it never becomes a flow either);
+/// - anything the framer cannot interpret, including everything it holds when it
+///   desyncs, is forwarded as-is: capture may give up, the wire never does.
+///
+/// The mode is re-decided before every read and can only change while the framer
+/// holds nothing, so no byte is ever forwarded twice or lost when a hook is
+/// added or removed mid-socket.
 async fn pump_ws<R, W>(
     mut r: R,
     mut w: W,
     writer: WriteHandle,
     flow_id: i64,
     direction: WsDirection,
+    hooks: Arc<WsHookCtx>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut scanner = ws::Scanner::new();
+    let mut framer = ws::Framer::new();
+    let mut framed = false;
     let mut buf = vec![0u8; 16 * 1024];
-    loop {
+    'pump: loop {
+        // Switch modes only at a message boundary — the one moment at which
+        // "already forwarded" and "still held by the framer" cannot disagree.
+        if framer.at_boundary() {
+            framed = hooks.active(direction);
+        }
         let n = match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        // Forward verbatim FIRST; capture must never delay or alter the wire.
-        if w.write_all(&buf[..n]).await.is_err() {
-            break;
+        let chunk = &buf[..n];
+        if !framed {
+            // Forward verbatim FIRST; capture must never delay or alter the wire.
+            if w.write_all(chunk).await.is_err() {
+                break;
+            }
+            for msg in framer.push(chunk).into_iter().filter_map(ws::message_of) {
+                record_ws(&writer, flow_id, direction, msg.opcode, msg.payload).await;
+            }
+            continue;
         }
-        for msg in scanner.push(&buf[..n]) {
-            // Fire-and-forget: enqueue the write but don't block the pump on the
-            // DB ack (the id reply is discarded via a dropped receiver).
-            let (reply, _rx) = tokio::sync::oneshot::channel();
-            let _ = writer
-                .send(WriteOp::InsertWsMessage {
-                    flow_id,
-                    direction,
-                    opcode: Some(msg.opcode as i64),
-                    fin: Some(msg.fin),
-                    payload: msg.payload,
-                    ts: now_millis(),
-                    reply,
-                })
-                .await;
+        for emit in framer.push(chunk) {
+            match emit {
+                ws::Emit::Passthrough(raw) => {
+                    if w.write_all(&raw).await.is_err() {
+                        break 'pump;
+                    }
+                }
+                ws::Emit::Control {
+                    opcode,
+                    payload,
+                    raw,
+                } => {
+                    if w.write_all(&raw).await.is_err() {
+                        break 'pump;
+                    }
+                    record_ws(&writer, flow_id, direction, opcode, payload).await;
+                }
+                ws::Emit::Data {
+                    opcode,
+                    mut payload,
+                    raw,
+                    truncated,
+                } => {
+                    // A message cut at `ws::MAX_MESSAGE` is not the message: it
+                    // may be captured truncated, as it always was, but rewriting
+                    // it would corrupt what the peer receives.
+                    let out = if truncated {
+                        crate::hooks::HookOutcome::default()
+                    } else {
+                        hooks.engine.ws_message(
+                            hooks.exec_id.as_deref(),
+                            direction,
+                            &hooks.host,
+                            &hooks.path,
+                            &mut payload,
+                        )
+                    };
+                    if out.dropped {
+                        tracing::info!(
+                            flow = flow_id,
+                            direction = ?direction,
+                            bytes = payload.len(),
+                            "websocket message dropped by hook"
+                        );
+                        continue;
+                    }
+                    let ok = if out.changed {
+                        // Client→server frames MUST be masked (RFC6455 §5.3);
+                        // server→client frames must NOT be.
+                        let mask = matches!(direction, WsDirection::C2s).then(ws::mask_key);
+                        w.write_all(&ws::encode_frame(opcode, &payload, mask)).await
+                    } else {
+                        w.write_all(&raw).await
+                    };
+                    if ok.is_err() {
+                        break 'pump;
+                    }
+                    record_ws(&writer, flow_id, direction, opcode, payload).await;
+                }
+            }
         }
     }
     let _ = w.shutdown().await;
+}
+
+/// Persist one complete WebSocket message. Fire-and-forget: the write is
+/// enqueued but the pump never blocks on the DB ack (the id reply is discarded
+/// through a dropped receiver).
+async fn record_ws(
+    writer: &WriteHandle,
+    flow_id: i64,
+    direction: WsDirection,
+    opcode: u8,
+    payload: Vec<u8>,
+) {
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    let _ = writer
+        .send(WriteOp::InsertWsMessage {
+            flow_id,
+            direction,
+            opcode: Some(opcode as i64),
+            fin: Some(true),
+            payload,
+            ts: now_millis(),
+            reply,
+        })
+        .await;
 }
 
 /// Grace period a still-open splice direction is given to drain after its

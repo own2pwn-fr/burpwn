@@ -49,12 +49,15 @@ namespace, so LLM traffic is excluded by construction.
   battering-ram / pitchfork / cluster-bomb, results ranked by anomaly), response `compare`,
   `encode`/`decode` (base64/url/hex/jwt), scoped blocking interception, and a session-auth login macro
   that auto-refreshes the token on 401/403 — so the tight probe loop never leaves the session.
-- **Hooks.** One action applied to every request (or response) matching a scope: add a header the
-  client never sent, replace or remove one, set a query parameter, drop the flow — or run a command
-  in the sandbox before the request goes out and inject what it prints (a token mint, a request
-  signer), cached for a TTL — a burst of concurrent requests on a cold cache runs the command once
-  and all of them go out carrying its value. A slow or failing hook fails **open**, so it never
-  blocks an engagement.
+- **Hooks.** One action applied to every message the proxy relays that matches a scope: add a header
+  the client never sent, replace or remove one, set a query parameter, drop the flow — or run a
+  command in the sandbox before the request goes out and inject what it prints (a token mint, a
+  request signer), cached for a TTL — a burst of concurrent requests on a cold cache runs the command
+  once and all of them go out carrying its value. A slow or failing hook fails **open**, so it never
+  blocks an engagement. Hooks are not limited to HTTP: `--phase ws-c2s`/`ws-s2c` rewrites or drops
+  complete **WebSocket messages** inside a socket the page is already holding open (nothing else can
+  reach those — there is no replaying a message that only exists in a live socket), and
+  `--phase dns-query` drops a lookup or **forces a name to resolve** where you want it.
 - **Agent integration (rtk-style).** `burpwn init` installs the right command-rewrite hook for the
   detected agent (Claude Code / Copilot, Cursor, Gemini CLI, Cline/Roo), plus a generic global shell
   hook so even a custom agent is covered.
@@ -81,6 +84,10 @@ burpwn hook add token --action exec --host api.target.example \
   --cmd './mint-token.sh' --extract '"access_token":"([^"]+)"' \
   --inject-header 'Authorization: Bearer {}' --ttl 300000  # refresh + inject, cached 5 min
 burpwn hook test 2 --flow 42                   # replay a hook against a capture, no live traffic
+burpwn hook add esc --phase ws-c2s --host chat.target.example \
+  --action replace-payload --find '"role":"user"' --replace '"role":"admin"'  # inside an OPEN socket
+burpwn hook add pin --phase dns-query --host internal.target.example \
+  --action set-answer --answer 10.0.0.5         # force a resolution (A/AAAA)
 burpwn intercept scope target.example --path /admin  # narrow blocking intercept
 burpwn intercept enable                        # blocking intercept (also via MCP await_intercept)
 burpwn group new auth-flow \

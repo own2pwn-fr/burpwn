@@ -119,18 +119,25 @@ pub struct HookAddParams {
     /// Name for the hook, for later listings (e.g. `refresh-api-token`).
     pub name: String,
     /// `add-header`, `set-header`, `remove-header`, `set-query-param`, `drop`
-    /// or `exec`.
+    /// or `exec` on the HTTP phases; `replace-payload` on `ws-c2s`/`ws-s2c`;
+    /// `set-answer` on `dns-query`. An action that does not apply to the phase
+    /// is refused, not ignored.
     pub action: String,
-    /// `pre-request` (default) or `post-response`.
+    /// `pre-request` (default), `post-response`, `ws-c2s` / `ws-s2c` (one
+    /// complete WebSocket message, client→server / server→client) or
+    /// `dns-query`.
     #[serde(default)]
     pub phase: Option<String>,
-    /// Only hosts containing this (omit for every host).
+    /// Only hosts containing this (omit for every host). On `ws-*` it is the
+    /// upgrade request's host; on `dns-query`, the queried NAME.
     #[serde(default)]
     pub host: Option<String>,
-    /// Only this request method (omit for any).
+    /// Only this request method (omit for any). HTTP phases only.
     #[serde(default)]
     pub method: Option<String>,
-    /// Only request targets containing this (omit for any).
+    /// Only request targets containing this (omit for any). On `ws-*` it is
+    /// the upgrade request's target; on `dns-query`, the record type as
+    /// `/A`, `/AAAA`, `/TXT`.
     #[serde(default)]
     pub path: Option<String>,
     /// Only this response status (`post-response` hooks only).
@@ -143,6 +150,16 @@ pub struct HookAddParams {
     /// `name=value`, for `set-query-param`.
     #[serde(default)]
     pub param: Option<String>,
+    /// The literal text to look for in a WebSocket payload, for
+    /// `replace-payload`.
+    #[serde(default)]
+    pub find: Option<String>,
+    /// What replaces `find` (omit to delete it), for `replace-payload`.
+    #[serde(default)]
+    pub replace: Option<String>,
+    /// The address to answer with instead of resolving, for `set-answer`.
+    #[serde(default)]
+    pub answer: Option<String>,
     /// The command, for `exec`. Runs as `sh -c` in the sandbox.
     #[serde(default)]
     pub cmd: Option<String>,

@@ -2,29 +2,54 @@
 //!
 //! The sandbox redirects the workload's UDP/53 traffic to this listener. For
 //! each datagram we:
-//! 1. decode the query with `hickory-proto` (decode only — we never synthesize
-//!    answers),
+//! 1. decode the query with `hickory-proto`,
 //! 2. forward the raw query bytes to a real upstream resolver (the host's first
 //!    `/etc/resolv.conf` nameserver, falling back to `1.1.1.1:53`),
 //! 3. decode the answer for logging,
 //! 4. record a `Protocol::Dns` flow (query name/type as request, answer records
 //!    as the response body),
 //! 5. return the upstream answer bytes verbatim to the client.
+//!
+//! # Hooks
+//!
+//! A `dns-query` hook can short-circuit step 2, and only step 2: it decides
+//! whether the name is resolved at all, and — for an `A`/`AAAA` query — what it
+//! resolves to. Everything burpwn answers itself is SYNTHESIZED here rather than
+//! edited, because that is the only form it can get right: a response built from
+//! the query echoes the id and the question, carries one record and nothing
+//! else. Rewriting an upstream answer would mean re-encoding records burpwn did
+//! not make — CNAME chains, EDNS(0), DNSSEC material — so there is deliberately
+//! no `dns-response` phase.
+//!
+//! What a synthetic answer is NOT: authoritative about anything else. It carries
+//! no EDNS OPT record even when the query had one (a resolver reads that as "no
+//! EDNS support", which is a defined answer), and it is unsigned — a client that
+//! set `DO` and validates will refuse it, correctly. Both are properties of
+//! answering rather than resolving, and neither can be fixed by trying harder.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::{RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
 use burpwn_store::model::{FlowStart, Protocol, RequestData, ResponseData};
 use burpwn_store::WriteHandle;
 
+use crate::hooks::{DnsDecision, HookEngine};
 use crate::util::now_millis;
 
+/// TTL put on a synthesized answer, in seconds.
+///
+/// Short on purpose: the point of a `set-answer` hook is to steer a target
+/// during an engagement, and a long TTL would keep steering it from the client's
+/// own cache after the hook is gone — a stale finding that looks like a live one.
+const SYNTHETIC_TTL: u32 = 60;
+
 /// Configuration for the DNS front-end.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DnsConfig {
     /// Upstream resolver to forward to.
     pub upstream: SocketAddr,
@@ -34,17 +59,32 @@ pub struct DnsConfig {
     pub exec_id: Option<String>,
     /// Per-query upstream timeout.
     pub timeout: Duration,
+    /// The hook engine, shared with the daemon: a `dns-query` hook added
+    /// mid-session reaches the shim that is already serving.
+    pub hooks: HookEngine,
+}
+
+impl std::fmt::Debug for DnsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsConfig")
+            .field("upstream", &self.upstream)
+            .field("workspace_id", &self.workspace_id)
+            .field("exec_id", &self.exec_id)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DnsConfig {
     /// Build a config using the host's first configured nameserver, or
     /// `1.1.1.1:53` if `/etc/resolv.conf` has none.
-    pub fn from_host(workspace_id: i64, exec_id: Option<String>) -> Self {
+    pub fn from_host(workspace_id: i64, exec_id: Option<String>, hooks: HookEngine) -> Self {
         Self {
             upstream: host_upstream(),
             workspace_id,
             exec_id,
             timeout: Duration::from_secs(5),
+            hooks,
         }
     }
 }
@@ -111,11 +151,29 @@ async fn handle_query(
     cfg: &DnsConfig,
     writer: &WriteHandle,
 ) -> std::io::Result<()> {
-    let answer = forward_upstream(&query, cfg).await?;
+    // The hooks are consulted behind one relaxed atomic load, and the query is
+    // decoded for them only if one exists — a shim with no `dns-query` hook
+    // resolves exactly as it did, and decodes the query once, for the log.
+    let mut described: Option<(String, String)> = None;
+    let decision = if cfg.hooks.any_dns() {
+        let (qname, qtype) = describe_query(&query);
+        let d = cfg
+            .hooks
+            .dns_query(cfg.exec_id.as_deref(), &qname, &format!("/{qtype}"));
+        described = Some((qname, qtype));
+        d
+    } else {
+        DnsDecision::Resolve
+    };
+
+    let answer = match hooked_answer(&query, decision) {
+        Some(bytes) => bytes,
+        None => forward_upstream(&query, cfg).await?,
+    };
     // Reply to the client first (latency), then log.
     sock.send_to(&answer, peer).await?;
 
-    let (qname, qtype) = describe_query(&query);
+    let (qname, qtype) = described.unwrap_or_else(|| describe_query(&query));
     let answer_text = describe_answer(&answer);
 
     let flow_id = writer
@@ -163,6 +221,79 @@ async fn handle_query(
         .await;
     let _ = writer.flow_end(flow_id, now_millis()).await;
     Ok(())
+}
+
+/// The answer a `dns-query` hook decided on, or `None` to resolve upstream.
+///
+/// Every failure here FAILS OPEN — an undecodable query, a `set-answer` whose
+/// family does not match the question, a message that will not re-encode — and
+/// falls back to resolving. A hook that cannot be honoured must never turn into
+/// a name that stops resolving.
+fn hooked_answer(query: &[u8], decision: DnsDecision) -> Option<Vec<u8>> {
+    let (rcode, ip) = match decision {
+        DnsDecision::Resolve => return None,
+        DnsDecision::Refuse => (ResponseCode::Refused, None),
+        DnsDecision::Answer(ip) => (ResponseCode::NoError, Some(ip)),
+    };
+    match synthesize(query, rcode, ip) {
+        Some(bytes) => {
+            tracing::info!(
+                refused = rcode == ResponseCode::Refused,
+                answered = ?ip,
+                "dns query answered by a hook instead of being resolved"
+            );
+            Some(bytes)
+        }
+        None => {
+            tracing::warn!(
+                answered = ?ip,
+                "a dns hook could not be applied to this query (undecodable, or a \
+                 record type the address does not fit); resolving upstream instead"
+            );
+            None
+        }
+    }
+}
+
+/// Build a response to `query` carrying `rcode` and, optionally, one address
+/// record. `None` when the query cannot be decoded, has no question, or asks for
+/// a record type `ip` cannot answer (an `A` hook has nothing to say about an
+/// `MX` lookup, and saying it anyway would be a lie the client caches).
+fn synthesize(query: &[u8], rcode: ResponseCode, ip: Option<IpAddr>) -> Option<Vec<u8>> {
+    let request = Message::from_vec(query).ok()?;
+    let question = request.queries().first()?.clone();
+    if let Some(addr) = ip {
+        let wanted = match addr {
+            IpAddr::V4(_) => RecordType::A,
+            IpAddr::V6(_) => RecordType::AAAA,
+        };
+        if question.query_type() != wanted {
+            return None;
+        }
+    }
+
+    let mut response = Message::new();
+    response
+        .set_id(request.id())
+        .set_op_code(request.op_code())
+        .set_message_type(MessageType::Response)
+        .set_recursion_desired(request.recursion_desired())
+        .set_recursion_available(true)
+        .set_response_code(rcode)
+        .add_query(question.clone());
+    if let Some(addr) = ip {
+        let rdata = match addr {
+            IpAddr::V4(v4) => RData::A(v4.into()),
+            IpAddr::V6(v6) => RData::AAAA(v6.into()),
+        };
+        response.set_authoritative(true);
+        response.add_answer(Record::from_rdata(
+            question.name().clone(),
+            SYNTHETIC_TTL,
+            rdata,
+        ));
+    }
+    response.to_vec().ok()
 }
 
 /// Forward the raw query to the upstream resolver over UDP and return its reply.
@@ -246,6 +377,10 @@ mod tests {
     use std::str::FromStr;
 
     fn sample_query(name: &str) -> Vec<u8> {
+        typed_query(name, RecordType::A)
+    }
+
+    fn typed_query(name: &str, rtype: RecordType) -> Vec<u8> {
         let mut msg = Message::new();
         msg.set_id(0x1234)
             .set_message_type(MessageType::Query)
@@ -253,7 +388,7 @@ mod tests {
             .set_recursion_desired(true);
         let mut q = Query::new();
         q.set_name(Name::from_str(name).unwrap())
-            .set_query_type(RecordType::A);
+            .set_query_type(rtype);
         msg.add_query(q);
         msg.to_vec().unwrap()
     }
@@ -271,6 +406,133 @@ mod tests {
         let bytes = sample_query("test.local.");
         let rendered = describe_answer(&bytes);
         assert!(rendered.contains("test.local"));
+    }
+
+    /// A synthesized answer has to be an answer to THIS query: same id, same
+    /// question, one record of the type that was asked for. A resolver that
+    /// gets any of those wrong is a resolver whose reply is thrown away.
+    #[test]
+    fn a_synthesized_answer_echoes_the_query_and_carries_the_record() {
+        let query = sample_query("internal.example.com.");
+        let bytes = synthesize(
+            &query,
+            ResponseCode::NoError,
+            Some("10.0.0.5".parse().unwrap()),
+        )
+        .expect("an A query is answerable with an A record");
+        let msg = Message::from_vec(&bytes).unwrap();
+        assert_eq!(msg.id(), 0x1234, "the transaction id must be echoed");
+        assert_eq!(msg.message_type(), MessageType::Response);
+        assert_eq!(msg.response_code(), ResponseCode::NoError);
+        assert_eq!(msg.queries().len(), 1);
+        assert!(msg.queries()[0].name().to_string().starts_with("internal"));
+        assert_eq!(msg.answers().len(), 1);
+        assert_eq!(msg.answers()[0].ttl(), SYNTHETIC_TTL);
+        assert_eq!(
+            msg.answers()[0].data().ip_addr(),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        assert!(msg.recursion_available());
+
+        // AAAA, the same way.
+        let v6 = typed_query("internal.example.com.", RecordType::AAAA);
+        let bytes = synthesize(&v6, ResponseCode::NoError, Some("::1".parse().unwrap())).unwrap();
+        let msg = Message::from_vec(&bytes).unwrap();
+        assert_eq!(
+            msg.answers()[0].data().ip_addr(),
+            Some("::1".parse().unwrap())
+        );
+    }
+
+    /// The honest boundary of `set-answer`: an address answers an address
+    /// question and nothing else. Anything it cannot answer must fall back to
+    /// resolving rather than invent a record — including a query it cannot even
+    /// decode.
+    #[test]
+    fn an_address_hook_does_not_answer_a_question_it_cannot_answer() {
+        // An A hook has nothing to say about an MX (or AAAA) lookup…
+        for rtype in [RecordType::MX, RecordType::AAAA, RecordType::TXT] {
+            let q = typed_query("internal.example.com.", rtype);
+            assert!(
+                synthesize(&q, ResponseCode::NoError, Some("10.0.0.5".parse().unwrap())).is_none(),
+                "{rtype:?}"
+            );
+        }
+        // …nor a v6 hook about an A lookup.
+        let q = sample_query("internal.example.com.");
+        assert!(synthesize(&q, ResponseCode::NoError, Some("::1".parse().unwrap())).is_none());
+        // An undecodable datagram is forwarded, not answered.
+        assert!(hooked_answer(&[0xff, 0x00], DnsDecision::Refuse).is_none());
+        assert!(hooked_answer(&q, DnsDecision::Resolve).is_none());
+    }
+
+    /// A `drop` on DNS is a REFUSED answer, not silence: a client that gets no
+    /// datagram retries for seconds and then blames the network.
+    #[test]
+    fn a_dropped_query_is_answered_refused() {
+        let query = sample_query("telemetry.example.com.");
+        let bytes = hooked_answer(&query, DnsDecision::Refuse).expect("an rcode, not silence");
+        let msg = Message::from_vec(&bytes).unwrap();
+        assert_eq!(msg.response_code(), ResponseCode::Refused);
+        assert_eq!(msg.id(), 0x1234);
+        assert!(msg.answers().is_empty());
+    }
+
+    /// End to end through the shim: a `set-answer` hook must answer WITHOUT
+    /// asking upstream. The upstream here is a socket nobody is listening on,
+    /// so a reply proves the query never left.
+    #[tokio::test]
+    async fn a_set_answer_hook_answers_without_touching_the_upstream() {
+        use burpwn_store::model::{Hook, HookAction, HookPhase, HookScope};
+
+        let dead_upstream: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let hooks = HookEngine::new();
+        hooks.set_hooks(vec![Hook {
+            id: 1,
+            enabled: true,
+            name: "force".into(),
+            phase: HookPhase::DnsQuery,
+            scope: HookScope {
+                host: "internal.example.com".into(),
+                ..Default::default()
+            },
+            action: HookAction::SetAnswer {
+                ip: "10.0.0.5".parse().unwrap(),
+            },
+            order: 0,
+            timeout_ms: 1_000,
+            ttl_ms: 0,
+            created_at: 0,
+        }]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = burpwn_store::Store::open(dir.path().join("session.db")).unwrap();
+        let shim = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let shim_addr = shim.local_addr().unwrap();
+        let cfg = DnsConfig {
+            upstream: dead_upstream,
+            workspace_id: 1,
+            exec_id: None,
+            timeout: Duration::from_millis(200),
+            hooks,
+        };
+        tokio::spawn(serve_socket(shim, cfg, store.writer()));
+
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        client
+            .send_to(&sample_query("internal.example.com."), shim_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("the shim must answer from the hook, not wait on the upstream")
+            .unwrap();
+        let msg = Message::from_vec(&buf[..n]).unwrap();
+        assert_eq!(
+            msg.answers()[0].data().ip_addr(),
+            Some("10.0.0.5".parse().unwrap())
+        );
     }
 
     #[test]
@@ -307,6 +569,7 @@ mod tests {
             workspace_id: 1,
             exec_id: None,
             timeout: Duration::from_secs(2),
+            hooks: HookEngine::new(),
         };
         let query = sample_query("forward.test.");
         let got = forward_upstream(&query, &cfg).await.unwrap();
@@ -338,6 +601,7 @@ mod tests {
             workspace_id: 1,
             exec_id: None,
             timeout: Duration::from_secs(2),
+            hooks: HookEngine::new(),
         };
         let query = sample_query("mismatch.test.");
         let err = forward_upstream(&query, &cfg).await.unwrap_err();

@@ -69,6 +69,12 @@ pub struct HookSpec {
     pub header: Option<String>,
     /// `name=value` for `set-query-param`.
     pub param: Option<String>,
+    /// The literal text to look for, for `replace-payload`.
+    pub find: Option<String>,
+    /// What replaces it, for `replace-payload`.
+    pub replace: Option<String>,
+    /// The address to answer with, for `set-answer`.
+    pub answer: Option<String>,
     /// The command, for `exec`.
     pub cmd: Option<String>,
     /// The one-capture-group regex applied to the command's stdout.
@@ -99,6 +105,17 @@ pub fn build_hook(spec: &HookSpec) -> Result<NewHook> {
         crate::fail!(
             ErrorCode::InputInvalidValue,
             "--status only makes sense on a post-response hook (a request has no status yet)"
+        );
+    }
+    // A WebSocket message and a DNS query have no method. A hook carrying one
+    // could only ever fail to match, silently, which is the whole failure mode
+    // `hook add` exists to prevent.
+    if !spec.method.trim().is_empty() && !phase.is_http() {
+        crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "--method scopes an HTTP request; a {} hook has no method to match \
+             (scope it with --host and --path instead)",
+            phase.as_str()
         );
     }
     if spec.timeout_ms <= 0 {
@@ -142,6 +159,30 @@ pub fn build_hook(spec: &HookSpec) -> Result<NewHook> {
             HookAction::SetQueryParam { name, value }
         }
         "drop" => HookAction::Drop,
+        "replace-payload" => {
+            let find = require(&spec.find, "--find <text>", "replace-payload")?;
+            if find.is_empty() {
+                crate::fail!(
+                    ErrorCode::InputInvalidValue,
+                    "--find must not be empty (an empty match would rewrite nothing, \
+                     on every message)"
+                );
+            }
+            HookAction::ReplacePayload {
+                find: find.clone(),
+                replace: spec.replace.clone().unwrap_or_default(),
+            }
+        }
+        "set-answer" => {
+            let raw = require(&spec.answer, "--answer <ip>", "set-answer")?;
+            let ip = raw.trim().parse().map_err(|_| {
+                crate::coded!(
+                    ErrorCode::InputInvalidValue,
+                    "--answer must be an IPv4 or IPv6 address, got {raw:?}"
+                )
+            })?;
+            HookAction::SetAnswer { ip }
+        }
         "exec" => {
             let cmd = require(&spec.cmd, "--cmd <command>", "exec")?
                 .trim()
@@ -160,10 +201,25 @@ pub fn build_hook(spec: &HookSpec) -> Result<NewHook> {
         }
         other => crate::fail!(
             ErrorCode::InputInvalidValue,
-            "unknown hook action {other:?} — one of: add-header, set-header, \
-             remove-header, set-query-param, drop, exec"
+            "unknown hook action {other:?} — one of: {}",
+            HookAction::VALID.join(", ")
         ),
     };
+
+    // The pairing. An action that means nothing on this phase — a header on a
+    // WebSocket message, a command on a per-frame phase — is refused HERE, at
+    // the only moment a human is looking: accepting it and discovering on the
+    // hot path that there is nothing to add the header to is the silent
+    // fallback this codebase keeps removing.
+    if !action.allowed_on(phase) {
+        crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "the {} action does not apply to a {} hook — {}",
+            action.kind(),
+            phase.as_str(),
+            why_not(&action, phase)
+        );
+    }
 
     Ok(NewHook {
         enabled: !spec.disabled,
@@ -182,14 +238,65 @@ pub fn build_hook(spec: &HookSpec) -> Result<NewHook> {
     })
 }
 
-/// `pre-request` / `post-response`, with the short aliases an operator will try.
+/// The phase, with the short aliases an operator will try.
+///
+/// The WebSocket phases are named after the DIRECTION, `ws-c2s` / `ws-s2c`,
+/// because that is the word the capture already uses: `req show` on a WebSocket
+/// flow prints `c2s`/`s2c` per message, so the operator who just read a frame
+/// and wants to act on it writes down what they read. `ws-send`/`ws-recv` would
+/// have been shorter and ambiguous — sent by whom? — so they are accepted as
+/// aliases (from the CLIENT's point of view, the only one a browser-side
+/// operator has) rather than as the name.
 fn parse_phase(s: &str) -> Result<HookPhase> {
     match s {
         "pre-request" | "request" | "req" => Ok(HookPhase::PreRequest),
         "post-response" | "response" | "resp" => Ok(HookPhase::PostResponse),
+        "ws-c2s" | "ws-send" | "ws-client" => Ok(HookPhase::WsC2s),
+        "ws-s2c" | "ws-recv" | "ws-server" => Ok(HookPhase::WsS2c),
+        "dns-query" | "dns" => Ok(HookPhase::DnsQuery),
         other => crate::fail!(
             ErrorCode::InputInvalidValue,
-            "--phase must be pre-request|post-response, got {other:?}"
+            "--phase must be one of {}, got {other:?}",
+            HookPhase::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+        ),
+    }
+}
+
+/// Why an action does not apply to a phase, in the operator's terms. The
+/// refusal is worth nothing if it does not say what to do instead.
+fn why_not(action: &HookAction, phase: HookPhase) -> String {
+    match action {
+        HookAction::Exec { .. } => format!(
+            "an exec hook runs a command in a sandbox, and a {} hook fires on every \
+             {} — one sandbox each would cost more than the traffic it watches. \
+             Put the exec hook on pre-request: a socket inherits what its upgrade \
+             request carried",
+            phase.as_str(),
+            if phase.is_ws() {
+                "message the socket carries"
+            } else {
+                "name the workload resolves"
+            }
+        ),
+        HookAction::ReplacePayload { .. } => {
+            "it rewrites a websocket payload, so it needs --phase ws-c2s or ws-s2c".into()
+        }
+        HookAction::SetAnswer { .. } => {
+            "it answers a name instead of resolving it, so it needs --phase dns-query".into()
+        }
+        _ => format!(
+            "there are no headers and no request target on a {} message; what a hook \
+             can do there is drop it{}",
+            phase.as_str(),
+            if phase.is_ws() {
+                " or rewrite its payload (--action replace-payload)"
+            } else {
+                " or answer it (--action set-answer)"
+            }
         ),
     }
 }
@@ -209,7 +316,8 @@ fn request_side_only(phase: HookPhase, action: &str) -> Result<()> {
         crate::fail!(
             ErrorCode::InputInvalidValue,
             "{action} rewrites the request target, so it only applies to a \
-             pre-request hook"
+             pre-request hook, not to a {} one",
+            phase.as_str()
         );
     }
     Ok(())
@@ -349,6 +457,10 @@ pub fn action_summary(hook: &Hook) -> String {
         HookAction::RemoveHeader { name } => format!("remove-header {name}"),
         HookAction::SetQueryParam { name, value } => format!("set-query-param {name}={value}"),
         HookAction::Drop => "drop".to_string(),
+        HookAction::ReplacePayload { find, replace } => {
+            format!("replace-payload {find:?} -> {replace:?}")
+        }
+        HookAction::SetAnswer { ip } => format!("set-answer {ip}"),
         HookAction::Exec { cmd, inject, .. } => format!(
             "exec {cmd:?} -> {} {}: {}",
             inject.kind.as_str(),
@@ -483,6 +595,23 @@ pub async fn test_hook(
         .or_else(|| (!request.authority.is_empty()).then(|| request.authority.clone()))
         .unwrap_or_default();
 
+    // `hook test` replays a hook against a captured HTTP message. The
+    // WebSocket and DNS phases have no such message on a `FlowDetail` — the
+    // frames live in their own table and a DNS query is a name, not a request —
+    // so testing them would mean inventing a message the hook never sees. Say
+    // that, rather than report a confident "does not match" about a comparison
+    // that was never made.
+    if !hook.phase.is_http() {
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "hook {} is a {} hook: `hook test` replays a hook against a captured \
+             HTTP request or response, and neither exists for that phase. Watch it \
+             on live traffic instead (`req list --protocol ws` / `--protocol dns`)",
+            hook.id,
+            hook.phase.as_str()
+        );
+    }
+
     // The message the hook would see, per phase: a request, or the response
     // headers/body carrying the request's host/path for scoping.
     let (mut msg, status) = match hook.phase {
@@ -513,6 +642,13 @@ pub async fn test_hook(
                 Some(response.status),
             )
         }
+        // Refused above: `hook test` needs an HTTP message and these phases
+        // have none. Unreachable, and deliberately not a fabricated default.
+        other => crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "hook test does not apply to the {} phase",
+            other.as_str()
+        ),
     };
 
     let (scope_host, scope_path) = (msg.host.clone(), request.path.clone());
@@ -660,6 +796,137 @@ mod tests {
         );
 
         assert_eq!(build_hook(&spec("drop")).unwrap().action, HookAction::Drop);
+    }
+
+    /// The WebSocket and DNS phases: what they accept, and — the part that
+    /// matters — what they refuse. An action that means nothing on a phase must
+    /// die here, with a message naming the phase, because the alternative is a
+    /// hook sitting in the table doing nothing at all.
+    #[test]
+    fn the_websocket_and_dns_phases_accept_only_what_they_can_do() {
+        let ws_spec = |action: &str| {
+            let mut s = spec(action);
+            s.phase = "ws-c2s".into();
+            s
+        };
+
+        let mut s = ws_spec("replace-payload");
+        s.find = Some("\"role\":\"user\"".into());
+        s.replace = Some("\"role\":\"admin\"".into());
+        let h = build_hook(&s).unwrap();
+        assert_eq!(h.phase, HookPhase::WsC2s);
+        assert_eq!(
+            h.action,
+            HookAction::ReplacePayload {
+                find: "\"role\":\"user\"".into(),
+                replace: "\"role\":\"admin\"".into()
+            }
+        );
+        // An omitted --replace deletes the match rather than being a refusal:
+        // "cut the heartbeat field out of every frame" is a real thing to want.
+        let mut s = ws_spec("replace-payload");
+        s.find = Some("secret".into());
+        assert_eq!(
+            build_hook(&s).unwrap().action,
+            HookAction::ReplacePayload {
+                find: "secret".into(),
+                replace: String::new()
+            }
+        );
+        // …but an empty --find would match nothing on every message.
+        let mut s = ws_spec("replace-payload");
+        s.find = Some(String::new());
+        assert!(build_hook(&s).is_err());
+        assert!(
+            build_hook(&ws_spec("replace-payload")).is_err(),
+            "no --find"
+        );
+
+        // `drop` is the one action every phase understands.
+        assert_eq!(
+            build_hook(&ws_spec("drop")).unwrap().action,
+            HookAction::Drop
+        );
+
+        let mut s = spec("set-answer");
+        s.phase = "dns-query".into();
+        s.answer = Some("10.0.0.5".into());
+        let h = build_hook(&s).unwrap();
+        assert_eq!(h.phase, HookPhase::DnsQuery);
+        assert_eq!(
+            h.action,
+            HookAction::SetAnswer {
+                ip: "10.0.0.5".parse().unwrap()
+            }
+        );
+        s.answer = Some("not-an-ip".into());
+        assert!(build_hook(&s).is_err());
+
+        // --- the refusals ---
+        for (phase, action) in [
+            // No header, no target, on a frame or a query.
+            ("ws-c2s", "add-header"),
+            ("ws-s2c", "set-header"),
+            ("dns-query", "remove-header"),
+            ("ws-c2s", "set-query-param"),
+            // A command per message is the cost model these phases exist to
+            // avoid.
+            ("ws-s2c", "exec"),
+            ("dns-query", "exec"),
+            // …and the reverse: a payload rewrite is not an HTTP action, an
+            // answer is not a WebSocket one.
+            ("pre-request", "replace-payload"),
+            ("ws-c2s", "set-answer"),
+            ("dns-query", "replace-payload"),
+        ] {
+            let mut s = spec(action);
+            s.phase = phase.into();
+            // Give every action everything it could need, so the refusal is
+            // about the PAIRING and not about a missing flag.
+            s.header = Some("X-Test: 1".into());
+            s.param = Some("a=1".into());
+            s.find = Some("a".into());
+            s.answer = Some("127.0.0.1".into());
+            s.cmd = Some("mint".into());
+            s.extract = Some(r#"tok=(\w+)"#.into());
+            s.inject_header = Some("Authorization: Bearer {}".into());
+            let err = build_hook(&s).unwrap_err().to_string();
+            assert!(
+                err.contains(phase) || err.contains("ws-c2s") || err.contains("dns-query"),
+                "{phase}/{action} must be refused with a message that names the \
+                 phase, got: {err}"
+            );
+        }
+
+        // A method scope on a phase that has no method is equally a refusal:
+        // silently never matching is the failure this whole check exists for.
+        let mut s = ws_spec("drop");
+        s.method = "GET".into();
+        assert!(build_hook(&s).is_err());
+    }
+
+    /// The phase spellings an operator will actually type.
+    #[test]
+    fn phase_aliases_resolve_to_the_direction_the_capture_prints() {
+        for (spelling, want) in [
+            ("pre-request", HookPhase::PreRequest),
+            ("req", HookPhase::PreRequest),
+            ("post-response", HookPhase::PostResponse),
+            ("resp", HookPhase::PostResponse),
+            ("ws-c2s", HookPhase::WsC2s),
+            ("ws-send", HookPhase::WsC2s),
+            ("ws-client", HookPhase::WsC2s),
+            ("ws-s2c", HookPhase::WsS2c),
+            ("ws-recv", HookPhase::WsS2c),
+            ("ws-server", HookPhase::WsS2c),
+            ("dns-query", HookPhase::DnsQuery),
+            ("dns", HookPhase::DnsQuery),
+        ] {
+            assert_eq!(parse_phase(spelling).unwrap(), want, "{spelling}");
+        }
+        // A near-miss is an error listing the real spellings, never a default.
+        let err = parse_phase("ws").unwrap_err().to_string();
+        assert!(err.contains("ws-c2s") && err.contains("dns-query"), "{err}");
     }
 
     #[test]
