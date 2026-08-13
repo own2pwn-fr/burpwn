@@ -258,7 +258,8 @@ burpwn exec --workspace recon -- curl ...  # attribute captures to it
 burpwn req list --workspace recon
 burpwn tag add <flow_id> sqli-candidate
 burpwn note add <flow_id> 'reflected param `q`'
-burpwn export har -o /tmp/session.har      # HAR 1.2 (stdout if no -o); export pcap is not implemented
+burpwn export har -o /tmp/session.har      # HAR 1.2 (stdout if no -o)
+burpwn export pcap -o /tmp/session.pcapng  # SYNTHETIC pcapng for Wireshark (read the caveat below)
 burpwn export session -o /tmp/acme.burpwn  # the WHOLE session in one portable file
 ```
 
@@ -275,6 +276,18 @@ the session replays identically. `--redact` drops the stored auth profiles and
 match/replace replacements, but it does **not** scrub credentials captured inside
 recorded requests and responses. Move a bundle the way you would move the
 credentials it contains.
+
+⚠️ **`export pcap` is a SYNTHESIS, not a capture.** burpwn stores reassembled
+HTTP messages, never packets, so the pcapng is fabricated around the bytes it
+really has. The request/response bytes, the websocket payloads, the endpoints and
+the millisecond timestamps are real; the handshakes, every sequence number and
+the segmentation are generated (the file says so in its own pcapng comments).
+`Content-Length` is recomputed and `Content-Encoding` / `Transfer-Encoding` are
+dropped, because stored bodies are already decoded. DNS, raw-TCP and
+TLS-passthrough flows are **left out and counted** rather than faked — burpwn has
+their metadata, not their bytes — and HTTP/2 is re-encoded as HTTP/1.1. Reach for
+it to hand a scenario to Wireshark or an IDS; never to argue about what was on
+the wire.
 
 `burpwn workspace use <name>` only records the choice in config — you must still
 pass `--workspace` on `exec`/`req` to actually scope.

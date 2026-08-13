@@ -5,6 +5,74 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — `export pcap`, and an honest answer to what a pcap of burpwn can even be
+`burpwn export pcap` has errored on purpose since 0.2.0. It now writes a **pcapng** that Wireshark,
+tshark and tcpdump open: `Follow HTTP stream` works, the HTTP dissector labels the exchanges, and
+the websocket dissector lights up after the `101`.
+
+The reason it stayed a stub for four releases is worth stating, because it is the whole design. **A
+pcap is a packet format and burpwn has no packets.** The proxy terminates TLS, reassembles the HTTP
+layer and stores *messages* — a method, a header block, a decoded body. There is no handshake, no
+sequence number, no MTU and no per-packet clock anywhere in the store. So this is not a conversion,
+it is a **synthesis**: a plausible wire trace fabricated around the bytes we really have. That is
+genuinely useful — it is how a scenario gets handed to Wireshark, to an IDS, to `tshark -z` — and it
+is dangerous exactly to the extent that the file can be mistaken for a capture.
+
+**Which is why the format is pcapng and not classic pcap.** Both can hold the same synthetic frames
+and both follow a TCP stream. The difference is that a classic pcap has *nowhere to say the file is
+manufactured*: its 24-byte header holds a magic, a version, a link type and a snaplen, so the file
+simply claims to be a capture and nothing can contradict it. pcapng has options, so the export
+stamps the section header with a comment spelling out what was generated, names the interface
+`burpwn-synthetic` and describes it as one that was never captured from, and puts a comment on every
+fabricated `SYN` — visible in the packet list, not in a README nobody ships alongside the file. The
+second reason is the clock: the store keeps **milliseconds**, and pcap's packet header is
+microseconds, so a pcap export would pad three zeroes onto every timestamp and imply a precision
+that does not exist. pcapng's `if_tsresol` declares millisecond resolution, which is exactly what we
+know. The link type is `LINKTYPE_RAW` for the same reason — there was no link layer, so the file
+does not invent two MAC addresses for a hop that never existed.
+
+What is real, and what is not:
+- **Real**: request and response bytes, websocket payloads and opcodes, client and server addresses
+  and ports, and the millisecond timestamps of the request and the response.
+- **Invented**: the TCP handshake and teardown, every sequence and acknowledgement number, window
+  sizes, IP ids, TTLs, the segmentation (a conventional 1460-byte MSS, 1440 over IPv6) and the
+  ordering of packets inside one millisecond.
+- **Rewritten**: stored bodies are already decoded — gunzipped, de-chunked — so the captured
+  `Content-Length` / `Transfer-Encoding` / `Content-Encoding` headers describe bytes that are not in
+  the file. They are dropped and a correct `Content-Length` is written instead. This is the one
+  place where the header block on the wire differs from the header block in the store, and without
+  it the stream mis-frames and nothing dissects at all.
+
+**What cannot be rendered is left out and counted, never faked.** DNS, raw-TCP and TLS-passthrough
+flows have metadata in the store and no bytes; writing invented DNS queries would produce a file
+that is worse than no file. They are excluded, and so are flows with no request recorded, with a
+per-reason breakdown printed next to the success line and carried in `data.skipped` under `--json`.
+HTTP/2 *is* exported — re-encoded as HTTP/1.1, because the HPACK framing was never stored — counted
+in `data.h2_as_http1`, and every affected frame carries a comment saying so. Endpoints the store
+never recorded are filled from the RFC 5737 documentation ranges, deliberately un-routable so a
+placeholder cannot be read as a host that was really contacted, and counted too.
+
+Two smaller decisions. HTTP/1 flows that shared a client socket share one synthetic stream with a
+continuous sequence space — `client_addr` is the real client socket, so that grouping is
+information, not a guess — while HTTP/2 and websocket flows each get their own, since laying
+multiplexed or long-lived traffic on one stream produces interleaved nonsense. And two conversations
+are never allowed to collide on one 4-tuple: the loser is given an invented ephemeral port, counted
+in `data.synthetic_client_ports`, because a collision is what turns two clean streams into one
+broken one in Wireshark.
+
+The command takes the same filters as `export har` (`--workspace`, now by name *or* id, exclusive
+with `--group`), plus `--session` and `--force`. Unlike `export har` there is no stdout form — a
+pcapng is binary and stdout belongs to the envelope. It defaults to `<session>.pcapng`, is refused
+onto an existing file without `--force`, and is refused through a symlink with or without it. No new
+dependency: both the pcapng container and the IP/TCP synthesis are written by hand, which is a few
+hundred lines for formats this simple. The output is byte-for-byte reproducible for the same input,
+which is what makes the tests mean anything — and libpcap itself validates it, via a test that
+shells out to `tcpdump` where the machine has it and skips where it does not.
+
+There is deliberately **no `export_pcap` MCP tool**, for the same reason `export har` has none: the
+artefact is a binary file for a human's Wireshark, and an agent cannot read it. Archival an agent
+*can* act on remains `session_export`.
+
 ### Changed — the MCP `compare` tool stops handing over a whole page of diff
 `compare` returns the body diff as two lists of lines, one per side. Two HTML pages that differ
 share almost no lines, so those lists are routinely thousands of lines long — and unlike every
