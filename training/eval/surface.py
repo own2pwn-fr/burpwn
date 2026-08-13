@@ -255,9 +255,14 @@ def cli_surface_from_binary(binary: str) -> dict[str, Any] | None:
         return None
     flags.update(CLAP_BUILTIN_FLAGS)
     # The version is part of the provenance on purpose: it is the one field that
-    # would have made the 0.2.0-binary false green visible at a glance.
+    # would have made the 0.2.0-binary false green visible at a glance. The path
+    # is relativized when it sits inside the repo so the committed surface.json
+    # snapshot does not bake in one machine's absolute paths.
+    shown = binary
+    if os.path.commonpath([os.path.abspath(binary), REPO_ROOT]) == REPO_ROOT:
+        shown = os.path.relpath(binary, REPO_ROOT)
     return {
-        "provenance": f"binary:{binary} ({binary_version(binary)})",
+        "provenance": f"binary:{shown} ({binary_version(binary)})",
         "subcommands": sorted(subcommands),
         "flags": sorted(flags),
     }
