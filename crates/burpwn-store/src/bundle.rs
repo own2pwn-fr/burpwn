@@ -25,12 +25,17 @@
 //!
 //! # Secrets
 //!
-//! A bundle is the session AS CAPTURED: `auth_profiles.token`, the
-//! `auth_profiles.login_cmd` (which usually carries credentials in its argv),
-//! and every `Authorization` / `Cookie` header recorded in the blobs. [`redact`]
-//! removes the credentials burpwn stored AND masks the credential-shaped values
-//! in the traffic it captured — see its doc comment for the exact, deliberately
-//! narrow, scope. Callers are expected to say so out loud.
+//! A bundle is the session AS CAPTURED: the command an `exec` hook runs (a
+//! login macro's argv routinely holds a password), the match/replace
+//! replacements, and every `Authorization` / `Cookie` header recorded in the
+//! blobs. [`redact`] removes the credentials burpwn stored AND masks the
+//! credential-shaped values in the traffic it captured — at the BYTE level, not
+//! just the row level. See its doc comment for the exact, deliberately narrow,
+//! scope. Callers are expected to say so out loud.
+//!
+//! One thing it no longer has to erase: a minted session token. Since schema v8
+//! the login macro is a hook, and the token it mints stays in the daemon's
+//! memory for the hook's TTL instead of being written to `auth_profiles.token`.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -304,10 +309,12 @@ pub fn stage(bundle: &Path, staging_dir: &Path) -> Result<StagedBundle> {
 /// Strip the credentials out of a bundle-in-progress. Two halves, both applied
 /// to the COPY — the session on disk is never touched.
 ///
-/// **What burpwn stored**, dropped whole: the auth profiles' tokens and login
-/// commands (whose argv routinely carries a password), the match/replace
-/// replacements (where an injected `Authorization` value lives), an `exec`
-/// hook's parameters, and the recorded `burpwn exec` command lines.
+/// **What burpwn stored**, dropped whole: an `exec` hook's parameters (the login
+/// macro lives there since schema v8, and its argv routinely carries a
+/// password), the match/replace replacements (where an injected `Authorization`
+/// value lives), the recorded `burpwn exec` command lines, and — on a session
+/// file old enough to still have the table — the `auth_profiles` tokens and
+/// login commands.
 ///
 /// **What burpwn captured**, masked in place: every credential-shaped value in
 /// the recorded traffic — see [`crate::scrub`] for the exact rules. In short,
@@ -321,6 +328,17 @@ pub fn stage(bundle: &Path, staging_dir: &Path) -> Result<StagedBundle> {
 /// still in the bundle. `--redact` narrows what you are handing over; it does
 /// not certify the result. Anything that changes here must change the warning
 /// in `burpwn-cli`'s `bundle` module too, which is what the operator reads.
+///
+/// ⚠️ **This function alone does not ERASE anything.** Overwriting a row leaves
+/// the old bytes in the page SQLite frees, so a `grep` over the file still finds
+/// what the rows no longer show. Getting rid of those is [`export`]'s job: it
+/// runs this on a scratch copy and then `VACUUM INTO`s a second one, which is
+/// rebuilt from live rows only and therefore has no freelist to leak from. A
+/// future caller that redacts a database it intends to keep has to vacuum it
+/// too: `PRAGMA secure_delete` is NOT a substitute here — it zeroes the cells
+/// the `UPDATE`s free, but the traffic pass also merges and deletes blob rows,
+/// and a captured token survives in the file without the vacuum. Measured both
+/// ways in `a_redacted_bundle_carries_no_freelist_residue`.
 pub fn redact(conn: &Connection) -> Result<()> {
     redact_stored_credentials(conn)?;
     redact_captured_traffic(conn)?;
@@ -329,6 +347,11 @@ pub fn redact(conn: &Connection) -> Result<()> {
 
 /// The credentials burpwn holds in its own tables, as opposed to the ones it
 /// recorded off the wire.
+///
+/// The `auth_profiles` branch is not dead code on a schema-v8 build: [`export`]
+/// deliberately does not migrate the database it copies, so a `session.db` that
+/// this build has never opened still arrives here in its v7 shape, table and
+/// secrets included.
 fn redact_stored_credentials(conn: &Connection) -> Result<()> {
     if table_exists(conn, "auth_profiles")? {
         conn.execute(
@@ -342,11 +365,11 @@ fn redact_stored_credentials(conn: &Connection) -> Result<()> {
             [REDACTED],
         )?;
     }
-    // A hook's `exec` command is a login command by another name — it carries
-    // credentials in its argv exactly like `auth_profiles.login_cmd` — and the
-    // value it injects is whatever it minted. Blank the whole parameter object
-    // rather than surgically editing the JSON: an unparseable-but-empty hook is
-    // refused loudly on import, which is the right failure for a redacted file.
+    // A hook's `exec` command IS the login command (that is what `session auth
+    // set` writes), so this is the main event, not a side case. Blank the whole
+    // parameter object rather than surgically editing the JSON: an
+    // unparseable-but-empty hook is refused loudly on import, which is the right
+    // failure for a redacted file.
     if table_exists(conn, "hooks")? {
         conn.execute(
             "UPDATE hooks SET params = ?1 WHERE action = 'exec'",
@@ -819,8 +842,7 @@ impl Drop for TempPath {
 mod tests {
     use super::*;
     use crate::model::{
-        FlowStart, MatchKind, NewAuthProfile, NewMatchReplaceRule, Protocol, RequestData,
-        ResponseData,
+        FlowStart, MatchKind, NewMatchReplaceRule, Protocol, RequestData, ResponseData,
     };
     use crate::Store;
     use tempfile::TempDir;
@@ -1003,45 +1025,39 @@ mod tests {
 
     /// `--redact` purges exactly what it claims to purge — and nothing more, so
     /// the honest scope stays pinned by a test rather than by a doc comment.
+    ///
+    /// Since schema v8 the login macro IS a hook (`auth_profiles` is gone), so
+    /// the credential this has to catch lives in `hooks.params`. The assertion
+    /// that matters is the last one: the password must not survive ANYWHERE in
+    /// the bundle's bytes — not in a row, and not in a page the update freed.
     #[tokio::test]
     async fn redact_purges_the_credentials_burpwn_stored() {
+        const PASSWORD: &str = "hunter2";
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("session.db");
         {
             let store = Store::open(&db).unwrap();
             let flow_id = populate(&store).await;
             let w = store.writer();
-            let rule = w
-                .add_match_replace(NewMatchReplaceRule {
-                    enabled: true,
-                    scope: "example.com".into(),
-                    match_kind: MatchKind::Header,
-                    pattern: "Authorization".into(),
-                    replacement: "Authorization: Bearer s3cr3t".into(),
-                    on_request: true,
-                })
-                .await
-                .unwrap();
-            w.upsert_auth_profile(NewAuthProfile {
-                host: "example.com".into(),
-                login_cmd: "curl -u admin:hunter2 https://example.com/login".into(),
-                extract_regex: "\"token\":\"([^\"]+)\"".into(),
-                header_template: "Authorization: Bearer {}".into(),
+            w.add_match_replace(NewMatchReplaceRule {
+                enabled: true,
+                scope: "example.com".into(),
+                match_kind: MatchKind::Header,
+                pattern: "Authorization".into(),
+                replacement: "Authorization: Bearer s3cr3t".into(),
+                on_request: true,
             })
             .await
             .unwrap();
-            w.set_auth_token("example.com", Some("s3cr3t".into()), Some(rule), 1017)
-                .await
-                .unwrap();
-            // A hook whose exec command carries a password in its argv, like the
-            // login macro it resembles.
+            // The session-auth profile, in its post-v8 form: an exec hook whose
+            // command carries the password in its argv.
             w.add_hook(crate::model::NewHook {
                 enabled: true,
-                name: "refresh".into(),
+                name: "auth:example.com".into(),
                 phase: crate::model::HookPhase::PreRequest,
                 scope: crate::model::HookScope::default(),
                 action: crate::model::HookAction::Exec {
-                    cmd: "curl -u admin:hunter2 https://example.com/token".into(),
+                    cmd: format!("curl -u admin:{PASSWORD} https://example.com/login"),
                     extract: "\"token\":\"([^\"]+)\"".into(),
                     inject: crate::model::HookInject {
                         kind: crate::model::HookInjectKind::SetHeader,
@@ -1051,7 +1067,7 @@ mod tests {
                 },
                 order: 0,
                 timeout_ms: 10_000,
-                ttl_ms: 0,
+                ttl_ms: 300_000,
             })
             .await
             .unwrap();
@@ -1078,15 +1094,12 @@ mod tests {
         let raw_db = raw_dir.path().join("session.db");
         staged.install(&raw_db).unwrap();
         let store = Store::open(&raw_db).unwrap();
-        let profile = store.reader().auth_profiles().unwrap().remove(0);
-        assert_eq!(profile.token.as_deref(), Some("s3cr3t"));
-        assert!(profile.login_cmd.contains("hunter2"));
         assert!(store.reader().exec_records().unwrap()[0]
             .cmd
-            .contains("hunter2"));
+            .contains(PASSWORD));
         let hooks = store.reader().list_hooks().unwrap();
         assert!(
-            matches!(&hooks[0].action, crate::model::HookAction::Exec { cmd, .. } if cmd.contains("hunter2"))
+            matches!(&hooks[0].action, crate::model::HookAction::Exec { cmd, .. } if cmd.contains(PASSWORD))
         );
 
         // Redacted export: the stored credentials are gone.
@@ -1099,9 +1112,6 @@ mod tests {
         let clean_db = clean_dir.path().join("session.db");
         staged.install(&clean_db).unwrap();
         let store = Store::open(&clean_db).unwrap();
-        let profile = store.reader().auth_profiles().unwrap().remove(0);
-        assert!(profile.token.is_none());
-        assert_eq!(profile.login_cmd, REDACTED);
         let rules = store.reader().list_match_replace().unwrap();
         assert_eq!(rules[0].replacement, REDACTED);
         assert_eq!(store.reader().exec_records().unwrap()[0].cmd, REDACTED);
@@ -1129,11 +1139,22 @@ mod tests {
             "the captured Authorization header must be masked"
         );
 
+        // The BYTES, not just the rows. Overwriting a value leaves the old one
+        // in the page SQLite freed unless it is told otherwise, and a bundle is
+        // a file that gets handed to someone else — "the row reads REDACTED" is
+        // not the property `--redact` promises.
+        let bytes = std::fs::read(&clean_db).unwrap();
+        assert!(
+            !contains_bytes(&bytes, PASSWORD.as_bytes()),
+            "the redacted bundle still carries the login password somewhere in \
+             its pages"
+        );
+
         // The source session is never modified by an export, redacted or not.
         let store = Store::open(&db).unwrap();
-        assert_eq!(
-            store.reader().auth_profiles().unwrap()[0].token.as_deref(),
-            Some("s3cr3t")
+        let hooks = store.reader().list_hooks().unwrap();
+        assert!(
+            matches!(&hooks[0].action, crate::model::HookAction::Exec { cmd, .. } if cmd.contains(PASSWORD))
         );
     }
 
@@ -1145,10 +1166,14 @@ mod tests {
         zstd::stream::decode_all(&raw[HEADER_LEN..]).unwrap()
     }
 
+    /// Substring search over raw bytes (`needle` is short; the naive scan is
+    /// plenty for a test).
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     fn contains(haystack: &[u8], needle: &str) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|w| w == needle.as_bytes())
+        contains_bytes(haystack, needle.as_bytes())
     }
 
     /// Record one flow with the given wire text, as the proxy would.
@@ -1556,6 +1581,92 @@ mod tests {
             "the 300 request-header blobs differed only by the token, so they must fold onto \
              one — otherwise the test never frees a page and proves nothing"
         );
+    }
+
+    /// The migration's own redaction question: a session that has been in use
+    /// since before v8 keeps its login command in `auth_profiles` until the day
+    /// it is opened by this build. `--redact` has to purge it wherever it has
+    /// ended up — in the old table on a file nobody has opened yet, and in the
+    /// `hooks` row it became once someone did. A migration that quietly moved a
+    /// secret out from under the redactor is the one bug here nobody would see.
+    #[tokio::test]
+    async fn redact_purges_the_login_command_before_and_after_the_v8_migration() {
+        const PASSWORD: &str = "hunter2";
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+
+        // A session in its pre-v8 shape: the current schema, plus the table v8
+        // drops, holding a profile — then stamped back to 7 so opening it
+        // migrates exactly as a real old session would.
+        {
+            let store = Store::open(&db).unwrap();
+            populate(&store).await;
+        }
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TABLE auth_profiles (
+                id              INTEGER PRIMARY KEY,
+                host            TEXT NOT NULL DEFAULT '' UNIQUE,
+                login_cmd       TEXT NOT NULL,
+                extract_regex   TEXT NOT NULL,
+                header_template TEXT NOT NULL,
+                token           TEXT,
+                rule_id         INTEGER,
+                updated_at      INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO auth_profiles(host, login_cmd, extract_regex, header_template, token)
+                VALUES ('example.com', 'curl -u admin:{PASSWORD} https://example.com/login',
+                        '"token":"([^"]+)"', 'Authorization: Bearer {{}}', 'minted-s3cr3t');
+            PRAGMA user_version = 7;
+            "#
+        ))
+        .unwrap();
+        conn.close().unwrap();
+
+        // Redacting the UN-migrated file (export never migrates what it copies).
+        let old = dir.path().join("old.burpwn");
+        export(&db, &old, &opts("work", true)).unwrap();
+        let old_dir = TempDir::new().unwrap();
+        let staged = stage(&old, old_dir.path()).unwrap();
+        assert_eq!(staged.migrated_from, Some(7));
+        let old_db = old_dir.path().join("session.db");
+        staged.install(&old_db).unwrap();
+        assert!(
+            !contains_bytes(&std::fs::read(&old_db).unwrap(), PASSWORD.as_bytes()),
+            "a v7 session exported with --redact still leaks its login command"
+        );
+
+        // Now migrate the session for real, and redact what the migration made.
+        {
+            let store = Store::open(&db).unwrap();
+            let hooks = store.reader().list_hooks().unwrap();
+            assert!(
+                matches!(&hooks[0].action, crate::model::HookAction::Exec { cmd, .. }
+                         if cmd.contains(PASSWORD)),
+                "the profile is a hook now: {:?}",
+                hooks[0].action
+            );
+        }
+        let new = dir.path().join("new.burpwn");
+        export(&db, &new, &opts("work", true)).unwrap();
+        let new_dir = TempDir::new().unwrap();
+        let staged = stage(&new, new_dir.path()).unwrap();
+        let new_db = new_dir.path().join("session.db");
+        staged.install(&new_db).unwrap();
+        let bytes = std::fs::read(&new_db).unwrap();
+        assert!(
+            !contains_bytes(&bytes, PASSWORD.as_bytes()),
+            "the migrated login command survives --redact"
+        );
+        // The token the old profile had minted is gone with the table — it was
+        // never carried into the hook, and the daemon holds the new one only in
+        // memory. Nothing to redact, nothing to leak.
+        assert!(!contains_bytes(&bytes, b"minted-s3cr3t"));
+        assert!(!contains_bytes(
+            &std::fs::read(&db).unwrap(),
+            b"minted-s3cr3t"
+        ));
     }
 
     /// Anything that is not a bundle must be named as such, not blow up as a

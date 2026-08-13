@@ -400,8 +400,8 @@ pub enum SessionAction {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Session auth handling: persist a login command + token-injection rule and
-    /// refresh the token when the target starts returning 401s.
+    /// Session auth handling: persist a login command + a header to inject, as a
+    /// pre-request hook that mints the token on demand (`hook list` shows it).
     Auth {
         /// Auth subcommand.
         #[command(subcommand)]
@@ -412,10 +412,12 @@ pub enum SessionAction {
 /// `session auth` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum SessionAuthAction {
-    /// Persist (or update) an auth profile for the session.
+    /// Persist (or update) an auth profile: a pre-request `exec` hook that runs
+    /// the login command and injects the header. Re-running it for the same host
+    /// replaces that profile rather than adding a second one.
     Set(SessionAuthSetArgs),
-    /// Run the stored login command, extract the token, and (re)install the
-    /// match/replace rule that injects the auth header into in-scope requests.
+    /// Throw away the token the daemon has cached, so the NEXT request through
+    /// the proxy runs the login command again (and carries the fresh token).
     Refresh {
         /// Restrict to the profile for this host scope (defaults to all profiles).
         #[arg(long)]
@@ -424,8 +426,9 @@ pub enum SessionAuthAction {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Show the stored auth profile(s) and whether a token is currently set
-    /// (the token value is masked).
+    /// Show the stored auth profile(s): the hook id, host scope, login command
+    /// and injected header. The token itself is never stored — it is minted on
+    /// demand and cached in the running daemon for the profile's TTL.
     Status {
         /// Session to operate on (defaults to the active session).
         #[arg(long)]
@@ -924,10 +927,10 @@ pub enum ExportAction {
     /// flow with its bodies, plus the groups, tags, notes, attacks and rules.
     /// `burpwn session import <file>` opens it on another machine.
     ///
-    /// By default the bundle is RAW — it carries the stored auth tokens, the
-    /// login commands and the Authorization / Cookie headers captured in the
-    /// traffic, so that the session replays identically. `--redact` drops the
-    /// stored credentials and masks the credential-shaped values in the
+    /// By default the bundle is RAW — it carries the login commands of the auth
+    /// profiles / exec hooks and the Authorization / Cookie headers captured in
+    /// the traffic, so that the session replays identically. `--redact` drops
+    /// the stored credentials and masks the credential-shaped values in the
     /// capture; it matches shapes, so a secret that does not look like one is
     /// still in the file.
     Session {
@@ -937,7 +940,8 @@ pub enum ExportAction {
         /// Output file (defaults to `<session>.burpwn` in the current directory).
         #[arg(short, long)]
         output: Option<String>,
-        /// Drop the stored auth tokens, login/exec commands and match/replace
+        /// Drop the stored login commands (auth profiles / exec hooks), the
+        /// recorded `burpwn exec` command lines and the match/replace
         /// replacements, and mask the Authorization / Proxy-Authorization /
         /// Cookie / Set-Cookie headers and password / token / api_key-style
         /// parameters in the captured traffic. Credential SHAPES only: a secret

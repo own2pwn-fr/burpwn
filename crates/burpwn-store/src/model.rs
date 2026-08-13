@@ -389,7 +389,8 @@ pub struct HookScope {
 
 /// Where the value produced by a [`HookAction::Exec`] is injected. The
 /// `value_template` carries the `{}` placeholder the extracted value replaces
-/// (same convention as [`AuthProfile::header_template`]).
+/// (the convention `session auth set --header 'Authorization: Bearer {}'` uses,
+/// which is the same thing: that façade builds one of these).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookInject {
     /// Injection form.
@@ -813,44 +814,14 @@ pub struct NewAttackResult {
     pub ts: i64,
 }
 
-/// A persisted session-auth profile (schema v4): the login command + token
-/// extraction regex + header-injection template for one host scope, plus the
-/// last-minted token and the id of the match/replace rule that injects it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthProfile {
-    /// Profile id.
-    pub id: i64,
-    /// Host scope (case-insensitive substring; empty = all hosts).
-    pub host: String,
-    /// Shell command whose stdout carries a fresh token.
-    pub login_cmd: String,
-    /// Regex (one capture group) applied to the login command's output to pull
-    /// the token.
-    pub extract_regex: String,
-    /// Header injection template, e.g. `Authorization: Bearer {}` (the `{}` is
-    /// substituted with the token).
-    pub header_template: String,
-    /// Last-minted token, if a refresh has run (masked when displayed).
-    pub token: Option<String>,
-    /// Id of the match/replace rule that injects this header (so refresh updates
-    /// it in place rather than stacking a new rule each time).
-    pub rule_id: Option<i64>,
-    /// Last update timestamp (unix millis).
-    pub updated_at: i64,
-}
-
-/// Parameters to upsert an [`AuthProfile`] (token/rule_id are managed by refresh).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewAuthProfile {
-    /// Host scope (empty = all).
-    pub host: String,
-    /// Login command.
-    pub login_cmd: String,
-    /// Token extraction regex.
-    pub extract_regex: String,
-    /// Header injection template.
-    pub header_template: String,
-}
+// A session-auth profile used to be a row type here (schema v4..v7): a login
+// command, an extract regex, a header template, the last-minted token and the id
+// of the match/replace rule injecting it. Schema v8 rewrote every one of them
+// into a `pre-request` / `exec` [`Hook`], because that is the same thing minus
+// the hole — a hook can ADD the header a request never sent — and dropped the
+// table. `session auth` is now a façade that reads and writes those hooks, so
+// there is one storage and one code path; the token is no longer persisted at
+// all (the daemon caches it for the hook's TTL).
 
 /// A capture-completeness telemetry row (schema v4): one per `burpwn exec`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

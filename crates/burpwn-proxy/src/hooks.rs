@@ -88,6 +88,19 @@
 //! On top of both, every `exec` hook is bounded by its own `timeout_ms` and
 //! FAILS OPEN on expiry or error: a broken hook never breaks traffic, it just
 //! stops modifying it (and says so at `WARN`).
+//!
+//! # The `401` that arrives inside the TTL
+//!
+//! Minting on demand and caching for `--ttl` answers "the token expired between
+//! two engagements" but not "the token expired mid-TTL": until the cache lapses,
+//! every request keeps carrying a value the target has started refusing. So a
+//! `401`/`403` on the response side drops the cached value of the `exec` hooks
+//! in scope for that host ([`HookEngine::observe_status`]) and the NEXT request
+//! re-mints on the spot. This is the whole of what the removed `AuthWatcher`
+//! did, minus its machinery: no channel, no detached `session auth refresh`
+//! child, and — since the marker already handles recursion structurally — no
+//! debounce doing double duty as a recursion guard. What is left is a rate
+//! question, answered by [`REMINT_COOLDOWN`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,6 +135,17 @@ pub const VALUE_PLACEHOLDER: &str = "{}";
 /// trip, hundreds of milliseconds — and on the default `--timeout 10000`, of
 /// which it is exactly half.
 pub const MAX_SINGLE_FLIGHT_WAIT: Duration = Duration::from_secs(5);
+
+/// How young a cached value has to be for a `401`/`403` NOT to throw it away
+/// (see [`HookEngine::observe_status`]).
+///
+/// It bounds the cost of a target that refuses everything: one command per hook
+/// per this interval, not one per request. Thirty seconds is well above a login
+/// round trip (so a value that has just been minted and is already being refused
+/// is not re-minted on every following request) and far below any TTL an
+/// operator would set on a token, so the case it exists for — a token that has
+/// been working for a while and stops — is never delayed by it.
+pub const REMINT_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Whether this flow was produced by a hook's own command, and must therefore
 /// not be hooked again.
@@ -170,6 +194,7 @@ pub trait HookRunner: Send + Sync {
 /// A cached value extracted from a hook's command output.
 struct CachedValue {
     value: String,
+    minted_at: Instant,
     expires_at: Instant,
 }
 
@@ -226,9 +251,14 @@ impl HookEngine {
         }
     }
 
-    /// Replace the hook snapshot. Values cached for hooks that are gone (or
-    /// whose definition changed) are dropped, so editing a hook never leaves a
+    /// Replace the hook snapshot. Values cached for hooks that are gone — or
+    /// whose definition CHANGED — are dropped, so editing a hook never leaves a
     /// stale token being injected by the new one.
+    ///
+    /// The comparison is on the whole hook, not on its id: a `session auth set`
+    /// that replaces a profile deletes a row and inserts one, and SQLite hands
+    /// the freed rowid straight back, so an id-only check would happily keep
+    /// serving the token the PREVIOUS login command minted.
     pub fn set_hooks(&self, hooks: Vec<Hook>) {
         let any_pre = hooks
             .iter()
@@ -236,10 +266,20 @@ impl HookEngine {
         let any_post = hooks
             .iter()
             .any(|h| h.enabled && h.phase == HookPhase::PostResponse);
-        let ids: Vec<i64> = hooks.iter().map(|h| h.id).collect();
         {
+            let previous = self.snapshot();
             let mut cache = self.inner.cache.lock();
-            cache.retain(|id, _| ids.contains(id));
+            cache.retain(|id, _| {
+                let before = previous.iter().find(|h| h.id == *id);
+                let after = hooks.iter().find(|h| h.id == *id);
+                match (before, after) {
+                    (Some(b), Some(a)) => b == a,
+                    // No previous entry to compare against (a cache written
+                    // between two snapshots): keep it, its hook is still there.
+                    (None, Some(_)) => true,
+                    _ => false,
+                }
+            });
         }
         *self.inner.hooks.write() = Arc::new(hooks);
         self.inner.any_pre.store(any_pre, Ordering::Relaxed);
@@ -444,11 +484,13 @@ impl HookEngine {
             }
         };
         if hook.ttl_ms > 0 {
+            let now = Instant::now();
             self.inner.cache.lock().insert(
                 hook.id,
                 CachedValue {
                     value: value.clone(),
-                    expires_at: Instant::now() + Duration::from_millis(hook.ttl_ms as u64),
+                    minted_at: now,
+                    expires_at: now + Duration::from_millis(hook.ttl_ms as u64),
                 },
             );
         }
@@ -520,6 +562,107 @@ impl HookEngine {
             );
         }
         None
+    }
+
+    /// Drop the value cached for an `exec` hook because the target just refused
+    /// a request that carried it.
+    ///
+    /// A token minted at `T` with `--ttl 5m` is served for five minutes whether
+    /// or not it is still valid; a session the target revokes (or one that
+    /// simply expires sooner than the TTL the operator guessed) turns into five
+    /// minutes of `401`s that the hook is in a position to fix and does not.
+    /// This is what makes the `401` fix it: the next in-scope request finds an
+    /// empty cache and re-mints, SYNCHRONOUSLY, and goes out with the new token.
+    ///
+    /// This replaces the old `AuthWatcher`, which signalled a debounced host to
+    /// the daemon so it could spawn a detached `session auth refresh`. The
+    /// request that took the `401` was never the one that got the new token, and
+    /// the debounce could not be a recursion guard against a login command that
+    /// outlived it. Here, recursion is the marker's job ([`is_hook_traffic`],
+    /// structural), concurrency is the one-command claim's, and this only has to
+    /// answer "how often may a `401` cost a fresh mint".
+    ///
+    /// Its answer is [`REMINT_COOLDOWN`], and it is deliberately a property of
+    /// the VALUE rather than a timer per host: a value younger than the cooldown
+    /// is left alone, so a target that answers `401` to everything (a wrong
+    /// extract regex, a revoked account) costs at most one command per hook per
+    /// cooldown instead of one per request. A token that has been in use longer
+    /// than that — the case this exists for — is dropped on the first `401`.
+    ///
+    /// Cheap when it does nothing: one relaxed atomic load before anything else,
+    /// so a proxy with no hooks does not even look at the status.
+    ///
+    /// `m` is the REQUEST's own match context (host/method/path, `status: None`)
+    /// — the one the pre-request phase matched on — so a hook narrowed to
+    /// `--method POST` or a path prefix is invalidated by a refusal of the
+    /// requests it actually injects into, and not by any other flow to that host.
+    pub fn observe_status(&self, exec_id: Option<&str>, m: &MatchCtx, status: u16) {
+        if status != 401 && status != 403 {
+            return;
+        }
+        if !self.inner.any_pre.load(Ordering::Relaxed) {
+            return;
+        }
+        // A hook command's own `401` says nothing about the token the client is
+        // using — the login endpoint refusing the credentials is a different
+        // failure, and letting it invalidate would make a broken login retry on
+        // its own traffic.
+        if is_hook_traffic(exec_id) {
+            return;
+        }
+        let stale: Vec<i64> = self
+            .snapshot()
+            .iter()
+            .filter(|h| {
+                h.enabled
+                    && h.phase == HookPhase::PreRequest
+                    && !h.action.is_declarative()
+                    && scope_matches(&h.scope, m)
+            })
+            .map(|h| h.id)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut cache = self.inner.cache.lock();
+        for id in stale {
+            let young = cache
+                .get(&id)
+                .is_some_and(|c| now.duration_since(c.minted_at) < REMINT_COOLDOWN);
+            if young {
+                continue;
+            }
+            if cache.remove(&id).is_some() {
+                tracing::info!(
+                    hook = id,
+                    host = %m.host,
+                    status,
+                    "the target refused a request carrying this hook's value; \
+                     dropping it so the next request re-mints"
+                );
+            }
+        }
+    }
+
+    /// Drop cached values on request: `hook_ids` when non-empty, otherwise every
+    /// one. Returns the ids that actually had a value.
+    ///
+    /// Unlike [`observe_status`](Self::observe_status) this ignores
+    /// [`REMINT_COOLDOWN`]: an operator (or `session auth refresh`) asking for a
+    /// fresh token is not a storm, and second-guessing an explicit request is
+    /// how a command ends up appearing not to work.
+    pub fn invalidate(&self, hook_ids: &[i64]) -> Vec<i64> {
+        let mut cache = self.inner.cache.lock();
+        let dropped: Vec<i64> = cache
+            .keys()
+            .copied()
+            .filter(|id| hook_ids.is_empty() || hook_ids.contains(id))
+            .collect();
+        for id in &dropped {
+            cache.remove(id);
+        }
+        dropped
     }
 
     fn cached(&self, id: i64) -> Option<String> {
@@ -1482,6 +1625,228 @@ mod tests {
             2,
             "a nested run was allowed to start"
         );
+    }
+
+    // --- the 401 that arrives inside the TTL --------------------------------
+
+    /// The case the removed `AuthWatcher` existed for, now handled where the
+    /// value lives: the target starts refusing the cached token, and the NEXT
+    /// request goes out with a freshly minted one.
+    #[tokio::test]
+    async fn a_401_drops_the_cached_value_so_the_next_request_re_mints() {
+        struct Rotating(Arc<AtomicUsize>);
+        #[async_trait]
+        impl HookRunner for Rotating {
+            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(format!(r#"{{"token":"t{n}"}}"#))
+            }
+        }
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_runner(Arc::new(Rotating(calls.clone())));
+        // A long TTL: without the 401 handling, the first token would be served
+        // for an hour whatever the target thinks of it.
+        engine.set_hooks(vec![token_hook(1, 3_600_000)]);
+
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert!(String::from_utf8_lossy(&m.headers).contains("Bearer t1"));
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cached, as it should be");
+
+        // The response comes back 401. (`minted_at` is backdated past the
+        // cooldown: a value that has been in use IS what this is for, and the
+        // test must not depend on wall-clock sleeps.)
+        backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
+        engine.observe_status(None, &ctx_for("api.example.com"), 401);
+
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the 401 forced a re-mint");
+        assert!(
+            String::from_utf8_lossy(&m.headers).contains("Bearer t2"),
+            "and the very next request carries the NEW token"
+        );
+    }
+
+    /// The rate guard. A target that refuses everything must not cost one
+    /// sandbox per request — which is what an unconditional invalidation would
+    /// do, and the failure mode the old 30 s debounce was really about.
+    #[tokio::test]
+    async fn a_401_storm_costs_at_most_one_re_mint_per_cooldown() {
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_runner(Arc::new(CountingRunner {
+            calls: calls.clone(),
+            output: r#"{"token":"rejected"}"#.into(),
+            delay: Duration::ZERO,
+        }));
+        engine.set_hooks(vec![token_hook(1, 3_600_000)]);
+
+        for _ in 0..20 {
+            let mut m = msg();
+            engine.pre_request(None, "GET", &mut m).await;
+            // Every single one of them comes back 401.
+            engine.observe_status(None, &ctx_for("api.example.com"), 401);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a freshly minted value is not thrown away by the 401s it causes"
+        );
+
+        // Once the value is old enough, the next 401 does invalidate it.
+        backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
+        engine.observe_status(None, &ctx_for("api.example.com"), 401);
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Scoping and the recursion guard, on the response side this time: a 401
+    /// on a flow this hook does not inject into is none of its business, and a
+    /// 401 the hook's OWN login command took says nothing about the client's
+    /// token.
+    #[tokio::test]
+    async fn observe_status_ignores_out_of_scope_flows_other_statuses_and_hook_traffic() {
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_runner(Arc::new(CountingRunner {
+            calls: calls.clone(),
+            output: r#"{"token":"t"}"#.into(),
+            delay: Duration::ZERO,
+        }));
+        let mut h = token_hook(1, 3_600_000);
+        h.scope.host = "api.example.com".into();
+        h.scope.path = "/v1/".into();
+        engine.set_hooks(vec![h]);
+
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
+
+        engine.observe_status(None, &ctx_for("api.example.com"), 200);
+        engine.observe_status(None, &ctx_for("api.example.com"), 500);
+        engine.observe_status(None, &ctx_for("unrelated.test"), 401);
+        engine.observe_status(Some("hook:abc"), &ctx_for("api.example.com"), 401);
+        // A refusal of a request this hook does not inject into (it is scoped
+        // to /v1/) says nothing about the value it holds.
+        engine.observe_status(
+            None,
+            &MatchCtx {
+                host: "api.example.com",
+                method: "GET",
+                path: "/public/health",
+                status: None,
+            },
+            401,
+        );
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "none of those may invalidate anything"
+        );
+
+        // …and the one that does apply, does.
+        engine.observe_status(None, &ctx_for("api.example.com"), 403);
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The cost of the status hook on a proxy nobody configured: nothing. It
+    /// must not even look at the hook list.
+    #[tokio::test]
+    async fn observe_status_on_an_empty_engine_is_a_no_op() {
+        let engine = HookEngine::new();
+        engine.observe_status(None, &ctx_for("api.example.com"), 401);
+        assert!(engine.invalidate(&[]).is_empty());
+    }
+
+    /// `session auth refresh` / `hook cache clear`: an explicit request is NOT
+    /// subject to the cooldown — an operator asking for a fresh token gets one.
+    #[tokio::test]
+    async fn invalidate_ignores_the_cooldown_and_reports_what_it_dropped() {
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_runner(Arc::new(CountingRunner {
+            calls: calls.clone(),
+            output: r#"{"token":"t"}"#.into(),
+            delay: Duration::ZERO,
+        }));
+        engine.set_hooks(vec![token_hook(1, 3_600_000), token_hook(2, 3_600_000)]);
+
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both hooks minted");
+
+        // Just minted — the cooldown would have refused, this must not.
+        assert_eq!(engine.invalidate(&[1]), vec![1]);
+        assert!(engine.invalidate(&[1]).is_empty(), "nothing left to drop");
+        assert_eq!(engine.invalidate(&[]), vec![2], "empty = every hook");
+    }
+
+    /// The request context a response carries back to `observe_status`.
+    fn ctx_for(host: &str) -> MatchCtx<'_> {
+        MatchCtx {
+            host,
+            method: "GET",
+            path: "/v1/users?id=5",
+            status: None,
+        }
+    }
+
+    /// Age a cached value by rewriting its `minted_at`, so the cooldown can be
+    /// exercised without sleeping through it.
+    fn backdate(engine: &HookEngine, id: i64, by: Duration) {
+        let mut cache = engine.inner.cache.lock();
+        if let Some(entry) = cache.get_mut(&id) {
+            entry.minted_at -= by;
+        }
+    }
+
+    /// Re-`set`ting a hook (`session auth set` on a host it already has) is a
+    /// DELETE plus an INSERT, and SQLite hands the freed rowid straight back —
+    /// so the id is no evidence at all. What must not survive it is the token
+    /// the previous command minted.
+    #[tokio::test]
+    async fn a_hook_redefined_under_the_same_id_does_not_keep_its_cached_value() {
+        let engine = HookEngine::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        engine.set_runner(Arc::new(CountingRunner {
+            calls: calls.clone(),
+            output: r#"{"token":"t"}"#.into(),
+            delay: Duration::ZERO,
+        }));
+        engine.set_hooks(vec![token_hook(1, 3_600_000)]);
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Same id, same everything except the command: a different login.
+        let mut redefined = token_hook(1, 3_600_000);
+        if let HookAction::Exec { cmd, .. } = &mut redefined.action {
+            *cmd = "mint-token --as other-user".into();
+        }
+        engine.set_hooks(vec![redefined]);
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the new definition must mint its own value"
+        );
+
+        // An UNCHANGED snapshot (the refresher re-reads every 2s) keeps it.
+        engine.set_hooks(engine.snapshot().as_ref().clone());
+        let mut m = msg();
+        engine.pre_request(None, "GET", &mut m).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "re-reading is not editing");
     }
 
     #[tokio::test]

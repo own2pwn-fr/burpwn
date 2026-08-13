@@ -1123,10 +1123,10 @@ async fn cmd_session_auth(out: &Output, paths: &Paths, action: SessionAuthAction
                 .await?;
             out.ok(
                 format!(
-                    "auth profile {id} set for {}",
+                    "auth profile set for {} (hook {id})",
                     if host.is_empty() { "all hosts" } else { &host }
                 ),
-                json!({ "id": id, "host": host }),
+                json!({ "id": id, "hook_id": id, "host": host }),
             );
             Ok(0)
         }
@@ -1134,39 +1134,33 @@ async fn cmd_session_auth(out: &Output, paths: &Paths, action: SessionAuthAction
             let session = session.unwrap_or_else(|| paths.active_session());
             validate_session_name(&session)?;
             let store = open_store(paths, &session)?;
-            let profiles = store.reader().auth_profiles()?;
-            let view: Vec<Value> = profiles
-                .iter()
-                .map(|p| {
-                    json!({
-                        "id": p.id,
-                        "host": p.host,
-                        "login_cmd": p.login_cmd,
-                        "header_template": p.header_template,
-                        "token_set": p.token.is_some(),
-                        "token": p.token.as_deref().map(crate::auth::mask_token),
-                        "rule_id": p.rule_id,
-                    })
-                })
-                .collect();
+            let profiles = crate::auth::auth_hooks(&store)?;
+            let view: Vec<Value> = profiles.iter().map(auth_profile_json).collect();
             out.emit(json!({ "profiles": view }), |r| {
                 let mut t = Table::new(vec![
-                    Column::right("id"),
+                    Column::right("hook"),
                     Column::left("host"),
                     Column::left("header").truncatable(),
-                    Column::left("token"),
+                    Column::left("login").truncatable(),
+                    Column::left("state"),
                 ]);
                 for p in &profiles {
-                    let scope = if p.host.is_empty() { "*" } else { &p.host };
-                    let (tok, style) = match &p.token {
-                        Some(t) => (crate::auth::mask_token(t), palette::GOOD),
-                        None => ("none".to_string(), palette::MUTED),
+                    let scope = if p.scope.host.is_empty() {
+                        "*"
+                    } else {
+                        &p.scope.host
+                    };
+                    let (state, style) = if p.enabled {
+                        (format!("ttl {}s", p.ttl_ms / 1000), palette::GOOD)
+                    } else {
+                        ("disabled".to_string(), palette::MUTED)
                     };
                     t.row(vec![
                         Cell::new(p.id.to_string()),
                         Cell::new(scope),
-                        Cell::new(p.header_template.clone()),
-                        Cell::styled(tok, style),
+                        Cell::new(auth_header_template(p)),
+                        Cell::new(auth_login_cmd(p)),
+                        Cell::styled(state, style),
                     ]);
                 }
                 listing(r, &t, "(no auth profiles)")
@@ -1179,25 +1173,67 @@ async fn cmd_session_auth(out: &Output, paths: &Paths, action: SessionAuthAction
     }
 }
 
-/// `session auth refresh`: for each matching profile, run its login command in
-/// the sandbox, extract a fresh token, and (re)install its injection rule.
+/// The `Name: template` an auth hook injects, in the form `session auth set
+/// --header` takes.
+fn auth_header_template(hook: &burpwn_store::model::Hook) -> String {
+    match &hook.action {
+        burpwn_store::model::HookAction::Exec { inject, .. } => {
+            format!("{}: {}", inject.name, inject.value_template)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The login command of an auth hook.
+fn auth_login_cmd(hook: &burpwn_store::model::Hook) -> String {
+    match &hook.action {
+        burpwn_store::model::HookAction::Exec { cmd, .. } => cmd.clone(),
+        _ => String::new(),
+    }
+}
+
+/// The JSON view of one profile. It reports the HOOK, because that is what a
+/// profile is now — no phantom `token` field for a value the session file no
+/// longer holds, and a `hook_id` the operator can pass to `hook test` / `hook
+/// rm` / `hook disable`.
+fn auth_profile_json(hook: &burpwn_store::model::Hook) -> Value {
+    json!({
+        "id": hook.id,
+        "hook_id": hook.id,
+        "name": hook.name,
+        "enabled": hook.enabled,
+        "host": hook.scope.host,
+        "login_cmd": auth_login_cmd(hook),
+        "header_template": auth_header_template(hook),
+        "ttl_ms": hook.ttl_ms,
+        "timeout_ms": hook.timeout_ms,
+    })
+}
+
+/// `session auth refresh`: throw away the token the daemon has cached for the
+/// matching profiles, so the next in-scope request mints a new one.
+///
+/// It no longer runs the login command itself. The hook does that — on the
+/// request that is waiting, which is the whole point of moving the login macro
+/// onto the hook engine — and the value it mints lives in the daemon's memory,
+/// so "refresh" is a request to that daemon rather than a store write. When no
+/// daemon is running there is nothing cached and nothing to do: it says so
+/// instead of starting one to clear an empty cache.
 async fn cmd_session_auth_refresh(
     out: &Output,
     paths: &Paths,
     host: Option<String>,
     session: Option<String>,
 ) -> Result<i32> {
-    use crate::auth::{apply_refresh, extract_token, run_login, HeaderTemplate};
-
     let session = session.unwrap_or_else(|| paths.active_session());
     validate_session_name(&session)?;
     paths.ensure_session_dir(&session)?;
     let store = open_store(paths, &session)?;
 
-    // Select the profiles to refresh: an exact-host match, or all profiles.
-    let all = store.reader().auth_profiles()?;
+    // Select the profiles to refresh: an exact host-scope match, or all of them.
+    let all = crate::auth::auth_hooks(&store)?;
     let targets: Vec<_> = match &host {
-        Some(h) => all.into_iter().filter(|p| &p.host == h).collect(),
+        Some(h) => all.into_iter().filter(|p| &p.scope.host == h).collect(),
         None => all,
     };
     if targets.is_empty() {
@@ -1206,48 +1242,56 @@ async fn cmd_session_auth_refresh(
             "no matching auth profile (set one with `session auth set`)"
         );
     }
+    let ids: Vec<i64> = targets.iter().map(|h| h.id).collect();
 
-    // The login command routes through the session's proxy, so ensure it is up.
-    ensure_daemon(paths, &session).await?;
+    let cleared = match crate::control::ControlClient::connect(paths.control_sock(&session)).await {
+        Ok(mut client) => match client.hook_cache_clear(ids).await? {
+            ControlResponse::HookCache { cleared } => cleared,
+            ControlResponse::Error { message } => {
+                crate::fail!(ErrorCode::DaemonRejected, "{message}")
+            }
+            other => crate::fail!(
+                ErrorCode::DaemonRejected,
+                "unexpected daemon reply: {other:?}"
+            ),
+        },
+        // No daemon: nothing is cached, so the next request already mints.
+        Err(_) => Vec::new(),
+    };
 
-    let mut results = Vec::new();
-    for profile in &targets {
-        let template = HeaderTemplate::parse(&profile.header_template)?;
-        let output = run_login(paths, &session, &profile.login_cmd, None).await?;
-        let token = extract_token(&profile.extract_regex, &output)?;
-        let rule_id = apply_refresh(
-            &store,
-            &profile.host,
-            &template,
-            &token,
-            profile.rule_id,
-            now_millis(),
-        )
-        .await?;
-        results.push(json!({
-            "host": profile.host,
-            "rule_id": rule_id,
-            "token": crate::auth::mask_token(&token),
-        }));
-    }
-
-    out.emit(json!({ "refreshed": results }), |r| {
+    let profiles: Vec<Value> = targets
+        .iter()
+        .map(|p| {
+            json!({
+                "host": p.scope.host,
+                "hook_id": p.id,
+                "cleared": cleared.contains(&p.id),
+            })
+        })
+        .collect();
+    out.emit(json!({ "profiles": profiles, "cleared": cleared }), |r| {
         let mut t = Table::new(vec![
+            Column::right("hook"),
             Column::left("host"),
-            Column::right("rule"),
-            Column::left("token"),
+            Column::left("cached token"),
         ]);
-        for res in &results {
-            let host = res["host"].as_str().unwrap_or("");
+        for p in &targets {
+            let (state, style) = if cleared.contains(&p.id) {
+                ("dropped", palette::GOOD)
+            } else {
+                ("none was cached", palette::MUTED)
+            };
             t.row(vec![
-                Cell::new(if host.is_empty() { "*" } else { host }),
-                Cell::new(res["rule_id"].as_i64().unwrap_or(0).to_string()),
-                Cell::styled(res["token"].as_str().unwrap_or(""), palette::GOOD),
+                Cell::new(p.id.to_string()),
+                Cell::new(if p.scope.host.is_empty() {
+                    "*"
+                } else {
+                    &p.scope.host
+                }),
+                Cell::styled(state, style),
             ]);
         }
-        if !t.is_empty() {
-            t.footer(format!("refreshed {} profile(s)", t.len()));
-        }
+        t.footer("the next in-scope request runs the login command again".to_string());
         listing(r, &t, "(nothing to refresh)")
     });
     Ok(0)
@@ -1946,6 +1990,9 @@ fn render_control(out: &Output, resp: ControlResponse) -> Result<()> {
             None => r.aside("(timed out, none parked)").unwrap_or_default(),
         },
         ControlResponse::Resolved { .. } => "resolved".to_string(),
+        ControlResponse::HookCache { cleared } => {
+            format!("dropped {} cached hook value(s)", cleared.len())
+        }
         // Already turned into a coded failure above.
         ControlResponse::Error { .. } => unreachable!("handled before rendering"),
     });

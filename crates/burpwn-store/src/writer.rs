@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::blob::BlobStore;
 use crate::error::{Result, StoreError};
 use crate::model::{
-    FlowStart, NewAttack, NewAttackResult, NewAuthProfile, NewExecRecord, NewHook,
-    NewMatchReplaceRule, RequestData, ResponseData, WsDirection,
+    FlowStart, NewAttack, NewAttackResult, NewExecRecord, NewHook, NewMatchReplaceRule,
+    RequestData, ResponseData, WsDirection,
 };
 
 /// Default bound for the writer channel. Large enough to absorb bursts without
@@ -197,6 +197,15 @@ pub enum WriteOp {
         /// Reply with the hook id.
         reply: IdReply,
     },
+    /// Replace every hook carrying [`NewHook::name`] with this one; replies with
+    /// the new id. The delete and the insert happen in the same write op, so a
+    /// caller that re-`set`s a named hook can never end up with two.
+    UpsertHookByName {
+        /// Hook definition; its `name` is the key.
+        hook: NewHook,
+        /// Reply with the hook id.
+        reply: IdReply,
+    },
     /// Enable/disable a hook.
     SetHookEnabled {
         /// Hook id.
@@ -294,28 +303,6 @@ pub enum WriteOp {
         id: i64,
         /// New status.
         status: String,
-        /// Optional completion ack.
-        reply: Option<AckReply>,
-    },
-    /// Insert-or-update a session-auth profile keyed by host; replies with its id.
-    /// Only the config columns are touched — the token/rule_id are managed by
-    /// [`WriteOp::SetAuthToken`] so a re-`set` never clobbers a live token.
-    UpsertAuthProfile {
-        /// Profile definition.
-        profile: NewAuthProfile,
-        /// Reply with the profile id.
-        reply: IdReply,
-    },
-    /// Set the current token + injection rule id on an auth profile (by host).
-    SetAuthToken {
-        /// Host scope key.
-        host: String,
-        /// The freshly-minted token (or `None` to clear).
-        token: Option<String>,
-        /// The match/replace rule injecting the header (or `None`).
-        rule_id: Option<i64>,
-        /// Update timestamp.
-        updated_at: i64,
         /// Optional completion ack.
         reply: Option<AckReply>,
     },
@@ -576,6 +563,22 @@ impl WriteHandle {
         recv_id(rx).await
     }
 
+    /// Insert a hook, replacing any hook that already carries the same NAME, and
+    /// await its id.
+    ///
+    /// This is what makes a named hook idempotent to re-declare — `session auth
+    /// set` for a host it already has must update that profile, not stack a
+    /// second login command onto every request. (The token the old definition
+    /// minted is not kept either: the proxy drops the cached value of any hook
+    /// whose definition changed, see `burpwn_proxy::HookEngine::set_hooks`. Note
+    /// that SQLite reuses the freed rowid, so the id alone would NOT have said
+    /// anything changed.)
+    pub async fn upsert_hook_by_name(&self, hook: NewHook) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::UpsertHookByName { hook, reply }).await?;
+        recv_id(rx).await
+    }
+
     /// Enable/disable a hook, awaiting ack.
     pub async fn set_hook_enabled(&self, id: i64, enabled: bool) -> Result<()> {
         let (reply, rx) = oneshot::channel();
@@ -691,34 +694,6 @@ impl WriteHandle {
         self.send(WriteOp::UpdateAttackStatus {
             id,
             status: status.into(),
-            reply: Some(reply),
-        })
-        .await?;
-        recv_ack(rx).await
-    }
-
-    /// Insert-or-update a session-auth profile (by host), awaiting its id.
-    pub async fn upsert_auth_profile(&self, profile: NewAuthProfile) -> Result<i64> {
-        let (reply, rx) = oneshot::channel();
-        self.send(WriteOp::UpsertAuthProfile { profile, reply })
-            .await?;
-        recv_id(rx).await
-    }
-
-    /// Set an auth profile's current token + injection rule id, awaiting ack.
-    pub async fn set_auth_token(
-        &self,
-        host: impl Into<String>,
-        token: Option<String>,
-        rule_id: Option<i64>,
-        updated_at: i64,
-    ) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.send(WriteOp::SetAuthToken {
-            host: host.into(),
-            token,
-            rule_id,
-            updated_at,
             reply: Some(reply),
         })
         .await?;
@@ -888,6 +863,9 @@ fn handle_op(conn: &Connection, op: WriteOp) {
         WriteOp::AddHook { hook, reply } => {
             let _ = reply.send(do_add_hook(conn, &hook));
         }
+        WriteOp::UpsertHookByName { hook, reply } => {
+            let _ = reply.send(do_upsert_hook_by_name(conn, &hook));
+        }
         WriteOp::SetHookEnabled { id, enabled, reply } => ack(
             reply,
             conn.execute(
@@ -967,24 +945,6 @@ fn handle_op(conn: &Connection, op: WriteOp) {
             conn.execute(
                 "UPDATE attacks SET status = ?1 WHERE id = ?2",
                 rusqlite::params![status, id],
-            )
-            .map(|_| ())
-            .map_err(Into::into),
-        ),
-        WriteOp::UpsertAuthProfile { profile, reply } => {
-            let _ = reply.send(do_upsert_auth_profile(conn, &profile));
-        }
-        WriteOp::SetAuthToken {
-            host,
-            token,
-            rule_id,
-            updated_at,
-            reply,
-        } => ack(
-            reply,
-            conn.execute(
-                "UPDATE auth_profiles SET token = ?1, rule_id = ?2, updated_at = ?3 WHERE host = ?4",
-                rusqlite::params![token, rule_id, updated_at, host],
             )
             .map(|_| ())
             .map_err(Into::into),
@@ -1212,6 +1172,18 @@ fn do_add_hook(conn: &Connection, h: &NewHook) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// Delete every hook with this name, then insert. The name is free text and NOT
+/// unique in the table (two `hook add`s may share one), so the delete is by name
+/// rather than an `ON CONFLICT` — that also collapses a table that somehow ended
+/// up with several rows under the name back to one.
+fn do_upsert_hook_by_name(conn: &Connection, h: &NewHook) -> Result<i64> {
+    // Same order as `do_add_hook`: refuse an unrepresentable action BEFORE
+    // deleting anything, so a bad upsert cannot remove a working hook.
+    let _ = h.action.params_json()?;
+    conn.execute("DELETE FROM hooks WHERE name = ?1", [&h.name])?;
+    do_add_hook(conn, h)
+}
+
 /// Wall-clock unix millis, for rows the writer stamps itself.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -1286,27 +1258,6 @@ fn do_insert_attack_result(conn: &Connection, r: &NewAttackResult) -> Result<i64
         ],
     )?;
     Ok(conn.last_insert_rowid())
-}
-
-fn do_upsert_auth_profile(conn: &Connection, p: &NewAuthProfile) -> Result<i64> {
-    // Upsert by host. On conflict we update ONLY the config columns, leaving the
-    // token + rule_id untouched so a re-`set` of an existing profile never blanks
-    // a live token / detaches its injection rule.
-    conn.execute(
-        "INSERT INTO auth_profiles(host, login_cmd, extract_regex, header_template, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 0)
-         ON CONFLICT(host) DO UPDATE SET
-            login_cmd = excluded.login_cmd,
-            extract_regex = excluded.extract_regex,
-            header_template = excluded.header_template",
-        rusqlite::params![p.host, p.login_cmd, p.extract_regex, p.header_template],
-    )?;
-    let id: i64 = conn.query_row(
-        "SELECT id FROM auth_profiles WHERE host = ?1",
-        [&p.host],
-        |r| r.get(0),
-    )?;
-    Ok(id)
 }
 
 fn do_insert_exec(conn: &Connection, r: &NewExecRecord) -> Result<i64> {

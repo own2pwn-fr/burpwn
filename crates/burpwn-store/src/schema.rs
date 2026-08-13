@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
@@ -28,6 +28,7 @@ const MIGRATIONS: &[(i64, MigrationStep)] = &[
     (5, migrate_v5),
     (6, migrate_v6),
     (7, migrate_v7),
+    (8, migrate_v8),
 ];
 
 /// Apply pending migrations, stamp the version, and ensure the default
@@ -335,6 +336,12 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
 /// whether it was network-facing and how many flows it captured). Both use
 /// `IF NOT EXISTS`, so the step is idempotent on the fresh-create replay and the
 /// in-place v3→v4 upgrade alike.
+///
+/// `auth_profiles` is dead as of v8: [`migrate_v8`] rewrites every row into a
+/// `hooks` row and drops the table. The `CREATE` stays here so this step remains
+/// exactly the one an existing v3 file went through — on a fresh create the
+/// table is made here and dropped a few steps later, which costs nothing and
+/// keeps the migration list readable as history.
 fn migrate_v4(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -479,6 +486,172 @@ fn migrate_v7(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v8: the login macro moves onto the hook engine — `auth_profiles` becomes
+/// `hooks` rows and the table is dropped.
+///
+/// An auth profile was a login command + a one-capture-group extract regex + a
+/// header template, and a refresh turned the minted token into a match/replace
+/// rule. That rule could only ever REWRITE an `Authorization` header the request
+/// already carried; a request that sent none went upstream bare, which is the
+/// exact shape of "the first call after the token expires still 401s". A
+/// `pre-request` hook with an `exec` action expresses the same profile and does
+/// not have that hole: it runs the login command in the sandbox, extracts the
+/// token, and `set-header` SYNTHESIZES the header when it is absent — on the
+/// request that is waiting, before it is forwarded.
+///
+/// What each row becomes:
+///
+/// - one enabled `pre-request` / `exec` hook named `auth:<host>` (`auth:*` for a
+///   profile with no host scope), carrying the command, the regex and the header
+///   template as its injection;
+/// - the profile's generated match/replace rule (`rule_id`) is DELETED — it is
+///   what the hook now does, and leaving it behind would rewrite the header a
+///   second time with a token frozen at migration time;
+/// - the stored `token` is NOT carried over. It lived in the table because the
+///   rule needed a literal to substitute; the hook mints its own on the first
+///   in-scope request and keeps it in the daemon's memory for the hook TTL. A
+///   session file therefore stops being a place where a bearer token is at rest.
+///
+/// A row whose header template cannot be expressed as an injection (no colon, no
+/// `{}`, a name with CR/LF — only reachable by hand-editing the database, since
+/// `session auth set` validates all of it) is migrated DISABLED rather than
+/// dropped: the login command and the regex are the parts that took work, and a
+/// disabled hook is visible in `hook list` instead of silently gone.
+fn migrate_v8(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "auth_profiles")? {
+        return Ok(());
+    }
+    let profiles = {
+        let mut stmt = conn.prepare(
+            "SELECT host, login_cmd, extract_regex, header_template, updated_at
+             FROM auth_profiles ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (host, login_cmd, extract, template, updated_at) in profiles {
+        let (name, value_template) = inject_from_template(&template);
+        let usable = header_template_is_usable(&template);
+        let action = crate::model::HookAction::Exec {
+            cmd: login_cmd,
+            extract,
+            inject: crate::model::HookInject {
+                // `set-header` (add-or-replace), which covers BOTH what the old
+                // match/replace rule did (replace a stale header) and what it
+                // could not (put one on a request that has none).
+                kind: crate::model::HookInjectKind::SetHeader,
+                name,
+                value_template,
+            },
+        };
+        conn.execute(
+            "INSERT INTO hooks(enabled, name, phase, host, method, path, status, action, params,
+                               ord, timeout_ms, ttl_ms, created_at)
+             VALUES (?1, ?2, 'pre-request', ?3, '', '', NULL, ?4, ?5, 0, ?6, ?7, ?8)",
+            rusqlite::params![
+                usable as i64,
+                auth_hook_name(&host),
+                host,
+                action.kind(),
+                action.params_json()?,
+                // The CLI's `hook add` defaults (burpwn_cli::hooks::DEFAULT_*),
+                // spelled out because the store cannot reach the CLI crate: a
+                // 10 s command budget and a 5 min token cache.
+                10_000_i64,
+                300_000_i64,
+                updated_at,
+            ],
+        )?;
+    }
+
+    // What is about to be deleted is a token and a password, so delete them
+    // PROPERLY: by default SQLite hands the pages to the freelist with their
+    // contents intact, and a `grep` over session.db would still find the token
+    // long after the table that held it was dropped — which would make a poor
+    // job of "burpwn no longer keeps your bearer token at rest". Restored
+    // afterwards: this is the store's long-lived write connection, and the
+    // zero-fill is not something the capture path should pay for.
+    let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+    conn.pragma_update(None, "secure_delete", "ON")?;
+    let purge = || -> Result<()> {
+        // The generated injection rules (whose replacement holds the token as a
+        // literal). Guarded: a step must survive being replayed on a file whose
+        // `match_replace_rules` was never created.
+        if table_exists(conn, "match_replace_rules")? {
+            conn.execute_batch(
+                "DELETE FROM match_replace_rules WHERE id IN
+                    (SELECT rule_id FROM auth_profiles WHERE rule_id IS NOT NULL);",
+            )?;
+        }
+        conn.execute_batch("DROP TABLE auth_profiles;")?;
+        Ok(())
+    };
+    let outcome = purge();
+    conn.pragma_update(None, "secure_delete", secure_delete)?;
+    outcome
+}
+
+/// The hook name a session-auth profile for `host` is stored under. Kept in sync
+/// with `burpwn_cli::auth::auth_hook_name`, which is what `session auth status`
+/// looks the hooks back up by (this module cannot reach the CLI crate).
+fn auth_hook_name(host: &str) -> String {
+    let scope = if host.trim().is_empty() { "*" } else { host };
+    format!("auth:{scope}")
+}
+
+/// Whether a `Name: value {}` header template is directly expressible as a hook
+/// injection.
+fn header_template_is_usable(template: &str) -> bool {
+    match template.split_once(':') {
+        Some((name, value)) => {
+            !name.trim().is_empty()
+                && value.contains("{}")
+                && !template.contains(['\r', '\n', '\0'])
+        }
+        None => false,
+    }
+}
+
+/// Split a header template into an injection `(name, value_template)`, repairing
+/// what can be repaired so the login command is never lost with it (the hook is
+/// stored disabled when [`header_template_is_usable`] said no).
+fn inject_from_template(template: &str) -> (String, String) {
+    let (name, value) = match template.split_once(':') {
+        Some((n, v)) => (n.trim(), v.trim()),
+        None => (template.trim(), ""),
+    };
+    let name = match name.replace(['\r', '\n', '\0'], "") {
+        n if n.is_empty() => "Authorization".to_string(),
+        n => n,
+    };
+    let value = value.replace(['\r', '\n', '\0'], "");
+    let value = if value.contains("{}") {
+        value
+    } else {
+        format!("{value} {{}}").trim_start().to_string()
+    };
+    (name, value)
+}
+
+/// Whether a table by that name exists.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Whether `table` already has a column named `column`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -558,7 +731,6 @@ mod tests {
             "ws_messages",
             "attacks",
             "attack_results",
-            "auth_profiles",
             "execs",
         ] {
             assert!(table_exists(&conn, t), "missing table {t}");
@@ -566,6 +738,8 @@ mod tests {
 
         // v7: a fresh file must NOT carry the dead intercept queue.
         assert!(!table_exists(&conn, "intercepts"));
+        // v8: nor the auth profiles, which are hooks now.
+        assert!(!table_exists(&conn, "auth_profiles"));
 
         // v3 TLS columns present on a fresh create.
         for c in ["tls_version", "tls_cipher", "tls_alpn", "origin_cert_fp"] {
@@ -732,9 +906,11 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v3_to_v4_adds_auth_and_exec_tables() {
+    fn migrates_v3_to_v4_adds_the_exec_telemetry_table() {
         // A file stamped at schema v3 (has flows + v3 tables but none of the v4
-        // additions) must gain `auth_profiles` + `execs` in place on upgrade.
+        // additions) must gain `execs` in place on upgrade. `auth_profiles` is
+        // created by the same step and dropped again by v8, so it must NOT be
+        // there once the whole chain has run.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("BEGIN").unwrap();
         migrate_v1(&conn).unwrap();
@@ -752,8 +928,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert!(table_exists(&conn, "auth_profiles"));
         assert!(table_exists(&conn, "execs"));
+        assert!(!table_exists(&conn, "auth_profiles"));
 
         // Idempotent second init is a no-op.
         init(&conn).unwrap();
@@ -1039,6 +1215,193 @@ mod tests {
 
         // Idempotent second init.
         init(&conn).unwrap();
+    }
+
+    /// A file in the real v7 shape, with `n` session-auth profiles and the
+    /// match/replace rules a refresh generated for them. Stamped at
+    /// `user_version = 7` — i.e. what a session that has been in use since
+    /// before this migration actually looks like on disk.
+    fn v7_db_with_auth_profiles() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO workspaces(id, name, created_at) VALUES (1, 'default', 0);
+            -- The rule a refresh generated for the profile (id 1), plus an
+            -- UNRELATED rule the operator wrote by hand (id 2).
+            INSERT INTO match_replace_rules(id, enabled, scope, match_kind, pattern, replacement, on_request)
+                VALUES (1, 1, 'api.test', 'header', '^Authorization:.*',
+                        'Authorization: Bearer minted-token', 1),
+                       (2, 1, '', 'body', 'foo', 'bar', 1);
+            INSERT INTO auth_profiles(id, host, login_cmd, extract_regex, header_template,
+                                      token, rule_id, updated_at)
+                VALUES (1, 'api.test', 'curl -u admin:hunter2 https://api.test/login',
+                        '"token":"([^"]+)"', 'Authorization: Bearer {}',
+                        'minted-token', 1, 4242),
+                       (2, '', 'get-key.sh', '(key-[a-z]+)', 'X-Api-Key: {}',
+                        NULL, NULL, 7),
+                       -- Hand-edited into a shape no `session auth set` would
+                       -- have accepted: no placeholder to substitute into.
+                       (3, 'broken.test', 'mint.sh', '(t)', 'Authorization', NULL, NULL, 9);
+            -- A hook that was already there: the migration must not disturb it.
+            INSERT INTO hooks(id, enabled, name, phase, host, method, path, status,
+                              action, params, ord, timeout_ms, ttl_ms, created_at)
+                VALUES (1, 1, 'ua', 'pre-request', '', '', '', NULL, 'add-header',
+                        '{"name":"User-Agent","value":"burpwn"}', 0, 10000, 0, 5);
+            "#,
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn
+    }
+
+    /// THE migration a real session goes through: every auth profile comes out
+    /// the other side as a hook that does strictly more (it can ADD the header,
+    /// which the rule it replaces could not), and nothing is silently lost.
+    #[test]
+    fn migrates_v7_to_v8_rewriting_auth_profiles_as_hooks() {
+        let conn = v7_db_with_auth_profiles();
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(!table_exists(&conn, "auth_profiles"), "v8 drops the table");
+
+        // Three profiles in, three hooks out — beside the pre-existing one.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, enabled, name, phase, host, action, params, timeout_ms, ttl_ms,
+                        created_at
+                 FROM hooks ORDER BY id",
+            )
+            .unwrap();
+        type Row = (
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        );
+        let hooks: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(hooks.len(), 4);
+        assert_eq!(hooks[0].2, "ua", "the pre-existing hook is untouched");
+
+        // The host-scoped profile.
+        let (_, enabled, name, phase, host, action, params, timeout, ttl, created) = &hooks[1];
+        assert_eq!(*enabled, 1);
+        assert_eq!(name, "auth:api.test");
+        assert_eq!(phase, "pre-request");
+        assert_eq!(host, "api.test");
+        assert_eq!(action, "exec");
+        assert_eq!(*timeout, 10_000);
+        assert_eq!(*ttl, 300_000);
+        assert_eq!(*created, 4242, "the profile's own timestamp is kept");
+        let p: serde_json::Value = serde_json::from_str(params).unwrap();
+        assert_eq!(p["cmd"], "curl -u admin:hunter2 https://api.test/login");
+        assert_eq!(p["extract"], r#""token":"([^"]+)""#);
+        assert_eq!(
+            p["inject_kind"], "set-header",
+            "add-or-replace: it must also work on a request that sends NO \
+             Authorization header — the hole the match/replace rule had"
+        );
+        assert_eq!(p["inject_name"], "Authorization");
+        assert_eq!(p["inject_value"], "Bearer {}");
+
+        // The un-scoped profile keeps its "every host" scope and gets the `*`
+        // name the CLI façade looks it up by.
+        assert_eq!(hooks[2].2, "auth:*");
+        assert_eq!(hooks[2].4, "");
+        assert_eq!(hooks[2].1, 1);
+
+        // The hand-broken template: migrated DISABLED rather than dropped, with
+        // the login command and regex preserved.
+        assert_eq!(hooks[3].2, "auth:broken.test");
+        assert_eq!(hooks[3].1, 0, "an unusable template lands disabled");
+        let p: serde_json::Value = serde_json::from_str(&hooks[3].6).unwrap();
+        assert_eq!(p["cmd"], "mint.sh");
+        assert_eq!(p["inject_name"], "Authorization");
+
+        // The generated injection rule is gone (the hook does that job now);
+        // the operator's own rule is NOT.
+        let rules: Vec<i64> = conn
+            .prepare("SELECT id FROM match_replace_rules ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rules, vec![2]);
+
+        // Idempotent second init, and the hooks are not duplicated by it.
+        init(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    /// The migrated hook must be readable by the ordinary hook path — a row the
+    /// proxy refuses to decode would take the WHOLE hook set down with it (see
+    /// `Reader::list_hooks`), so "it migrated" has to mean "it decodes".
+    #[test]
+    fn a_migrated_auth_hook_decodes_as_an_exec_hook() {
+        use crate::model::{HookAction, HookInjectKind};
+        let conn = v7_db_with_auth_profiles();
+        init(&conn).unwrap();
+
+        let (action, params): (String, String) = conn
+            .query_row(
+                "SELECT action, params FROM hooks WHERE name = 'auth:api.test'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        match HookAction::from_db(&action, &params).unwrap() {
+            HookAction::Exec {
+                cmd,
+                extract,
+                inject,
+            } => {
+                assert!(cmd.contains("api.test/login"));
+                assert_eq!(extract, r#""token":"([^"]+)""#);
+                assert_eq!(inject.kind, HookInjectKind::SetHeader);
+                assert_eq!(inject.value_template, "Bearer {}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

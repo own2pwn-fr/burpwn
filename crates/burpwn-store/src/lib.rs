@@ -1159,65 +1159,71 @@ mod tests {
         assert!(reader.attack_get(9999).unwrap().is_none());
     }
 
+    /// The idempotence `session auth set` (and any other named-hook façade)
+    /// stands on: re-declaring a name REPLACES, never stacks. (The token the
+    /// previous definition minted is dropped by the proxy, which invalidates the
+    /// cache of any hook whose definition changed — see
+    /// `burpwn_proxy::HookEngine::set_hooks`.)
     #[tokio::test]
-    async fn auth_profile_upsert_token_and_scope_lookup() {
-        use crate::model::NewAuthProfile;
+    async fn upsert_hook_by_name_replaces_and_never_stacks() {
+        use crate::model::{HookAction, HookInject, HookInjectKind, HookPhase, HookScope, NewHook};
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("session.db")).unwrap();
         let w = store.writer();
         let reader = store.reader();
 
-        let id = w
-            .upsert_auth_profile(NewAuthProfile {
+        let profile = |cmd: &str| NewHook {
+            enabled: true,
+            name: "auth:api.example.com".into(),
+            phase: HookPhase::PreRequest,
+            scope: HookScope {
                 host: "api.example.com".into(),
-                login_cmd: "printf tok123".into(),
-                extract_regex: "(tok[0-9]+)".into(),
-                header_template: "Authorization: Bearer {}".into(),
+                ..Default::default()
+            },
+            action: HookAction::Exec {
+                cmd: cmd.into(),
+                extract: "(tok[0-9]+)".into(),
+                inject: HookInject {
+                    kind: HookInjectKind::SetHeader,
+                    name: "Authorization".into(),
+                    value_template: "Bearer {}".into(),
+                },
+            },
+            order: 0,
+            timeout_ms: 10_000,
+            ttl_ms: 300_000,
+        };
+
+        // A hook under an unrelated name must survive every upsert below.
+        let other = w
+            .add_hook(NewHook {
+                name: "ua".into(),
+                action: HookAction::AddHeader {
+                    name: "User-Agent".into(),
+                    value: "burpwn".into(),
+                },
+                ..profile("unused")
             })
             .await
             .unwrap();
-        assert!(id > 0);
 
-        // A re-upsert of the same host updates config in place (no duplicate).
-        let id2 = w
-            .upsert_auth_profile(NewAuthProfile {
-                host: "api.example.com".into(),
-                login_cmd: "printf tok999".into(),
-                extract_regex: "(tok[0-9]+)".into(),
-                header_template: "Authorization: Bearer {}".into(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(id, id2);
-        assert_eq!(reader.auth_profiles().unwrap().len(), 1);
+        let _id1 = w.upsert_hook_by_name(profile("printf tok1")).await.unwrap();
+        let id2 = w.upsert_hook_by_name(profile("printf tok2")).await.unwrap();
 
-        // Setting a token + rule id is reflected; a re-upsert does NOT clobber it.
-        w.set_auth_token("api.example.com", Some("tok999".into()), Some(42), 7)
-            .await
-            .unwrap();
-        let _ = w
-            .upsert_auth_profile(NewAuthProfile {
-                host: "api.example.com".into(),
-                login_cmd: "printf again".into(),
-                extract_regex: "(x)".into(),
-                header_template: "Authorization: Bearer {}".into(),
-            })
-            .await
-            .unwrap();
-        let p = reader.auth_profiles().unwrap().pop().unwrap();
-        assert_eq!(p.token.as_deref(), Some("tok999"));
-        assert_eq!(p.rule_id, Some(42));
-        assert_eq!(p.login_cmd, "printf again");
-
-        // Scope lookup: substring match wins; a non-matching host resolves None.
-        assert!(reader
-            .auth_profile_for_host("api.example.com")
-            .unwrap()
-            .is_some());
-        assert!(reader
-            .auth_profile_for_host("other.test")
-            .unwrap()
-            .is_none());
+        let hooks = reader.list_hooks().unwrap();
+        assert_eq!(hooks.len(), 2, "one auth hook + the unrelated one");
+        assert!(hooks.iter().any(|h| h.id == other));
+        let auth: Vec<_> = hooks
+            .iter()
+            .filter(|h| h.name == "auth:api.example.com")
+            .collect();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].id, id2);
+        assert!(
+            matches!(&auth[0].action, HookAction::Exec { cmd, .. } if cmd == "printf tok2"),
+            "{:?}",
+            auth[0].action
+        );
     }
 
     #[tokio::test]

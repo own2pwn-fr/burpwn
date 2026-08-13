@@ -47,6 +47,10 @@ pub struct ControlState {
     pub dns_port: u16,
     /// The proxy's intercept primitive.
     pub intercept: InterceptController,
+    /// The proxy's hook engine, for the cache-clearing request. Defaults to an
+    /// empty engine, on which clearing is a no-op — which is what a control
+    /// server standing on its own (the tests) wants.
+    pub hooks: burpwn_proxy::HookEngine,
     /// Intercepts pulled by `InterceptAwait` and awaiting resolution, keyed by id.
     parked: Arc<Mutex<HashMap<u64, PendingIntercept>>>,
 }
@@ -58,8 +62,16 @@ impl ControlState {
             session: session.into(),
             dns_port,
             intercept,
+            hooks: burpwn_proxy::HookEngine::new(),
             parked: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach the proxy's hook engine (the daemon does; the tests do not need
+    /// to).
+    pub fn with_hooks(mut self, hooks: burpwn_proxy::HookEngine) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     fn summary_item(id: u64, kind: InterceptKind, data: &InterceptData) -> InterceptItem {
@@ -255,6 +267,9 @@ pub async fn handle_request(state: &ControlState, req: ControlRequest) -> Contro
                 None => ControlResponse::Resolved { found: false },
             }
         }
+        ControlRequest::HookCacheClear { hook_ids } => ControlResponse::HookCache {
+            cleared: state.hooks.invalidate(&hook_ids),
+        },
         // Shutdown is handled by the accept loop (it stops serving); here we
         // just acknowledge.
         ControlRequest::Shutdown => ControlResponse::Ack,
@@ -491,36 +506,29 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
     tracing::info!(%session, dns_port, run_dir = %run_dir.display(), "daemon starting");
 
     let intercept = proxy.intercept();
-    let state = ControlState::new(session, dns_port, intercept);
 
     let proxy_sock = paths.proxy_sock(session);
     let control_sock = paths.control_sock(session);
-
-    // Arm best-effort session-auth AUTO-refresh: the proxy signals 401/403 hosts
-    // (debounced) on this channel; the consumer checks whether that host has an
-    // auth profile and, if so, spawns `burpwn session auth refresh --host <host>`
-    // (which runs the login command through THIS proxy and updates the injection
-    // rule). The AuthWatcher debounce is the recursion guard — the login
-    // command's own traffic is suppressed for the debounce window (see
-    // `burpwn_proxy::auth`). Detached so a wedged refresh never blocks the daemon.
-    let auth_rx = proxy.auth().activate();
-    let auth_reader = store.reader();
-    let auth_exe = std::env::current_exe().ok();
-    let auth_session = session.to_string();
-    let auth = tokio::spawn(async move {
-        auth_refresh_consumer(auth_rx, auth_reader, auth_exe, auth_session).await;
-    });
 
     // Hooks: install the sandbox command runner and keep the engine's snapshot
     // fresh. The engine is ONE object shared by every connection (unlike the
     // per-connection match/replace snapshot), so a `burpwn hook add` reaches
     // keep-alive connections that are already open — which matters, since the
     // connection an agent is hooking is usually the one it just opened.
+    //
+    // The control server gets the same engine, because the token an `exec` hook
+    // minted is held HERE and nowhere else: `session auth refresh` is a request
+    // to drop it, not a store write. (Session-auth used to have a whole second
+    // mechanism at this spot — a 401/403 watcher feeding a consumer that spawned
+    // a detached `session auth refresh` child. The hook engine does that work
+    // itself now, on the request that is waiting; see
+    // `burpwn_proxy::hooks::HookEngine::observe_status`.)
     let hooks = proxy.hooks();
     hooks.set_runner(Arc::new(crate::hooks::SandboxHookRunner::new(
         paths.clone(),
         session,
     )));
+    let state = ControlState::new(session, dns_port, intercept).with_hooks(hooks.clone());
     let hook_reader = store.reader();
     let hooks_task = tokio::spawn(async move { hook_refresher(hooks, hook_reader).await });
 
@@ -540,7 +548,6 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
 
     scm.abort();
     dns.abort();
-    auth.abort();
     hooks_task.abort();
     let _ = std::fs::remove_file(paths.proxy_sock(session));
     let _ = std::fs::remove_file(&control_sock);
@@ -578,106 +585,6 @@ async fn hook_refresher(engine: burpwn_proxy::HookEngine, reader: burpwn_store::
         }
         tokio::time::sleep(HOOK_REFRESH_INTERVAL).await;
     }
-}
-
-/// Consume 401/403 host signals from the proxy's [`AuthWatcher`]: for each host,
-/// look up a matching session-auth profile in the store and, when one exists,
-/// spawn a detached `burpwn session auth refresh --host <host>` to re-mint the
-/// token + update its injection rule. The proxy-side debounce already bounds how
-/// often a host can be signalled, so this consumer stays trivial. A host with no
-/// profile is a cheap no-op (one store read).
-async fn auth_refresh_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<String>,
-    reader: burpwn_store::Reader,
-    exe: Option<std::path::PathBuf>,
-    session: String,
-) {
-    let Some(exe) = exe else {
-        tracing::debug!("auth auto-refresh disabled: own executable path unknown");
-        return;
-    };
-    while let Some(host) = rx.recv().await {
-        match reader.auth_profile_for_host(&host) {
-            Ok(Some(profile)) => {
-                tracing::warn!(
-                    %host,
-                    scope = %profile.host,
-                    "auth: observed 401/403 for a host with an auth profile; triggering refresh"
-                );
-                match spawn_auth_refresh(&exe, &session, &profile.host) {
-                    // The reaper task owns the child from here; dropping its
-                    // handle neither cancels it nor kills the refresh.
-                    Ok(_reaper) => {}
-                    Err(e) => tracing::warn!(error = %e, "auth: failed to spawn refresh"),
-                }
-            }
-            Ok(None) => {} // no profile for this host: nothing to do.
-            Err(e) => tracing::debug!(error = %e, "auth: profile lookup failed"),
-        }
-    }
-}
-
-/// Spawn a detached `burpwn --json session auth refresh --host <scope>` child
-/// and hand it to a task that will `wait()` for it.
-///
-/// Detached (its own session) so a slow login command never blocks the daemon;
-/// stdio to /dev/null and fd 3 closed so it never pins the exec envelope pipe.
-///
-/// `setsid` detaches the child's SESSION, not its PARENTAGE: the daemon remains
-/// its parent and still owes it a `wait()`. Nothing was making that call, so
-/// every 401/403-triggered refresh left a zombie in the process table until the
-/// daemon died — against a target that 401s on a schedule, one per refresh, for
-/// the whole life of the session. The reap therefore happens on its own tokio
-/// task doing an ASYNC `child.wait()`, which keeps exactly the property the
-/// detachment buys: the daemon never waits on the login command, a task parked
-/// on SIGCHLD does. Shutdown is not a race either way — if the runtime goes
-/// down first the task is simply dropped, the child (never `kill_on_drop`) is
-/// reparented to init, and init reaps it.
-///
-/// Returns the reaper's handle, which yields the child's pid once reaped.
-/// Dropping the handle does not cancel the task; the daemon drops it, tests
-/// await it.
-fn spawn_auth_refresh(
-    exe: &Path,
-    session: &str,
-    scope: &str,
-) -> std::io::Result<tokio::task::JoinHandle<Option<u32>>> {
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("--json")
-        .arg("session")
-        .arg("auth")
-        .arg("refresh")
-        .arg("--session")
-        .arg(session)
-        .arg("--host")
-        .arg(scope)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // SAFETY: `setsid`/`close` are async-signal-safe and the only calls between
-    // fork and exec. Detach into a new session and drop fd 3 (the exec envelope
-    // pipe) so this background refresh never wedges a caller reading fd 3.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            libc::close(3);
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    Ok(tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) if status.success() => {
-                tracing::debug!(?pid, "auth: refresh child finished")
-            }
-            Ok(status) => tracing::warn!(?pid, %status, "auth: refresh child failed"),
-            Err(e) => tracing::warn!(?pid, error = %e, "auth: could not reap refresh child"),
-        }
-        pid
-    }))
 }
 
 /// Write `{ "dns_port": <port> }` to `ports.json`.
@@ -1273,74 +1180,18 @@ mod tests {
         let _ = server.await;
     }
 
-    /// Whether `pid` is currently a ZOMBIE child of this process. `/proc/<pid>/stat`
-    /// puts `state` and `ppid` right after the comm, which is parenthesised and can
-    /// itself contain spaces — so split after the LAST `)`.
-    fn is_zombie_child(pid: u32) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        let Some(rest) = stat.rsplit(')').next() else {
-            return false;
-        };
-        let mut fields = rest.split_whitespace();
-        let state = fields.next().unwrap_or("");
-        let ppid: u32 = fields.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        state == "Z" && ppid == std::process::id()
-    }
-
-    /// The auth auto-refresh used to `spawn()` and throw the handle away, so every
-    /// 401/403 left a zombie behind for the daemon's whole life. Spawning a batch
-    /// must leave the process table exactly as it found it.
-    ///
-    /// `/bin/true` stands in for the burpwn binary: it ignores the argv and exits
-    /// immediately, which is the shape that made the leak accumulate fastest.
+    /// Clearing the hook cache is a control request because the token an
+    /// `exec` hook minted lives in the daemon's memory and nowhere else. A
+    /// control server with no engine attached must answer it rather than fail —
+    /// there is simply nothing cached to drop.
     #[tokio::test]
-    async fn auth_refresh_children_are_reaped_never_left_zombie() {
-        let exe = Path::new("/bin/true");
-        if !exe.exists() {
-            return; // non-FHS host; nothing meaningful to assert
-        }
-
-        // Negative control, so the assertion below cannot pass vacuously: a child
-        // nobody waits on IS a zombie, and stays one until reaped — the state is
-        // permanent, so polling for it cannot miss a window.
-        let mut orphan = std::process::Command::new(exe)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn control child");
-        let orphan_pid = orphan.id();
-        let mut seen_zombie = false;
-        for _ in 0..500 {
-            if is_zombie_child(orphan_pid) {
-                seen_zombie = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            seen_zombie,
-            "an unwaited child must show up as a zombie — otherwise this test proves nothing"
-        );
-        orphan.wait().expect("reap the control child");
-
-        let mut reapers = Vec::new();
-        for _ in 0..8 {
-            reapers.push(spawn_auth_refresh(exe, "default", "api.test").expect("spawn"));
-        }
-
-        for reaper in reapers {
-            // The task completing means `wait()` returned, i.e. the child is
-            // reaped by definition — no sleep, no scheduler dependence.
-            let pid = reaper
-                .await
-                .expect("reaper task must not panic")
-                .expect("a freshly spawned child has a pid");
-            assert!(
-                !is_zombie_child(pid),
-                "pid {pid} is still a zombie child of this process"
-            );
+    async fn hook_cache_clear_answers_with_what_it_dropped() {
+        let state = ctrl_state();
+        let resp =
+            handle_request(&state, ControlRequest::HookCacheClear { hook_ids: vec![] }).await;
+        match resp {
+            ControlResponse::HookCache { cleared } => assert!(cleared.is_empty()),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 }

@@ -113,7 +113,7 @@ Typical loop against a captured request:
    header/body diff + reflection check).
 4. **Decode/encode** any tokens you find with `decode`/`encode` (base64, url, hex,
    jwt) to understand or tamper with them.
-5. **Stay authenticated** with `session auth` so 401/403s auto-refresh the token.
+5. **Stay authenticated** with `session auth`: the token is minted on demand and re-minted on a 401/403.
 6. **Narrow interception** with `intercept scope` when you want to hand-edit only
    one host/path in flight instead of parking every flow.
 
@@ -176,9 +176,11 @@ Handy for reading/tampering cookies, JWTs, and encoded parameters mid-loop.
 ## Stay authenticated — session auth (login macro)
 
 Persist a login command + a token-extraction regex + a header-injection template.
-`refresh` runs the login, extracts the token, and installs a match/replace rule
-that injects the header into in-scope requests; the token is auto-refreshed when
-the target starts returning 401/403.
+It is stored as a `pre-request` hook named `auth:<host>` (so `hook list`,
+`hook test` and `hook disable` all work on it): the login command runs on demand,
+in the sandbox, and the header is ADDED to the waiting request — including when
+that request carries no auth header at all — then cached for 5 minutes. A
+401/403 drops the cached token, so the next request mints a fresh one.
 
 ```sh
 burpwn session auth set \
@@ -186,12 +188,14 @@ burpwn session auth set \
   --extract '"token":"([^"]+)"' \
   --header 'Authorization: Bearer {}' \
   --host target.example
-burpwn session auth refresh          # mint the token now + install the injection rule
-burpwn session auth status           # show profiles; token value is masked
+burpwn session auth status           # profiles: hook id, host, header, login command
+burpwn session auth refresh          # drop the cached token; the next request re-mints
 ```
 
 `--extract` needs exactly one capture group; `--header` uses `{}` as the token
-slot; `--host` scopes the injection (substring; omit for all hosts).
+slot; `--host` scopes the injection (substring; omit for all hosts). Re-running
+`set` for a host REPLACES that profile. The token itself is never written to the
+session — it lives only in the running daemon, for the profile's TTL.
 
 ## Live interception
 
@@ -275,16 +279,16 @@ attacks and rules. `burpwn session import /tmp/acme.burpwn [--as name] [--use]`
 opens it as a NEW session — it never merges into or overwrites an existing one,
 so a name collision is an error you resolve with `--as`.
 
-⚠️ **The bundle is raw by default**: it carries the stored auth tokens, the login
-commands and the `Authorization` / `Cookie` headers captured in the traffic, so
-the session replays identically. `--redact` drops the stored credentials (auth
-tokens, login and `exec` command lines, match/replace replacements) **and** masks
-the credential-shaped values in the capture: `Authorization` /
-`Proxy-Authorization` / `Cookie` / `Set-Cookie` header values and
-`password` / `token` / `api_key`-style parameters in query strings, form bodies
-and JSON. It matches credential **shapes** — a secret under a name it cannot
-recognise, one baked into a URL path, or one in a binary body is still in the
-file. Move a bundle the way you would move the credentials it contains.
+⚠️ **The bundle is raw by default**: it carries the stored login commands (an auth
+profile's, an exec hook's) and the `Authorization` / `Cookie` headers captured in
+the traffic, so the session replays identically. `--redact` drops the stored
+credentials (login and `exec` command lines, `exec` hook parameters,
+match/replace replacements) **and** masks the credential-shaped values in the
+capture: `Authorization` / `Proxy-Authorization` / `Cookie` / `Set-Cookie` header
+values and `password` / `token` / `api_key`-style parameters in query strings,
+form bodies and JSON. It matches credential **shapes** — a secret under a name it
+cannot recognise, one baked into a URL path, or one in a binary body is still in
+the file. Move a bundle the way you would move the credentials it contains.
 
 ⚠️ **`export pcap` is a SYNTHESIS, not a capture.** burpwn stores reassembled
 HTTP messages, never packets, so the pcapng is fabricated around the bytes it

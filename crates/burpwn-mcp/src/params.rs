@@ -100,11 +100,12 @@ pub struct SessionExportParams {
     /// directory.
     #[serde(default)]
     pub output: Option<String>,
-    /// Drop the stored auth tokens, login/exec commands and match/replace
-    /// replacements, and mask the Authorization / Proxy-Authorization / Cookie /
-    /// Set-Cookie headers and password / token / api_key-style parameters in the
-    /// captured traffic. Credential SHAPES only: a secret under an unrecognised
-    /// name, in a URL path or inside a binary body is NOT scrubbed.
+    /// Drop the stored login commands (auth profiles / exec hooks), the recorded
+    /// `burpwn exec` command lines and the match/replace replacements, and mask
+    /// the Authorization / Proxy-Authorization / Cookie / Set-Cookie headers and
+    /// password / token / api_key-style parameters in the captured traffic.
+    /// Credential SHAPES only: a secret under an unrecognised name, in a URL
+    /// path or inside a binary body is NOT scrubbed.
     #[serde(default)]
     pub redact: bool,
     /// Overwrite the output file if it already exists.
@@ -320,7 +321,7 @@ pub struct SessionAuthSetParams {
     pub host: Option<String>,
 }
 
-/// `session_auth_refresh` — re-mint the token + update the injection rule.
+/// `session_auth_refresh` — drop the cached token so the next request re-mints.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SessionAuthRefreshParams {
     /// Restrict to the profile for this exact host scope (omit = all profiles).

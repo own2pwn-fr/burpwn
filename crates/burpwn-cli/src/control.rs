@@ -106,6 +106,18 @@ pub enum ControlRequest {
         #[serde(default)]
         method: String,
     },
+    /// Drop the values the hook engine has cached for `exec` hooks, so the next
+    /// matching request runs the command again.
+    ///
+    /// The cache lives in the daemon's memory (that is the point: a minted token
+    /// is not written to the session file), so re-minting one is necessarily a
+    /// request to the daemon rather than a store write. `session auth refresh`
+    /// is this, scoped to the auth hooks of a host.
+    HookCacheClear {
+        /// Hook ids to clear; empty clears every cached value.
+        #[serde(default)]
+        hook_ids: Vec<i64>,
+    },
     /// Shut the daemon down.
     Shutdown,
 }
@@ -170,6 +182,12 @@ pub enum ControlResponse {
     Resolved {
         /// Whether the id matched a parked intercept.
         found: bool,
+    },
+    /// Reply to `HookCacheClear`.
+    HookCache {
+        /// The hook ids that actually had a cached value (so a caller can tell
+        /// "there was nothing to drop" from "a token was dropped").
+        cleared: Vec<i64>,
     },
     /// An error processing the request.
     Error {
@@ -411,6 +429,13 @@ impl ControlClient {
         method: String,
     ) -> Result<ControlResponse> {
         self.request(ControlRequest::InterceptSetScope { host, path, method })
+            .await
+    }
+
+    /// Drop the hook engine's cached `exec` values (all of them when `hook_ids`
+    /// is empty).
+    pub async fn hook_cache_clear(&mut self, hook_ids: Vec<i64>) -> Result<ControlResponse> {
+        self.request(ControlRequest::HookCacheClear { hook_ids })
             .await
     }
 
