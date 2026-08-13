@@ -11,9 +11,9 @@ use rusqlite::Connection;
 use crate::blob::get_blob;
 use crate::error::Result;
 use crate::model::{
-    Attack, AttackResult, AuthProfile, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow,
-    Group, Hook, HookAction, HookPhase, HookScope, MatchKind, MatchReplaceRule, Note, Protocol,
-    RequestData, ResponseData, Tag, Workspace, WsDirection, WsMessage,
+    Attack, AttackResult, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow, Group, Hook,
+    HookAction, HookPhase, HookScope, MatchKind, MatchReplaceRule, Note, Protocol, RequestData,
+    ResponseData, Tag, Workspace, WsDirection, WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -743,39 +743,6 @@ impl Reader {
         Ok(out)
     }
 
-    // ---- session-auth profiles (schema v4) ----
-
-    /// List every persisted session-auth profile (ascending id).
-    pub fn auth_profiles(&self) -> Result<Vec<AuthProfile>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, host, login_cmd, extract_regex, header_template, token, rule_id, updated_at
-             FROM auth_profiles ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], row_to_auth_profile)?;
-        collect(rows)
-    }
-
-    /// The auth profile whose host scope matches `host` (case-insensitive
-    /// substring; an empty scope matches every host). The most specific
-    /// (longest, non-empty) scope wins; `None` when no profile applies.
-    pub fn auth_profile_for_host(&self, host: &str) -> Result<Option<AuthProfile>> {
-        let host_l = host.to_ascii_lowercase();
-        let mut best: Option<AuthProfile> = None;
-        for p in self.auth_profiles()? {
-            let scope = p.host.trim().to_ascii_lowercase();
-            let matches = scope.is_empty() || host_l.contains(&scope);
-            if !matches {
-                continue;
-            }
-            match &best {
-                Some(b) if b.host.trim().len() >= p.host.trim().len() => {}
-                _ => best = Some(p),
-            }
-        }
-        Ok(best)
-    }
-
     // ---- capture-completeness telemetry (schema v4) ----
 
     /// Every recorded exec row (ascending id).
@@ -832,20 +799,6 @@ fn row_to_group(r: &rusqlite::Row) -> rusqlite::Result<Group> {
         description: r.get(2)?,
         workspace_id: r.get(3)?,
         created_at: r.get(4)?,
-    })
-}
-
-/// Map an `auth_profiles` row into an [`AuthProfile`].
-fn row_to_auth_profile(r: &rusqlite::Row) -> rusqlite::Result<AuthProfile> {
-    Ok(AuthProfile {
-        id: r.get(0)?,
-        host: r.get(1)?,
-        login_cmd: r.get(2)?,
-        extract_regex: r.get(3)?,
-        header_template: r.get(4)?,
-        token: r.get(5)?,
-        rule_id: r.get(6)?,
-        updated_at: r.get(7)?,
     })
 }
 

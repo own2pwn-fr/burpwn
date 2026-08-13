@@ -214,8 +214,10 @@ pub enum ErrorCode {
     // --- network (exit 77) -------------------------------------------------
     /// Replaying a flow against the target failed.
     NetworkReplayFailed,
-    /// The session-auth login macro failed or its regex did not match.
-    NetworkAuthRefreshFailed,
+    // (`BW-NETWORK-002`, "the session-auth login macro failed", was retired when
+    // the login macro became a hook: an `exec` hook whose command fails or whose
+    // regex does not match FAILS OPEN with a WARN — the traffic goes through
+    // un-hooked — so there is no longer a failure to give an exit code to.)
 
     // --- internal (exit 78) ------------------------------------------------
     /// A failure burpwn did not classify — always a bug worth reporting.
@@ -255,7 +257,7 @@ impl ErrorCode {
             | InputFileExists
             | InputNoSuchHook => ErrorClass::Input,
             AgentUnknown | AgentConfigShape | AgentRefusedOverwrite => ErrorClass::Agent,
-            NetworkReplayFailed | NetworkAuthRefreshFailed => ErrorClass::Network,
+            NetworkReplayFailed => ErrorClass::Network,
             Internal => ErrorClass::Internal,
         }
     }
@@ -317,7 +319,6 @@ impl ErrorCode {
             AgentRefusedOverwrite => 3,
 
             NetworkReplayFailed => 1,
-            NetworkAuthRefreshFailed => 2,
 
             Internal => 1,
         }
@@ -390,7 +391,6 @@ impl ErrorCode {
             AgentRefusedOverwrite => "refusing to overwrite a file burpwn does not own",
 
             NetworkReplayFailed => "the replay request failed",
-            NetworkAuthRefreshFailed => "the session-auth login macro failed",
 
             Internal => "unexpected internal error",
         }
@@ -546,9 +546,6 @@ impl ErrorCode {
                 "the target may be down, or the flow's host may no longer resolve — check with \
                  `burpwn req show <id>`",
             ],
-            NetworkAuthRefreshFailed => vec![
-                "check the login command and the extraction regex with `burpwn session auth show`",
-            ],
 
             Internal => vec![
                 "this is a burpwn bug: please report it with the debug report referenced below",
@@ -604,7 +601,6 @@ impl ErrorCode {
         ErrorCode::AgentConfigShape,
         ErrorCode::AgentRefusedOverwrite,
         ErrorCode::NetworkReplayFailed,
-        ErrorCode::NetworkAuthRefreshFailed,
         ErrorCode::Internal,
     ];
 
@@ -639,7 +635,7 @@ mod tests {
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(*code, back);
         }
-        assert_eq!(ErrorCode::ALL.len(), 48, "register new codes in ALL");
+        assert_eq!(ErrorCode::ALL.len(), 47, "register new codes in ALL");
     }
 
     #[test]

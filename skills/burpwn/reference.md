@@ -132,7 +132,6 @@ produce it — the JSON envelope disambiguates.
 | code | meaning |
 |---|---|
 | `BW-NETWORK-001` | the replay request failed |
-| `BW-NETWORK-002` | the session-auth login macro failed |
 
 **INTERNAL** — exit code `78`
 

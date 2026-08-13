@@ -1,52 +1,91 @@
-//! `session auth` — session-token handling for long engagements.
+//! `session auth` — the login macro, as a façade over the hook engine.
 //!
 //! Authenticated targets silently start returning 401s once a bearer/session
-//! token expires; the only prior tool was a STATIC match/replace on the auth
-//! header. This module persists an *auth profile* (a login command + a
-//! token-extraction regex + a header-injection template) and can REFRESH it:
-//! run the login command in the sandbox, pull a fresh token from its output, and
-//! install/UPDATE a single match/replace rule that injects the header into
-//! in-scope requests.
+//! token expires. This used to be its own machine: an `auth_profiles` row, a
+//! `session auth refresh` that ran the login command and rewrote ONE generated
+//! match/replace rule with the token it minted, and a proxy-side watcher that
+//! spawned that refresh in the background when it saw a 401.
 //!
-//! # Injection semantics
+//! It is now one `pre-request` hook with an `exec` action, because that is the
+//! same description of the same thing — run a command, pull a value out of its
+//! stdout with a one-capture-group regex, put the value in a header — with the
+//! two properties the old shape could not have:
 //!
-//! The injection is a [`MatchKind::Header`] rule. The pattern targets the header
-//! LINE (`^Authorization:.*`, matched case-insensitively per line by the
-//! match/replace engine) and the replacement re-emits the whole line with the
-//! fresh token: `Authorization: Bearer <token>`. This REPLACES a stale token on
-//! an in-scope request — the common cause of mid-engagement 401s, where the
-//! request already carries a (now-expired) auth header. (match/replace rewrites
-//! existing content; it cannot synthesize a header a request never sent.)
+//! - **it can ADD the header.** A match/replace rule rewrites text the message
+//!   already carries: `^Authorization:.*` matches nothing on a request that
+//!   never sent one, so the very first call of a fresh session went upstream
+//!   bare. A hook injection is `set-header`, i.e. add-or-replace.
+//! - **it happens to the request that is waiting.** The refresh no longer runs
+//!   beside the traffic; the request is parked on the mint and forwarded with
+//!   the token. Nobody has to take a 401 to make the next call work.
+//!
+//! # What this module is
+//!
+//! Only the naming and the translation. A profile is a hook stored under the
+//! name `auth:<host>` ([`auth_hook_name`]) — [`build_auth_hook`] turns the
+//! `session auth set` flags into the very [`crate::hooks::HookSpec`] that `hook
+//! add --action exec` builds, so there is one validator and one storage. Which
+//! is also why the façade is worth keeping: `session auth set --login … --header
+//! 'Authorization: Bearer {}'` says what an operator (or an agent) means, and
+//! `hook list` still shows exactly what it built.
 //!
 //! # Idempotency
 //!
-//! Each profile stores the id of its injection rule. A refresh DELETES the prior
-//! rule (if any) and installs a fresh one, then records the new rule id + token,
-//! so repeated refreshes never stack duplicate rules.
+//! [`auth_set`] upserts BY NAME (`Writer::upsert_hook_by_name`), so re-running
+//! it for a host replaces that profile instead of stacking a second login
+//! command onto every request. The proxy drops the value cached for a hook whose
+//! definition changed, so a re-`set` never keeps serving the previous command's
+//! token either.
 //!
-//! # Auto-refresh
+//! # Where the token lives
 //!
-//! The proxy signals 401/403 hosts to the daemon (see `burpwn_proxy::auth` +
-//! `daemon::auth_refresh_consumer`), which spawns `session auth refresh --host
-//! <scope>`. The pure token/rule logic here is shared by the manual and auto
-//! paths; only [`run_login`] touches the sandbox.
+//! Nowhere on disk. It used to be a column (`auth_profiles.token`) because the
+//! generated rule needed a literal to substitute; the hook mints its own and the
+//! daemon holds it in memory for the hook's TTL. A session file is no longer a
+//! place where a bearer token is at rest, which is also why `--redact` has less
+//! to erase.
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::{Context, Result};
-use regex::Regex;
-
-use burpwn_error::ErrorCode;
-use burpwn_sandbox::{doctor, RootlessRuntime, SandboxRuntime};
-use burpwn_store::model::{MatchKind, NewAuthProfile, NewMatchReplaceRule};
+use burpwn_store::model::{Hook, HookAction, NewHook};
 use burpwn_store::Store;
 
-use crate::exec;
-use crate::paths::Paths;
+use anyhow::Result;
+use burpwn_error::ErrorCode;
+
+use crate::hooks::{self, HookSpec};
 
 /// Placeholder in a header template that the token is substituted for.
 const TOKEN_PLACEHOLDER: &str = "{}";
+
+/// Prefix of the hook name a session-auth profile is stored under. Also the
+/// filter `session auth status` / `session auth refresh` select on, so a hook
+/// named this way by hand is a profile as far as they are concerned — which is
+/// the honest answer, since it IS one.
+pub const AUTH_HOOK_PREFIX: &str = "auth:";
+
+/// The hook name a profile for `host` lives under (`auth:*` when unscoped).
+///
+/// ⚠️ Kept in sync with `burpwn_store::schema`'s v8 migration, which names the
+/// hooks it rewrites out of `auth_profiles` the same way.
+pub fn auth_hook_name(host: &str) -> String {
+    let scope = if host.trim().is_empty() { "*" } else { host };
+    format!("{AUTH_HOOK_PREFIX}{scope}")
+}
+
+/// Whether this hook is a session-auth profile: an `exec` hook stored under the
+/// [`AUTH_HOOK_PREFIX`].
+pub fn is_auth_hook(hook: &Hook) -> bool {
+    hook.name.starts_with(AUTH_HOOK_PREFIX) && matches!(hook.action, HookAction::Exec { .. })
+}
+
+/// Every session-auth profile in the session, in hook application order.
+pub fn auth_hooks(store: &Store) -> Result<Vec<Hook>> {
+    Ok(store
+        .reader()
+        .list_hooks()?
+        .into_iter()
+        .filter(is_auth_hook)
+        .collect())
+}
 
 /// A header-injection template split into its name and value parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,44 +142,6 @@ impl HeaderTemplate {
     }
 }
 
-/// Extract the token from a login command's output using `regex` (one capture
-/// group). The FIRST match's group 1 is returned; a regex without a capture
-/// group, or no match, is an error.
-pub fn extract_token(regex: &str, output: &str) -> Result<String> {
-    let re = Regex::new(regex).with_context(|| format!("invalid --extract regex {regex:?}"))?;
-    let caps = re.captures(output).ok_or_else(|| {
-        crate::coded!(
-            ErrorCode::NetworkAuthRefreshFailed,
-            "--extract regex did not match the login command output"
-        )
-    })?;
-    let group = caps.get(1).ok_or_else(|| {
-        crate::coded!(
-            ErrorCode::InputBadRegex,
-            "--extract regex must have one capture group (found none)"
-        )
-    })?;
-    Ok(group.as_str().to_string())
-}
-
-/// Build the match/replace injection rule for `template` + `token` scoped to
-/// `host`. The pattern rewrites the existing header LINE; the replacement carries
-/// the fresh token with `$` neutralised (match/replace replacement honours `$1`
-/// capture refs, so a literal `$` in a token must be escaped as `$$`).
-pub fn injection_rule(template: &HeaderTemplate, token: &str, host: &str) -> NewMatchReplaceRule {
-    let pattern = format!("^{}:.*", regex::escape(&template.name));
-    let value = template.value_with(token);
-    let replacement = format!("{}: {}", template.name, value).replace('$', "$$");
-    NewMatchReplaceRule {
-        enabled: true,
-        scope: host.to_string(),
-        match_kind: MatchKind::Header,
-        pattern,
-        replacement,
-        on_request: true,
-    }
-}
-
 /// Mask a token for display: keep a short prefix/suffix, redact the middle.
 pub fn mask_token(token: &str) -> String {
     let n = token.chars().count();
@@ -153,33 +154,37 @@ pub fn mask_token(token: &str) -> String {
     format!("{head}…{tail} ({n} chars)")
 }
 
-/// Apply a freshly-minted token to a profile: DELETE the prior injection rule
-/// (if any), install a new one, and record the new rule id + token. Idempotent —
-/// repeated calls never stack rules. Pure w.r.t. the sandbox (store-only), so it
-/// is unit-tested directly.
-pub async fn apply_refresh(
-    store: &Store,
-    host: &str,
-    template: &HeaderTemplate,
-    token: &str,
-    prior_rule_id: Option<i64>,
-    now_ms: i64,
-) -> Result<i64> {
-    if let Some(old) = prior_rule_id {
-        // Best-effort: the rule may already be gone (deleted by hand).
-        let _ = store.writer().delete_match_replace(old).await;
+/// Translate the `session auth set` flags into the hook they describe.
+///
+/// The header template is parsed here FIRST, so a bad one is reported in terms
+/// of the flag the caller actually passed (`--header`) rather than the
+/// `--inject-header` it becomes; everything after that is `hook add`'s own
+/// validation, deliberately, so the façade can never build a hook the direct
+/// command would have refused.
+pub fn build_auth_hook(host: &str, login: &str, extract: &str, header: &str) -> Result<NewHook> {
+    let _ = HeaderTemplate::parse(header)?;
+    if login.trim().is_empty() {
+        crate::fail!(ErrorCode::InputInvalidValue, "--login must not be empty");
     }
-    let rule = injection_rule(template, token, host);
-    let rule_id = store.writer().add_match_replace(rule).await?;
-    store
-        .writer()
-        .set_auth_token(host, Some(token.to_string()), Some(rule_id), now_ms)
-        .await?;
-    Ok(rule_id)
+    hooks::build_hook(&HookSpec {
+        name: auth_hook_name(host),
+        phase: "pre-request".into(),
+        action: "exec".into(),
+        host: host.to_string(),
+        cmd: Some(login.to_string()),
+        extract: Some(extract.to_string()),
+        inject_header: Some(header.to_string()),
+        // Add-OR-REPLACE. Both halves matter: a stale header must be overwritten
+        // (all the old match/replace rule could do) and an absent one must be
+        // synthesized (what it could not).
+        inject_only_if_absent: false,
+        timeout_ms: hooks::DEFAULT_TIMEOUT_MS,
+        ttl_ms: hooks::DEFAULT_TTL_MS,
+        ..Default::default()
+    })
 }
 
-/// Persist (or update) an auth profile. Validates the header template + extract
-/// regex up front so a broken profile is rejected at `set` time, not refresh.
+/// Persist (or update) a session-auth profile; returns the hook id.
 pub async fn auth_set(
     store: &Store,
     host: &str,
@@ -187,70 +192,19 @@ pub async fn auth_set(
     extract: &str,
     header: &str,
 ) -> Result<i64> {
-    // Validate: the header template must carry `{}`, and the regex must compile.
-    let _ = HeaderTemplate::parse(header)?;
-    Regex::new(extract).with_context(|| format!("invalid --extract regex {extract:?}"))?;
-    if login.trim().is_empty() {
-        crate::fail!(ErrorCode::InputInvalidValue, "--login must not be empty");
-    }
+    let hook = build_auth_hook(host, login, extract, header)?;
     store
         .writer()
-        .upsert_auth_profile(NewAuthProfile {
-            host: host.to_string(),
-            login_cmd: login.to_string(),
-            extract_regex: extract.to_string(),
-            header_template: header.to_string(),
-        })
+        .upsert_hook_by_name(hook)
         .await
         .map_err(Into::into)
-}
-
-/// Run a profile's login command in the sandbox (routed through the session's
-/// proxy) and return its captured stdout. This is the only sandbox-touching part
-/// of refresh; it is gated on the sandbox preflight like `burpwn exec`.
-///
-/// `runtime_override` lets tests inject a [`burpwn_sandbox::MockRuntime`]; in
-/// production the real [`RootlessRuntime`] is used (after `doctor()`).
-pub async fn run_login(
-    paths: &Paths,
-    session: &str,
-    login_cmd: &str,
-    runtime_override: Option<Arc<dyn SandboxRuntime>>,
-) -> Result<String> {
-    let runtime: Arc<dyn SandboxRuntime> = match runtime_override {
-        Some(rt) => rt,
-        None => {
-            let pf = doctor();
-            if !pf.is_ok() {
-                crate::fail!(
-                    ErrorCode::SandboxPrerequisites,
-                    "sandbox preflight failed: {} — run `burpwn doctor`",
-                    pf.missing_summary()
-                );
-            }
-            Arc::new(RootlessRuntime::new())
-        }
-    };
-    // Run the login as one sandboxed `sh -c` so a compound login works and its
-    // traffic is captured/injected like any other exec.
-    let argv = vec!["sh".to_string(), "-c".to_string(), login_cmd.to_string()];
-    let result = exec::run_exec(
-        paths,
-        session,
-        exec::DEFAULT_WORKSPACE_ID,
-        runtime,
-        argv,
-        Some(Duration::from_secs(60)),
-        false, // capture stdout instead of inheriting it
-    )
-    .await
-    .context("running the auth login command in the sandbox")?;
-    Ok(String::from_utf8_lossy(&result.outcome.stdout).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::Paths;
+    use burpwn_store::model::{HookInjectKind, HookPhase};
 
     #[test]
     fn header_template_parse_requires_placeholder() {
@@ -268,63 +222,160 @@ mod tests {
     }
 
     #[test]
-    fn extract_token_pulls_capture_group() {
-        let out = r#"{"access_token":"eyJabc.def","expires":3600}"#;
-        let tok = extract_token(r#""access_token":"([^"]+)""#, out).unwrap();
-        assert_eq!(tok, "eyJabc.def");
+    fn a_profile_is_a_pre_request_exec_hook() {
+        let h = build_auth_hook(
+            "api.example.com",
+            "curl -s https://api.example.com/login",
+            r#""token":"([^"]+)""#,
+            "Authorization: Bearer {}",
+        )
+        .unwrap();
+        assert_eq!(h.name, "auth:api.example.com");
+        assert_eq!(h.phase, HookPhase::PreRequest);
+        assert_eq!(h.scope.host, "api.example.com");
+        assert_eq!(h.ttl_ms, hooks::DEFAULT_TTL_MS);
+        match h.action {
+            HookAction::Exec {
+                cmd,
+                extract,
+                inject,
+            } => {
+                assert_eq!(cmd, "curl -s https://api.example.com/login");
+                assert_eq!(extract, r#""token":"([^"]+)""#);
+                assert_eq!(
+                    inject.kind,
+                    HookInjectKind::SetHeader,
+                    "add-or-replace, so a request with NO auth header gets one"
+                );
+                assert_eq!(inject.name, "Authorization");
+                assert_eq!(inject.value_template, "Bearer {}");
+            }
+            other => panic!("{other:?}"),
+        }
 
-        // No match → error.
-        assert!(extract_token(r#""nope":"([^"]+)""#, out).is_err());
-        // No capture group → error.
-        assert!(extract_token(r#""access_token":"[^"]+""#, out).is_err());
-        // Invalid regex → error.
-        assert!(extract_token("(unclosed", out).is_err());
+        // Un-scoped profiles are named `auth:*` and match every host.
+        let h = build_auth_hook("", "login.sh", "(t)", "X-Token: {}").unwrap();
+        assert_eq!(h.name, "auth:*");
+        assert!(h.scope.host.is_empty());
+
+        // The validation is `hook add`'s, so nothing that could never work gets
+        // in: no capture group, no placeholder, an empty login.
+        assert!(build_auth_hook("h", "login.sh", r#""t":"[^"]+""#, "A: {}").is_err());
+        assert!(build_auth_hook("h", "login.sh", "(t)", "A: bare").is_err());
+        assert!(build_auth_hook("h", "   ", "(t)", "A: {}").is_err());
     }
 
-    #[test]
-    fn injection_rule_replaces_stale_header_and_escapes_dollar() {
-        let t = HeaderTemplate::parse("Authorization: Bearer {}").unwrap();
-        let rule = injection_rule(&t, "tok123", "api.example.com");
-        assert_eq!(rule.match_kind, MatchKind::Header);
-        assert_eq!(rule.pattern, "^Authorization:.*");
-        assert_eq!(rule.replacement, "Authorization: Bearer tok123");
-        assert_eq!(rule.scope, "api.example.com");
-        assert!(rule.on_request);
+    /// THE gain over the match/replace rule this replaces, end to end through
+    /// the real engine: a request that sends no `Authorization` at all comes out
+    /// carrying one.
+    #[tokio::test]
+    async fn the_injected_header_is_added_when_the_request_has_none() {
+        use burpwn_proxy::hooks::{HookEngine, HookRunner};
+        use burpwn_proxy::matchreplace::Message;
+        use std::sync::Arc;
+        use std::time::Duration;
 
-        // A `$` in the token is neutralised for the replacement engine.
-        let rule = injection_rule(&t, "a$1b", "");
-        assert_eq!(rule.replacement, "Authorization: Bearer a$$1b");
-    }
+        struct Login;
+        #[async_trait::async_trait]
+        impl HookRunner for Login {
+            async fn run(&self, _cmd: &str, _budget: Duration) -> Result<String> {
+                Ok(r#"{"token":"fresh-token"}"#.to_string())
+            }
+        }
 
-    #[test]
-    fn injection_rule_actually_rewrites_via_matchreplace_engine() {
-        use burpwn_proxy::matchreplace::{apply_request, Message};
-        use burpwn_store::model::MatchReplaceRule;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let store = Store::open(paths.session_db("default")).unwrap();
+        auth_set(
+            &store,
+            "api.example.com",
+            "login.sh",
+            r#""token":"([^"]+)""#,
+            "Authorization: Bearer {}",
+        )
+        .await
+        .unwrap();
 
-        let t = HeaderTemplate::parse("Authorization: Bearer {}").unwrap();
-        let n = injection_rule(&t, "fresh-token", "example.com");
-        let rule = MatchReplaceRule {
-            id: 1,
-            enabled: n.enabled,
-            scope: n.scope,
-            match_kind: n.match_kind,
-            pattern: n.pattern,
-            replacement: n.replacement,
-            on_request: n.on_request,
-        };
-        // A request carrying a STALE token (hyper lowercases header names).
+        let engine = HookEngine::new();
+        engine.set_runner(Arc::new(Login));
+        engine.set_hooks(store.reader().list_hooks().unwrap());
+
+        // A request with NO auth header — what the old `^Authorization:.*` rule
+        // could not touch, which is why the first call of a session 401'd.
         let mut msg = Message {
             host: "api.example.com".into(),
-            url: "/".into(),
-            headers: b"host: api.example.com\r\nauthorization: Bearer stale-token\r\n".to_vec(),
+            url: "/v1/me".into(),
+            headers: b"host: api.example.com\r\n".to_vec(),
             body: Vec::new(),
         };
-        assert!(apply_request(&[rule], &mut msg));
-        let hdrs = String::from_utf8(msg.headers).unwrap();
-        assert!(hdrs.contains("Authorization: Bearer fresh-token"), "{hdrs}");
+        assert!(engine.pre_request(None, "GET", &mut msg).await.changed);
+        let headers = String::from_utf8(msg.headers).unwrap();
         assert!(
-            !hdrs.contains("stale-token"),
-            "stale token replaced: {hdrs}"
+            headers.contains("Authorization: Bearer fresh-token"),
+            "the header must be ADDED, not merely replaced: {headers}"
+        );
+
+        // And a STALE header is still overwritten (the half that did work).
+        let mut msg = Message {
+            host: "api.example.com".into(),
+            url: "/v1/me".into(),
+            headers: b"host: api.example.com\r\nauthorization: Bearer stale\r\n".to_vec(),
+            body: Vec::new(),
+        };
+        assert!(engine.pre_request(None, "GET", &mut msg).await.changed);
+        let headers = String::from_utf8(msg.headers).unwrap();
+        assert!(
+            headers.contains("Authorization: Bearer fresh-token"),
+            "{headers}"
+        );
+        assert!(!headers.contains("stale"), "{headers}");
+
+        // Out of scope: another host is left alone.
+        let mut msg = Message {
+            host: "other.test".into(),
+            url: "/".into(),
+            headers: b"host: other.test\r\n".to_vec(),
+            body: Vec::new(),
+        };
+        assert!(!engine.pre_request(None, "GET", &mut msg).await.changed);
+    }
+
+    /// Re-`set`ting a host must UPDATE its profile, never stack a second login
+    /// command onto every request.
+    #[tokio::test]
+    async fn auth_set_is_idempotent_per_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let store = Store::open(paths.session_db("default")).unwrap();
+
+        for cmd in ["login-v1.sh", "login-v2.sh", "login-v3.sh"] {
+            auth_set(
+                &store,
+                "api.example.com",
+                cmd,
+                r#""token":"([^"]+)""#,
+                "Authorization: Bearer {}",
+            )
+            .await
+            .unwrap();
+        }
+        // A profile for ANOTHER host is a different name, so it coexists.
+        auth_set(&store, "other.test", "other.sh", "(t)", "X-Token: {}")
+            .await
+            .unwrap();
+
+        let profiles = auth_hooks(&store).unwrap();
+        assert_eq!(profiles.len(), 2, "one hook per host, not one per set");
+        let api = profiles
+            .iter()
+            .find(|h| h.name == "auth:api.example.com")
+            .unwrap();
+        assert!(
+            matches!(&api.action, HookAction::Exec { cmd, .. } if cmd == "login-v3.sh"),
+            "the last set wins: {:?}",
+            api.action
         );
     }
 
@@ -335,53 +386,5 @@ mod tests {
         assert!(m.starts_with("eyJh"), "{m}");
         assert!(m.contains('…'));
         assert!(!m.contains("bGci"));
-    }
-
-    #[tokio::test]
-    async fn apply_refresh_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::with_base(dir.path());
-        paths.ensure_session_dir("default").unwrap();
-        let store = Store::open(paths.session_db("default")).unwrap();
-
-        // Seed the profile.
-        let host = "api.example.com";
-        auth_set(
-            &store,
-            host,
-            "printf tok1",
-            r"(tok\d+)",
-            "Authorization: Bearer {}",
-        )
-        .await
-        .unwrap();
-        let template = HeaderTemplate::parse("Authorization: Bearer {}").unwrap();
-
-        // First refresh: installs one rule, sets the token.
-        let rid1 = apply_refresh(&store, host, &template, "tok1", None, 10)
-            .await
-            .unwrap();
-        assert_eq!(store.reader().list_match_replace().unwrap().len(), 1);
-
-        // Second refresh (as auto-refresh would run) must UPDATE, not stack.
-        let profile = store.reader().auth_profile_for_host(host).unwrap().unwrap();
-        assert_eq!(profile.rule_id, Some(rid1));
-        assert_eq!(profile.token.as_deref(), Some("tok1"));
-        let rid2 = apply_refresh(&store, host, &template, "tok2", profile.rule_id, 20)
-            .await
-            .unwrap();
-        let rules = store.reader().list_match_replace().unwrap();
-        assert_eq!(
-            rules.len(),
-            1,
-            "still exactly one injection rule (no stack)"
-        );
-        assert_eq!(rules[0].id, rid2, "the profile tracks the current rule");
-        assert_eq!(rules[0].replacement, "Authorization: Bearer tok2");
-        let _ = rid1;
-
-        let profile = store.reader().auth_profile_for_host(host).unwrap().unwrap();
-        assert_eq!(profile.token.as_deref(), Some("tok2"));
-        assert_eq!(profile.rule_id, Some(rid2));
     }
 }

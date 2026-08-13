@@ -112,7 +112,7 @@ pub fn session_export(
     });
     if !outcome.manifest.redacted {
         view["warning"] = json!(
-            "raw bundle: stored auth tokens/login commands and captured \
+            "raw bundle: stored login commands and captured \
              Authorization/Cookie headers are inside"
         );
     }
@@ -643,6 +643,7 @@ fn control_value(resp: burpwn_cli::control::ControlResponse) -> Result<Value> {
             "no parked intercept with that id (list them with intercept_list)"
         )),
         R::Resolved { found } => Ok(json!({ "found": found })),
+        R::HookCache { cleared } => Ok(json!({ "cleared": cleared })),
         R::Error { message } => Err(burpwn_cli::coded!(
             ErrorCode::DaemonRejected,
             "daemon error: {message}"
@@ -948,22 +949,31 @@ pub async fn session_auth_set(
     Ok(json!({ "id": id, "host": host }))
 }
 
-/// `session_auth_status` — the stored profiles with the token value MASKED.
+/// `session_auth_status` — the profiles, which are `pre-request` exec hooks
+/// (schema v8). There is no token field: the value a profile mints lives in the
+/// daemon's memory for the hook's TTL and is never written to the session.
 pub fn session_auth_status(paths: &Paths, session: &str) -> Result<Value> {
     let store = open_store(paths, session)?;
-    let profiles: Vec<Value> = store
-        .reader()
-        .auth_profiles()?
+    let profiles: Vec<Value> = burpwn_cli::auth::auth_hooks(&store)?
         .iter()
-        .map(|p| {
+        .map(|h| {
+            let (cmd, header) = match &h.action {
+                burpwn_store::model::HookAction::Exec { cmd, inject, .. } => (
+                    cmd.clone(),
+                    format!("{}: {}", inject.name, inject.value_template),
+                ),
+                _ => (String::new(), String::new()),
+            };
             json!({
-                "id": p.id,
-                "host": p.host,
-                "login_cmd": p.login_cmd,
-                "header_template": p.header_template,
-                "token_set": p.token.is_some(),
-                "token": p.token.as_deref().map(burpwn_cli::auth::mask_token),
-                "rule_id": p.rule_id,
+                "id": h.id,
+                "hook_id": h.id,
+                "name": h.name,
+                "enabled": h.enabled,
+                "host": h.scope.host,
+                "login_cmd": cmd,
+                "header_template": header,
+                "ttl_ms": h.ttl_ms,
+                "timeout_ms": h.timeout_ms,
             })
         })
         .collect();
@@ -972,10 +982,9 @@ pub fn session_auth_status(paths: &Paths, session: &str) -> Result<Value> {
     Ok(v)
 }
 
-/// `session_auth_refresh` — re-mint the token(s) + update the injection rule(s).
-/// This runs the login command in the sandbox, so it reuses the FULL CLI path
-/// (daemon-ensure + sandbox) by shelling out to `burpwn session auth refresh`
-/// (same rationale as [`run_exec`] shelling out for the sandbox).
+/// `session_auth_refresh` — drop the token(s) the daemon has cached, so the next
+/// in-scope request runs the login command again. Shells out to the CLI for the
+/// same reason as the rest of the daemon-touching tools: one code path.
 pub async fn session_auth_refresh(
     session: &str,
     params: &crate::params::SessionAuthRefreshParams,

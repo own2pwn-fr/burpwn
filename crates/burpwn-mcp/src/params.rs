@@ -100,9 +100,10 @@ pub struct SessionExportParams {
     /// directory.
     #[serde(default)]
     pub output: Option<String>,
-    /// Drop the stored auth tokens, login commands and match/replace
-    /// replacements. Credentials captured inside recorded requests/responses
-    /// (Authorization / Cookie headers, login bodies) are NOT scrubbed.
+    /// Drop the stored login commands (auth profiles / exec hooks) and
+    /// match/replace replacements. Credentials captured inside recorded
+    /// requests/responses (Authorization / Cookie headers, login bodies) are
+    /// NOT scrubbed.
     #[serde(default)]
     pub redact: bool,
     /// Overwrite the output file if it already exists.
@@ -318,7 +319,7 @@ pub struct SessionAuthSetParams {
     pub host: Option<String>,
 }
 
-/// `session_auth_refresh` — re-mint the token + update the injection rule.
+/// `session_auth_refresh` — drop the cached token so the next request re-mints.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SessionAuthRefreshParams {
     /// Restrict to the profile for this exact host scope (omit = all profiles).

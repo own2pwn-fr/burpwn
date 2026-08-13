@@ -119,7 +119,7 @@ impl BurpwnServer {
     // --- session auth -----------------------------------------------------
 
     #[tool(
-        description = "Persist a session-auth profile: a login command, a token-extraction regex (one capture group), and a header-injection template (e.g. 'Authorization: Bearer {}'), optionally scoped to a host. Use session_auth_refresh to mint the token."
+        description = "Persist a session-auth profile: a login command, a token-extraction regex (one capture group), and a header-injection template (e.g. 'Authorization: Bearer {}'), optionally scoped to a host. It becomes a pre-request hook that runs the login command on demand and ADDS the header (even to a request that carries none), so nothing has to be minted up front. Re-running it for the same host replaces that profile."
     )]
     async fn session_auth_set(
         &self,
@@ -132,7 +132,7 @@ impl BurpwnServer {
     }
 
     #[tool(
-        description = "Run the stored login command in the sandbox, extract a fresh token, and install/UPDATE the match/replace rule that injects the auth header into in-scope requests (idempotent). Use when a target starts returning 401s."
+        description = "Drop the token the daemon has cached for the profile(s), so the next request through the proxy runs the login command again and carries a fresh token. Rarely needed: a 401/403 already invalidates a cached token by itself."
     )]
     async fn session_auth_refresh(
         &self,
@@ -145,7 +145,7 @@ impl BurpwnServer {
     }
 
     #[tool(
-        description = "Show the stored session-auth profile(s) and whether a token is currently set (the token value is masked)."
+        description = "Show the stored session-auth profile(s): hook id, host scope, login command, injected header and cache TTL. The token is never stored — it is minted on demand and held only in the running daemon."
     )]
     async fn session_auth_status(&self) -> Result<CallToolResult, McpError> {
         handlers::session_auth_status(self.paths(), self.session())

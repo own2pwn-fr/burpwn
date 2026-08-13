@@ -117,8 +117,6 @@ pub struct HttpContext {
     pub writer: WriteHandle,
     /// Intercept primitive.
     pub intercept: InterceptController,
-    /// Session-auth auto-refresh trigger (inert unless the daemon armed it).
-    pub auth: crate::auth::AuthWatcher,
     /// Match/replace rules, snapshotted for the life of the connection.
     ///
     /// ⚠️ A rule added while a keep-alive connection is open does not apply to
@@ -416,12 +414,16 @@ async fn handle_inner(
     let (resp_parts, resp_body, up_guard, origin_cert_fp) =
         forward_streaming(&ctx.upstream, upstream_req).await?;
 
-    // Best-effort session-auth AUTO-refresh hook: signal the (debounced) host on
-    // a 401/403 so the daemon can re-mint an expired token. Inert (cheap no-op)
-    // unless the daemon armed the watcher via `AuthWatcher::activate`. Covers
-    // both the streaming and buffered response paths since the status is known
-    // here, before either branch. See [`crate::auth`] for the recursion guard.
-    ctx.auth.observe(&msg.host, resp_parts.status.as_u16());
+    // A 401/403 means whatever token an `exec` hook injected has stopped being
+    // accepted: drop it so the NEXT request mints a fresh one instead of reusing
+    // a refused value for the rest of the TTL. A cheap no-op with no pre-request
+    // hook configured, and it deliberately sits here — before the streaming /
+    // buffering fork — so it covers both response paths.
+    ctx.hooks.observe_status(
+        ctx.exec_id.as_deref(),
+        &msg.host,
+        resp_parts.status.as_u16(),
+    );
 
     // --- TLS/connection metadata (best-effort) ---
     // Negotiated version/cipher/alpn come from the downstream MITM handshake
