@@ -46,12 +46,15 @@ The generator is fully deterministic: no network, stdlib only, a fixed default
 seed, and a stable emission order — so regeneration is byte-identical on re-run.
 
 The emitted set is a *subsample* of the families (see ``build_dataset``), and
-that subsample is constrained by ``COVERAGE_MIN_PER_TOOL``: every one of the 42
-MCP tools is guaranteed to survive into ``dataset.jsonl`` and
-``dataset.train.jsonl`` as a real tool call, whatever ``--target`` /
-``--multiturn-frac`` are set to. ``--validate`` enforces this. Before that floor
-existed the raffle silently culled 15 of the 42 — coverage of the tool surface
-is a property worth asserting, not one to leave to chance.
+that subsample is constrained by two coverage floors: ``COVERAGE_MIN_PER_TOOL``
+guarantees every one of the 42 MCP tools survives into ``dataset.jsonl`` and
+``dataset.train.jsonl`` as a real tool call, and ``COVERAGE_MIN_PER_CAPABILITY``
+does the same for the features named in ``CAPABILITY_TAGS`` — the ones a CLI or
+shell example demonstrates in prose, where there is no tool call to detect.
+Whatever ``--target`` / ``--multiturn-frac`` are set to. ``--validate`` enforces
+both. Before the first floor existed the raffle silently culled 15 of the 42
+tools; before the second, four of the seven WebSocket/DNS examples. Coverage of
+the surface is a property worth asserting, not one to leave to chance.
 
 CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
 
@@ -3454,6 +3457,19 @@ def _ok(data: Any) -> str:
     return json.dumps({"ok": True, "data": data, "error": None}, sort_keys=True)
 
 
+def _err(code: str, message: str) -> str:
+    """A CLI `--json` FAILURE envelope, as burpwn prints it.
+
+    `data` is `null` on an error — the envelope is never null-pruned, so that
+    literal null is exactly how a failure is reported. The real binary also
+    emits a `diagnostic` object (title, remediation, debug_report path); it is
+    omitted here because an example that teaches the wrong *shape* of a refusal
+    is worse than one that shows less of it.
+    """
+    return json.dumps({"ok": False, "data": None, "error": f"[{code}] {message}"},
+                      sort_keys=True)
+
+
 def _home_body(t: Target) -> str:
     if t.kind == "rest":
         return (
@@ -6294,6 +6310,315 @@ def fam_hooks() -> list[dict[str, Any]]:
     return out
 
 
+def fam_hooks_ws_dns() -> list[dict[str, Any]]:
+    """0.4.0: hooks reach the WebSocket frames and the DNS names.
+
+    Three phases (`ws-c2s`, `ws-s2c`, `dns-query`) and two actions
+    (`replace-payload`, `set-answer`) that only mean anything there. The
+    load-bearing lessons are the two REFUSALS, because they are what an agent
+    walks into: `exec` is barred from these phases (one sandbox per frame would
+    serialize the proxy), and `hook test` cannot replay them (there is no
+    captured HTTP message to replay against). Both are real errors with real
+    codes, taught as the limits they are rather than as happy paths."""
+    out: list[dict[str, Any]] = []
+    ws = _t("spa")          # app.fintrack.dev — a React SPA with a live socket
+    dns = _t("mobapi")      # mobile-api.shopwave.io
+
+    # --- 1. The core new capability: rewrite a WebSocket payload in flight. ---
+    out.append(
+        cli_example(
+            tags=["hook", "websocket", "ws-c2s", "replace-payload", "tamper",
+                  ws.key],
+            turns=[
+                (
+                    "user",
+                    f"The order book on {ws.host} runs over a WebSocket, so my "
+                    "match/replace rules never fire on it. Can I tamper the messages "
+                    "the page sends?",
+                ),
+                (
+                    "assistant",
+                    "Yes — match/replace only sees HTTP messages, but a hook can fire on "
+                    "the socket itself. The phase is named after the direction:\n\n```\n"
+                    "burpwn --json hook add order-role \\\n  --phase ws-c2s \\\n"
+                    "  --action replace-payload \\\n  --find '\"role\":\"user\"' \\\n"
+                    "  --replace '\"role\":\"admin\"' \\\n"
+                    f"  --host {ws.host}\n```\n\n```json\n"
+                    + _ok({"hook_id": 1, "name": "order-role"}) + "\n```\n\n"
+                    "`ws-c2s` is client→server (the messages the page sends); `ws-s2c` is "
+                    "server→client. Those are the words the capture already uses — `req "
+                    "show` prints `c2s`/`s2c` per message — so you can copy what you read. "
+                    "`ws-send`/`ws-client` and `ws-recv`/`ws-server` are accepted as "
+                    "aliases if they come more naturally.\n\nTwo things to know about "
+                    "`--find`:\n\n* it is a **literal**, not a regex — `\"role\":\"user\"` "
+                    "matches those bytes and nothing else, so no escaping games\n"
+                    "* it is binary-safe, so it works on a socket carrying protobuf or "
+                    "MessagePack as well as JSON\n\nThe hook fires on one *complete* "
+                    "message, reassembled — not per TCP frame — so a payload split across "
+                    "continuation frames is still matched. An empty `--replace` deletes "
+                    f"the matched text. Scope it: without `--host {ws.host}` this would "
+                    "rewrite that string on every socket in the session.",
+                ),
+            ],
+        )
+    )
+
+    # --- 2. THE limit: exec is refused on the per-message phases. -------------
+    out.append(
+        cli_example(
+            tags=["hook", "websocket", "exec", "refused", "limits", "negative",
+                  ws.key],
+            turns=[
+                (
+                    "user",
+                    "Each WebSocket message needs a fresh HMAC. Can I put an exec hook on "
+                    "ws-c2s to sign them?",
+                ),
+                (
+                    "assistant",
+                    "No — burpwn refuses that pairing outright rather than accepting it "
+                    "and disappointing you on the wire:\n\n```\nburpwn --json hook add "
+                    "sign-frames --phase ws-c2s --action exec \\\n"
+                    "  --cmd './sign.sh' --extract '^(.*)$' "
+                    "--inject-header 'X-Sig: {}'\n```\n\n```json\n"
+                    + _err("BW-INPUT-001",
+                           "the exec action does not apply to a ws-c2s hook — an exec "
+                           "hook runs a command in a sandbox, and a ws-c2s hook fires on "
+                           "every message the socket carries — one sandbox each would "
+                           "cost more than the traffic it watches. Put the exec hook on "
+                           "pre-request: a socket inherits what its upgrade request "
+                           "carried")
+                    + "\n```\n\nThe reason is cost, not meaning. An `exec` hook runs its "
+                    "command **in the sandbox**, and one command is one sandbox; a busy "
+                    "socket carries thousands of messages, so signing each one would "
+                    "serialize the proxy behind a process spawn per frame.\n\nThe error "
+                    "also tells you the way round, and it is a real one: put the `exec` "
+                    "hook on `--phase pre-request` scoped to the **upgrade request**. A "
+                    "socket inherits what its upgrade carried, so a token or signature "
+                    "injected there applies for the life of the connection.\n\nIf the "
+                    "per-message value genuinely has to change per message, that is not a "
+                    "hook job — capture the socket and drive it yourself from a script "
+                    "under `burpwn exec`.\n\nThe same refusal covers `dns-query`, for the "
+                    "same reason (one sandbox per name resolved). What IS allowed on "
+                    "these phases is only what needs no process: `drop` everywhere, "
+                    "`replace-payload` on `ws-*`, `set-answer` on `dns-query`.",
+                ),
+            ],
+        )
+    )
+
+    # --- 3. DNS: answer a name yourself, or refuse to answer it. -------------
+    out.append(
+        cli_example(
+            tags=["hook", "dns", "dns-query", "set-answer", "drop", "redirect",
+                  dns.key],
+            turns=[
+                (
+                    "user",
+                    f"I want the app under test to hit my own listener instead of "
+                    f"{dns.host}, without editing its config or /etc/hosts.",
+                ),
+                (
+                    "assistant",
+                    "Hook the resolution itself — burpwn's shim sees the query before it "
+                    "goes upstream:\n\n```\nburpwn --json hook add pin-api \\\n"
+                    "  --phase dns-query \\\n"
+                    f"  --host {dns.host} \\\n"
+                    "  --action set-answer --answer 127.0.0.1\n```\n\n```json\n"
+                    + _ok({"hook_id": 2, "name": "pin-api"}) + "\n```\n\nThe sandboxed "
+                    "workload now resolves that name to your address, with no file to "
+                    "edit and nothing left behind on the host — the hook is scoped to the "
+                    "session.\n\nRead the scope flags carefully here, because they are "
+                    "reused rather than renamed: on `dns-query`, **`--host` is the queried "
+                    "NAME** (a case-insensitive substring, so `--host shopwave.io` would "
+                    "catch every subdomain), and `--path` is the record type written as "
+                    "`/A`, `/AAAA` or `/TXT`.\n\nOnly `A` and `AAAA` queries are answered "
+                    "— give it an IPv4 or IPv6 address and it replies with that record. "
+                    "Anything else (`TXT`, `MX`, `SRV`) still goes upstream even if the "
+                    "hook matches, so this steers connections, it does not forge a whole "
+                    "zone.\n\nTo make a name simply fail to resolve instead — cutting an "
+                    "analytics or update endpoint out of the run — drop the query:\n\n"
+                    "```\nburpwn --json hook add no-telemetry --phase dns "
+                    "--host telemetry --action drop\n```\n\n```json\n"
+                    + _ok({"hook_id": 3, "name": "no-telemetry"}) + "\n```\n\n`dns` is "
+                    "accepted as an alias for `dns-query`. `drop` is the one action that "
+                    "means the same thing on every phase.",
+                ),
+            ],
+        )
+    )
+
+    # --- 4. `hook test` refuses the non-HTTP phases. -------------------------
+    out.append(
+        cli_example(
+            tags=["hook", "test", "websocket", "dns", "refused", "negative",
+                  "limits"],
+            turns=[
+                (
+                    "user",
+                    "Let me dry-run that WebSocket hook against a captured flow before I "
+                    "trust it: `burpwn hook test 1 --flow 412`.",
+                ),
+                (
+                    "assistant",
+                    "That one cannot be dry-run:\n\n```json\n"
+                    + _err("BW-INPUT-009",
+                           "hook 1 is a ws-c2s hook: `hook test` replays a hook against a "
+                           "captured HTTP request or response, and neither exists for that "
+                           "phase. Watch it on live traffic instead (`req list --protocol "
+                           "ws` / `--protocol dns`)")
+                    + "\n```\n\n`hook test` works by replaying a hook against a **captured "
+                    "HTTP message** and diffing before/after. A WebSocket message is not "
+                    "one — the frames live in their own table — and a DNS query is a name, "
+                    "not a request. Rather than invent a message the hook would never see "
+                    "and report a confident `matched:false` about a comparison it never "
+                    "made, it refuses.\n\nSo verify these on live traffic instead:\n\n"
+                    "```\nburpwn --json req list --protocol ws\n```\n\nand read the "
+                    "messages with `burpwn req show <id>`, which prints them `c2s`/`s2c` "
+                    "with your replacement already applied. `--protocol dns` does the same "
+                    "for resolutions.\n\nOne gotcha in the order of checks: the flow is "
+                    "looked up **first**, so a bad `--flow` reports `[BW-INPUT-002] no "
+                    "such flow: 412` and you never see the phase refusal. If you get that, "
+                    "fix the flow id before concluding anything about the hook.\n\n`hook "
+                    "test` still works normally on `pre-request`/`post-response` hooks.",
+                ),
+            ],
+        )
+    )
+
+    # --- 5. MCP: the same capability, with the hook_list shape. --------------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "hook_add", "hook_list", "websocket", "ws-s2c",
+                  "replace-payload", "multi-turn"],
+            exchanges=[
+                {
+                    "user": f"The {ws.host} dashboard hides the admin panel based on a "
+                            "flag the server pushes over the WebSocket. Flip it.",
+                    "steps": [
+                        {
+                            "preamble": "The flag arrives server→client, so hook the "
+                                        "`ws-s2c` phase and rewrite the payload.",
+                            "tool": "hook_add",
+                            "args": {"action": "replace-payload",
+                                     "find": '"isAdmin":false',
+                                     "host": ws.host,
+                                     "name": "unhide-admin",
+                                     "phase": "ws-s2c",
+                                     "replace": '"isAdmin":true'},
+                            "result": {"hook_id": 5, "name": "unhide-admin"},
+                            "interp": "Installed. `ws-s2c` is server→client — the "
+                                      "direction the flag travels — where `ws-c2s` would "
+                                      "be the messages the page sends. `find` is a "
+                                      "literal, not a regex, and the hook fires on one "
+                                      "complete reassembled message.\n\nWorth being clear "
+                                      "about what this proves: flipping a client-side "
+                                      "flag only shows what the UI renders. It is a "
+                                      "finding when the admin actions it reveals actually "
+                                      "work — which you test by driving them and reading "
+                                      "the responses, not by looking at the page.",
+                        },
+                        {
+                            "preamble": "Confirm what is live on the socket.",
+                            "tool": "hook_list", "args": {},
+                            "result": {"hooks": [
+                                {"action": {"action": "replace-payload",
+                                            "find": '"isAdmin":false',
+                                            "replace": '"isAdmin":true'},
+                                 "created_at": 1786662076953, "enabled": True, "id": 5,
+                                 "name": "unhide-admin", "order": 0, "phase": "ws-s2c",
+                                 "scope": {"host": ws.host, "method": "", "path": ""},
+                                 "timeout_ms": 10000, "ttl_ms": 300000},
+                            ]},
+                            "interp": "One hook, `enabled:true` on `ws-s2c`. Two things to "
+                                      "read here:\n\n`scope` has no `status` member — "
+                                      "`hook_list` is null-pruned over MCP, and a "
+                                      "non-`post-response` hook has no status to match. "
+                                      "The CLI's `hook list` emits `\"status\":null` "
+                                      "instead; same hook, different envelope.\n\n"
+                                      "`timeout_ms` and `ttl_ms` are shown but inert "
+                                      "here — they budget an `exec` command, and `exec` "
+                                      "is not allowed on this phase at all. Their defaults "
+                                      "appear on every hook regardless.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 6. MCP: DNS steering as a single call. ------------------------------
+    out.append(
+        mcp_example(
+            tags=["mcp", "hook_add", "dns", "dns-query", "set-answer"],
+            user=f"Make everything in the sandbox resolve {dns.host} to 10.0.5.9 for "
+                 "this session only.",
+            steps=[{
+                "preamble": "A `dns-query` hook answers the name instead of resolving it "
+                            "upstream.",
+                "tool": "hook_add",
+                "args": {"action": "set-answer", "answer": "10.0.5.9",
+                         "host": dns.host, "name": "pin-mobile-api",
+                         "phase": "dns-query"},
+                "result": {"hook_id": 6, "name": "pin-mobile-api"},
+                "final": "Done — hook 6. Anything running under `exec` in this session now "
+                         "resolves that name to `10.0.5.9`; nothing on the host is "
+                         "touched, and removing the hook (`hook_rm`) undoes it.\n\nTwo "
+                         "limits worth stating: only `A`/`AAAA` queries are answered "
+                         "(`TXT`, `MX` and friends still go upstream even though the host "
+                         "scope matches), and `host` here is the queried NAME as a "
+                         "case-insensitive substring — `shopwave.io` would have caught "
+                         "every subdomain, not just this one.",
+            }],
+        )
+    )
+
+    # --- 7. Shell: pick the direction by reading the capture first. ----------
+    out.append(
+        shell_example(
+            tags=["shell", "hook", "websocket", "ws-c2s", "replace-payload",
+                  "multi-turn", ws.key],
+            exchanges=[
+                {
+                    "user": f"Something on {ws.host} is sent over a websocket and I want "
+                            "to tamper with it. Show me what's on the socket first.",
+                    "steps": [{
+                        "preamble": "List only the WebSocket flows.",
+                        "command": f"burpwn --json req list --protocol ws --host {ws.host}",
+                        "result": _ok([_flow_row(412, ws, "GET", "/ws/orders", 101)]),
+                        "interp": "One socket: flow 412, the `101` upgrade on `/ws/orders`. "
+                        "A WebSocket capture is a single flow whose messages hang off it — "
+                        "`burpwn req show 412` prints them in order, each tagged `c2s` "
+                        "(client→server) or `s2c` (server→client). Read one before "
+                        "choosing a phase: those two tags are exactly the hook phase names.",
+                    }],
+                },
+                {
+                    "user": "The client sends `{\"qty\":1,\"price\":4999}`. Change the "
+                            "price.",
+                    "steps": [{
+                        "preamble": "Client→server, so `ws-c2s`, scoped to this host.",
+                        "command": "burpwn --json hook add cut-price --phase ws-c2s "
+                        "--action replace-payload --find '\"price\":4999' "
+                        f"--replace '\"price\":1' --host {ws.host}",
+                        "result": _ok({"hook_id": 4, "name": "cut-price"}),
+                        "interp": "Live from the next message on. `--find` is literal, so "
+                        "`\"price\":4999` matches those exact bytes — it will not match "
+                        "`\"price\": 4999` with a space, which is the usual reason one of "
+                        "these silently does nothing. Copy the string out of `req show` "
+                        "rather than retyping it.\n\nThere is no dry run for this: `hook "
+                        "test` needs a captured HTTP message and refuses a `ws-c2s` hook "
+                        "(`BW-INPUT-009`). Drive the app and re-read flow 412 to confirm "
+                        "the rewritten message, then check the server *accepted* the price "
+                        "rather than merely receiving it.",
+                    }],
+                },
+            ],
+        )
+    )
+    return out
+
+
 def fam_compare_cap() -> list[dict[str, Any]]:
     """The MCP `compare` body-diff cap. An agent that does not notice
     `body.truncated` will reason confidently about a body it never saw, so the
@@ -7367,6 +7692,8 @@ FAMILIES = [
     fam_session_bundle,
     fam_hooks,
     fam_compare_cap,
+    # 0.4.0 surface: the WebSocket / DNS hook phases.
+    fam_hooks_ws_dns,
     fam_mcp_groups_hooks,
     # 0.2.0 integration surface: skill install / mcp register.
     fam_skill_install,
@@ -7421,6 +7748,28 @@ def _subsample_by_style(
 # something to leave to a raffle, so it is now a constraint on the raffle.
 COVERAGE_MIN_PER_TOOL = 2
 
+# The same argument, applied to capabilities that are not MCP tools.
+#
+# An MCP tool is not the only thing a raffle can delete off the surface. A CLI
+# or shell capability is demonstrated by a handful of records and calls no tool
+# at all, so `COVERAGE_MIN_PER_TOOL` cannot see it: when the 0.4.0 WebSocket/DNS
+# hook phases were added, four of their seven examples — including one of the
+# two REFUSAL lessons, which are the ones an agent actually walks into — were
+# raffled out of the emitted file on the first run. That is the same defect as
+# the fifteen culled tools, one level up.
+#
+# These tags name a capability rather than a topic, so "does the emitted dataset
+# still teach this?" is a question with a yes/no answer. Adding a tag here is a
+# claim that the feature must survive subsampling; it is not a place to list
+# every tag in use.
+CAPABILITY_TAGS = {
+    # 0.4.0: hooks on the WebSocket frames and the DNS names.
+    "ws-c2s", "ws-s2c", "dns-query", "replace-payload", "set-answer",
+    # The limits of those phases, which are the load-bearing half.
+    "refused",
+}
+COVERAGE_MIN_PER_CAPABILITY = 2
+
 
 def _record_mcp_tools(rec: dict[str, Any]) -> set[str]:
     """The MCP tool names a record actually calls (empty for cli/shell records —
@@ -7434,35 +7783,59 @@ def _record_mcp_tools(rec: dict[str, Any]) -> set[str]:
     return names
 
 
-def _coverage_floor_ids(
-    pool: list[dict[str, Any]], already: Iterable[dict[str, Any]], minimum: int
-) -> set[int]:
-    """Ids of records to force-keep from ``pool`` so that every MCP tool reaches
-    ``minimum`` occurrences, counting what ``already`` (the records kept
-    unconditionally) contributes.
+def _record_capabilities(rec: dict[str, Any]) -> set[str]:
+    """The declared capabilities a record demonstrates (``CAPABILITY_TAGS`` it
+    carries). Unlike tools these are asserted by the family author rather than
+    read off the record, because a CLI example demonstrates its feature in prose
+    and there is nothing structural to detect."""
+    return set(rec.get("tags") or ()) & CAPABILITY_TAGS
 
-    Deterministic: tools are visited in sorted order and ``pool`` is scanned in
-    its stable family order, so the result depends only on the family output —
-    not on the RNG, and not on iteration order of any set.
+
+def _coverage_keys(rec: dict[str, Any]) -> set[tuple[str, str]]:
+    """Everything a record counts as coverage for, namespaced so a tool and a
+    tag that happen to share a name can never collide."""
+    return ({("tool", t) for t in _record_mcp_tools(rec)}
+            | {("cap", c) for c in _record_capabilities(rec)})
+
+
+def _coverage_universe() -> list[tuple[tuple[str, str], int]]:
+    """Every (key, minimum) the floor enforces, in a stable order. Tools first,
+    then capabilities; each group sorted, so the result never depends on set
+    iteration order."""
+    return ([(("tool", t), COVERAGE_MIN_PER_TOOL) for t in sorted(MCP_TOOL_NAMES)]
+            + [(("cap", c), COVERAGE_MIN_PER_CAPABILITY)
+               for c in sorted(CAPABILITY_TAGS)])
+
+
+def _coverage_floor_ids(
+    pool: list[dict[str, Any]], already: Iterable[dict[str, Any]]
+) -> set[int]:
+    """Ids of records to force-keep from ``pool`` so that every MCP tool and every
+    declared capability reaches its minimum, counting what ``already`` (the
+    records kept unconditionally) contributes.
+
+    Deterministic: keys are visited in ``_coverage_universe`` order and ``pool``
+    is scanned in its stable family order, so the result depends only on the
+    family output — not on the RNG, and not on iteration order of any set.
     """
-    counts: dict[str, int] = {}
+    counts: dict[tuple[str, str], int] = {}
     for rec in already:
-        for tool in _record_mcp_tools(rec):
-            counts[tool] = counts.get(tool, 0) + 1
+        for key in _coverage_keys(rec):
+            counts[key] = counts.get(key, 0) + 1
     picked: set[int] = set()
-    for tool in sorted(MCP_TOOL_NAMES):
+    for key, minimum in _coverage_universe():
         for rec in pool:
-            if counts.get(tool, 0) >= minimum:
+            if counts.get(key, 0) >= minimum:
                 break
             if id(rec) in picked:
                 continue
-            tools = _record_mcp_tools(rec)
-            if tool not in tools:
+            keys = _coverage_keys(rec)
+            if key not in keys:
                 continue
             picked.add(id(rec))
-            # A record often demonstrates several tools; credit them all so we
-            # don't over-select.
-            for other in tools:
+            # A record often demonstrates several tools/capabilities; credit them
+            # all so we don't over-select.
+            for other in keys:
                 counts[other] = counts.get(other, 0) + 1
     return picked
 
@@ -7534,7 +7907,7 @@ def build_dataset(
                 keep: set[int] = set(id(r) for r in multi)
                 # Coverage floor before the raffle: a tool whose only
                 # demonstrations are single-turn must not be raffled away.
-                keep |= _coverage_floor_ids(single, multi, COVERAGE_MIN_PER_TOOL)
+                keep |= _coverage_floor_ids(single, multi)
                 total_single = len(single)
                 quotas = {
                     st: int(round(keep_single * len(g) / total_single))
@@ -7561,9 +7934,9 @@ def build_dataset(
             n = max(0, min(n, len(group)))
             allocated += n
             quotas2[st] = n
-        # Same floor as above: a --target cap must not be able to cull a tool
-        # off the emitted surface either.
-        keep2: set[int] = _coverage_floor_ids(unique, [], COVERAGE_MIN_PER_TOOL)
+        # Same floor as above: a --target cap must not be able to cull a tool or
+        # a capability off the emitted surface either.
+        keep2: set[int] = _coverage_floor_ids(unique, [])
         _raffle_by_style(by_style2, quotas2, keep2, rng)
         unique = _subsample_by_style(unique, keep2)
 
@@ -7575,7 +7948,8 @@ def split_dataset(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Deterministic train/validation split, stratified by style so every style
     (cli/mcp/shell) appears in both files, and constrained so that every MCP tool
-    is demonstrated at least once in the *train* half."""
+    and every declared capability is demonstrated at least once in the *train*
+    half."""
     rng = random.Random(seed + 1)
     train: list[dict[str, Any]] = []
     val: list[dict[str, Any]] = []
@@ -7588,22 +7962,24 @@ def split_dataset(
         for i, r in enumerate(group):
             (val if i in val_idx else train).append(r)
 
-    # Coverage floor, again — this time for the *train* file. A tool with only
-    # one surviving demonstration can have that record drawn into the 5%
-    # validation sample, which would leave the model with nothing to learn the
-    # tool from. Held-out sampling is supposed to measure the training set, not
-    # remove capabilities from it, so any tool that ends up absent from `train`
-    # gets one of its validation records handed back (deterministically: the
-    # first in stable order).
-    train_tools: set[str] = set()
+    # Coverage floor, again — this time for the *train* file. A tool (or a
+    # capability) with only one surviving demonstration can have that record
+    # drawn into the 5% validation sample, which would leave the model with
+    # nothing to learn it from. Held-out sampling is supposed to measure the
+    # training set, not remove capabilities from it, so anything that ends up
+    # absent from `train` gets one of its validation records handed back
+    # (deterministically: the first in stable order).
+    train_keys: set[tuple[str, str]] = set()
     for rec in train:
-        train_tools |= _record_mcp_tools(rec)
-    for tool in sorted(MCP_TOOL_NAMES - train_tools):
+        train_keys |= _coverage_keys(rec)
+    for key, _minimum in _coverage_universe():
+        if key in train_keys:
+            continue
         for rec in val:
-            if tool in _record_mcp_tools(rec):
+            if key in _coverage_keys(rec):
                 val.remove(rec)
                 train.append(rec)
-                train_tools |= _record_mcp_tools(rec)
+                train_keys |= _coverage_keys(rec)
                 break
     # Preserve a stable order within each split (by normalized key) for a
     # reviewable, byte-identical diff.
@@ -7845,6 +8221,7 @@ def run_validate(path: str) -> int:
     keys: dict[str, int] = {}
     dupes = 0
     tools_seen: set[str] = set()
+    caps_seen: set[str] = set()
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -7860,6 +8237,7 @@ def run_validate(path: str) -> int:
             if is_multiturn(rec):
                 n_multi += 1
             tools_seen |= _record_mcp_tools(rec)
+            caps_seen |= _record_capabilities(rec)
             k = _normalized_key(rec)
             if k in keys:
                 dupes += 1
@@ -7883,6 +8261,18 @@ def run_validate(path: str) -> int:
             + ", ".join(missing_tools)
         )
 
+    # Capability coverage, on the same terms. A tool call is structural and can
+    # be detected; a CLI capability is only visible through the tag its family
+    # declared, but "the emitted dataset no longer teaches this feature" is the
+    # same regression either way — and it happened to four of the seven
+    # WebSocket/DNS examples the first time they were generated.
+    missing_caps = sorted(CAPABILITY_TAGS - caps_seen)
+    if missing_caps and must_cover:
+        problems.append(
+            f"{len(missing_caps)} declared capability(ies) have no surviving "
+            "example: " + ", ".join(missing_caps)
+        )
+
     total = sum(by_style.values())
     breakdown = ", ".join(f"{by_style[s]} {s}" for s in sorted(by_style))
     pct = (100 * n_multi // total) if total else 0
@@ -7898,6 +8288,7 @@ def run_validate(path: str) -> int:
     print(
         f"OK: {src} — {total} records ({breakdown}; {n_multi} multi-turn = {pct}%), "
         f"0 dupes, {len(tools_seen)}/{len(MCP_TOOL_NAMES)} MCP tools exercised, "
+        f"{len(caps_seen)}/{len(CAPABILITY_TAGS)} capabilities, "
         f"schema {SCHEMA_VERSION}",
         file=sys.stderr,
     )
