@@ -1023,6 +1023,31 @@ pub async fn session_auth_refresh(
 /// Run `burpwn <args>` (which include `--json`) capturing stdout, and return the
 /// `data` of its `{ok,data,error}` envelope (or an error on `ok:false`). Used by
 /// the auth-refresh tool to reuse the CLI's daemon-ensure + sandbox path.
+/// Turn a failed `{ok:false, …}` CLI envelope back into a coded error.
+///
+/// The CLI already classified the failure and put the verdict in `diagnostic`;
+/// this re-raises *its* code instead of relabelling everything `Internal`. That
+/// relabelling is what made `hook_test` answer a typo'd flow id with
+/// `BW-INTERNAL-001` — "this is a burpwn bug: please report it" — while burying
+/// the `BW-INPUT-002` that actually said what to fix. Only an envelope we cannot
+/// read at all (the caller's `None` arm) is genuinely our bug.
+fn envelope_failure(v: &Value) -> anyhow::Error {
+    let diag = v.get("diagnostic");
+    let code = diag
+        .and_then(|d| d.get("code"))
+        .and_then(Value::as_str)
+        .and_then(ErrorCode::from_id)
+        .unwrap_or(ErrorCode::Internal);
+    // Prefer the diagnostic's bare message: the `error` field already carries a
+    // `[CODE]` prefix, which the coded error would then prefix a second time.
+    let msg = diag
+        .and_then(|d| d.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| v.get("error").and_then(Value::as_str))
+        .unwrap_or("unknown");
+    burpwn_cli::coded!(code, "{}", msg)
+}
+
 async fn run_burpwn_json(args: &[String]) -> Result<Value> {
     let exe = std::env::current_exe().context("locating the burpwn executable")?;
     let output = tokio::process::Command::new(&exe)
@@ -1041,11 +1066,7 @@ async fn run_burpwn_json(args: &[String]) -> Result<Value> {
         Some(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
             Ok(v.get("data").cloned().unwrap_or_else(|| json!({})))
         }
-        Some(v) => Err(burpwn_cli::coded!(
-            ErrorCode::Internal,
-            "burpwn command failed: {}",
-            v.get("error").and_then(Value::as_str).unwrap_or("unknown")
-        )),
+        Some(v) => Err(envelope_failure(&v)),
         None => Err(burpwn_cli::coded!(
             ErrorCode::Internal,
             "burpwn produced no JSON envelope (exit {:?})",
@@ -1866,5 +1887,44 @@ mod tests {
             message: "boom".into()
         })
         .is_err());
+    }
+
+    /// A failure the CLI already classified must keep ITS code over MCP.
+    ///
+    /// `hook_test`, `session_auth_refresh` and `exec` all shell out, and every
+    /// failure used to come back as `BW-INTERNAL-001` — whose remediation is
+    /// "this is a burpwn bug: please report it". An agent that typo'd a flow id
+    /// was being told to file a bug report about its own argument.
+    #[test]
+    fn a_cli_failure_keeps_its_own_code_instead_of_becoming_an_internal_bug() {
+        let env = json!({
+            "ok": false,
+            "data": null,
+            "error": "[BW-INPUT-002] no such flow: 1",
+            "diagnostic": { "code": "BW-INPUT-002", "message": "no such flow: 1" }
+        });
+        let err = envelope_failure(&env);
+        let diag = burpwn_cli::diag::diagnose(&err);
+        assert_eq!(diag.code, ErrorCode::InputNoSuchFlow);
+        // The `[CODE]` prefix lives in the rendered form, not in the message, so
+        // taking `error` verbatim here would print the code twice.
+        assert_eq!(diag.message, "no such flow: 1");
+
+        // An envelope with no diagnostic is all we can honestly call internal.
+        let bare = json!({ "ok": false, "error": "something went wrong" });
+        assert_eq!(
+            burpwn_cli::diag::diagnose(&envelope_failure(&bare)).code,
+            ErrorCode::Internal
+        );
+
+        // An unknown code id must not panic or be trusted blindly.
+        let alien = json!({
+            "ok": false,
+            "diagnostic": { "code": "BW-FROM-THE-FUTURE-9", "message": "hi" }
+        });
+        assert_eq!(
+            burpwn_cli::diag::diagnose(&envelope_failure(&alien)).code,
+            ErrorCode::Internal
+        );
     }
 }

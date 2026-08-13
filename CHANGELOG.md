@@ -3,6 +3,20 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed — an agent was told to report a bug when it had typo'd an argument
+Three MCP tools — `hook_test`, `session_auth_refresh` and `exec` — answer by shelling out to the
+burpwn binary and reading its `--json` envelope. Every failure of that child came back wrapped as
+`BW-INTERNAL-001`, whose remediation reads *"this is a burpwn bug: please report it"*. So a bad
+`flow_id` produced `[BW-INTERNAL-001] burpwn command failed: [BW-INPUT-002] no such flow: 1` — the
+code that says what to fix was carried, as text, inside the code that says nothing can be done.
+
+The CLI has already classified the failure and put its verdict in the envelope's `diagnostic`; that
+code is now re-raised instead of being relabelled, and the message is taken from `diagnostic` rather
+than from the pre-prefixed `error` string so the id is not printed twice. `Internal` is kept for the
+one case that deserves it: an envelope burpwn could not read at all.
+
 ## [0.4.0] - 2026-08-14
 
 ### Added — hooks reach the socket the page keeps open, and the names it resolves
