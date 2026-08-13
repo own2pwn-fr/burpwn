@@ -4885,6 +4885,614 @@ def fam_mcp_offensive_convos() -> list[dict[str, Any]]:
     return out
 
 
+def fam_mcp_housekeeping_convos() -> list[dict[str, Any]]:
+    """Multi-turn MCP conversations over the *housekeeping* half of the surface —
+    the session/workspace/tag/rule/intercept-state tools an operator actually
+    chains between attacks.
+
+    These tools were each demonstrated exactly once, by a single-turn record, and
+    the balancer's raffle therefore culled them from the emitted split (see
+    ``COVERAGE_MIN_PER_TOOL``). The floor now protects them, but one example per
+    tool is thin regardless — and a lone record can also land wholly in the
+    validation split, leaving the *train* file with no demonstration at all.
+    These conversations add a second, realistic demonstration where the tool has
+    an honest role in a workflow, rather than as a standalone "call X" drill.
+
+    Every result shape here was captured from the real 0.3.4 stdio MCP server
+    (see README.md "Grounding / accuracy"); note the MCP envelopes differ from
+    the CLI ones (`workspace_new` → `{workspace_id}` not `{id,name}`,
+    `workspace_list`/`tag_list`/`match_replace_list` wrap their arrays in
+    `{workspaces}`/`{tags}`/`{rules}` where the CLI returns bare arrays).
+    """
+    out: list[dict[str, Any]] = []
+    t = _t("ecom")
+
+    # --- 1. Engagement kickoff: which session, and scope captures to a new
+    # workspace before touching the target. -------------------------------------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "session_list", "session_current",
+                  "workspace_new", "workspace_list", "exec", "setup", t.key],
+            exchanges=[
+                {
+                    "user": "I'm picking up an engagement someone else started. What "
+                            "burpwn sessions exist and which one am I on?",
+                    "steps": [
+                        {
+                            "preamble": "List the sessions first.",
+                            "tool": "session_list", "args": {},
+                            "result": {"active": "northwind",
+                                       "sessions": ["default", "northwind", "fintrack"]},
+                            "interp": "Three sessions: `default`, `northwind` and "
+                                      "`fintrack`; `northwind` is active. Let me confirm "
+                                      "its capture database actually exists before you "
+                                      "rely on it.",
+                        },
+                        {
+                            "preamble": "Confirm the active session has a store on disk.",
+                            "tool": "session_current", "args": {},
+                            "result": {"active": "northwind", "db_exists": True},
+                            "interp": "`northwind` is active and `db_exists:true`, so "
+                                      "there is real captured traffic to query. "
+                                      "`session_list` gives you the names, "
+                                      "`session_current` tells you whether the active one "
+                                      "has been used yet — a fresh session reports "
+                                      "`db_exists:false` until the first `exec`.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Good. I don't want my captures mixed in with theirs — put "
+                            "everything I do today somewhere separate.",
+                    "steps": [
+                        {
+                            "preamble": "Create a workspace to attribute the new flows to.",
+                            "tool": "workspace_new", "args": {"name": "day2-checkout"},
+                            "result": {"workspace_id": 4},
+                            "interp": "Workspace `day2-checkout` created as id 4. A "
+                                      "workspace is a *label on flows within the same "
+                                      "session*, not a second database — the earlier "
+                                      "captures stay where they are, and nothing is "
+                                      "scoped automatically. (The MCP result is just "
+                                      "`{workspace_id}`; the CLI's `workspace new` echoes "
+                                      "`{id,name}`.)",
+                        },
+                        {
+                            "preamble": "Show the full list so the ids are unambiguous.",
+                            "tool": "workspace_list", "args": {},
+                            "result": {"workspaces": [
+                                {"id": 1, "name": "default", "created_at": 0},
+                                {"id": 2, "name": "recon", "created_at": 1781363698970},
+                                {"id": 3, "name": "auth-flow", "created_at": 1781364012044},
+                                {"id": 4, "name": "day2-checkout",
+                                 "created_at": 1781450113900},
+                            ]},
+                            "interp": "Four workspaces; yours is id 4. Their work sits in "
+                                      "`recon` (2) and `auth-flow` (3). Pass "
+                                      "`workspace:\"4\"` on every `exec` from now on — "
+                                      "that is the only thing that actually attributes a "
+                                      "flow — and `req_list` with `workspace:4` to read "
+                                      "back just yours.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Right, hit the checkout page under that workspace.",
+                    "steps": [{
+                        "preamble": "Run it through the sandbox, attributed to workspace 4.",
+                        "tool": "exec",
+                        "args": {"argv": ["curl", "-s", "-o", "/dev/null",
+                                          f"https://{t.host}/cart/checkout"],
+                                 "workspace": "4"},
+                        "result": {"exit_code": 0, "captured_request_ids": [301, 302, 303],
+                                   "exec_id": "exec-7712-0-1781450140000000000"},
+                        "interp": "Exit 0, three flows captured (301–303: the A/AAAA DNS "
+                                  "lookups plus the HTTPS GET) and all tagged to "
+                                  "workspace 4. Note `exec` takes `workspace` as a "
+                                  "*string*, while `req_list` takes it as a number — an "
+                                  "asymmetry in the MCP schema that is easy to trip over.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # --- 2. Capture-completeness audit: did anything escape the sandbox? --------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "session_stats", "exec", "capture", "escape"],
+            exchanges=[
+                {
+                    "user": "Before I write this up — am I sure I captured everything? "
+                            "Some of these tools fork their own downloaders.",
+                    "steps": [{
+                        "preamble": "Compare execs against captured flows.",
+                        "tool": "session_stats", "args": {},
+                        "result": {"session": "northwind", "total_execs": 12,
+                                   "total_flows": 208, "network_execs": 11,
+                                   "network_zero_flow_execs": 2,
+                                   "escaped_execs": [
+                                       {"exec_id": "exec-7701-3-1781449002000000000",
+                                        "cmd": "wget https://cdn.northwind.example/app.js"},
+                                       {"exec_id": "exec-7705-1-1781449551000000000",
+                                        "cmd": "nmap -sn 198.51.100.0/24"},
+                                   ]},
+                        "interp": "Two of eleven network-facing execs captured zero flows. "
+                                  "They are not equivalent, though: the `wget` is a real "
+                                  "gap — an HTTP fetch that should have produced flows — "
+                                  "whereas `nmap -sn` is a **false positive**. A ping "
+                                  "sweep sends ICMP/ARP, not HTTP, so there is nothing "
+                                  "for an HTTP-level proxy to capture; "
+                                  "`network_zero_flow_execs` counts \"touched the network "
+                                  "but produced no flows\", which is a heuristic, not a "
+                                  "verdict. Only the `wget` is worth chasing.",
+                    }],
+                },
+                {
+                    "user": "Chase the wget then.",
+                    "steps": [
+                        {
+                            "preamble": "Re-run the fetch explicitly through the sandbox.",
+                            "tool": "exec",
+                            "args": {"argv": ["curl", "-s", "-o", "/dev/null",
+                                              "https://cdn.northwind.example/app.js"]},
+                            "result": {"exit_code": 0,
+                                       "captured_request_ids": [401, 402, 403],
+                                       "exec_id": "exec-7719-0-1781450900000000000"},
+                            "interp": "Captured this time (flows 401–403), so the asset is "
+                                      "reachable and the proxy handles it fine — the "
+                                      "original `wget` escaped rather than failed. The "
+                                      "usual cause is a command started outside `exec` "
+                                      "(agent hook not firing); `init --check` on the CLI "
+                                      "verifies the hook.",
+                        },
+                        {
+                            "preamble": "Re-read the stats now the gap is filled.",
+                            "tool": "session_stats", "args": {},
+                            "result": {"session": "northwind", "total_execs": 13,
+                                       "total_flows": 211, "network_execs": 12,
+                                       "network_zero_flow_execs": 2,
+                                       "escaped_execs": [
+                                           {"exec_id": "exec-7701-3-1781449002000000000",
+                                            "cmd": "wget https://cdn.northwind.example/"
+                                                   "app.js"},
+                                           {"exec_id": "exec-7705-1-1781449551000000000",
+                                            "cmd": "nmap -sn 198.51.100.0/24"},
+                                       ]},
+                            "interp": "Three new flows, but be clear on what did **not** "
+                                      "change: `network_zero_flow_execs` is still 2 and "
+                                      "both entries remain in `escaped_execs`. These stats "
+                                      "are a historical record of each exec, not a "
+                                      "live-recomputed health score — re-running the "
+                                      "fetch adds a *new* successful exec, it does not "
+                                      "retroactively fix the old one. The coverage gap is "
+                                      "closed; the audit trail still shows it happened.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 3. Triage roll-up: what have I tagged, and bundle it into a group. -----
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "tag_list", "req_search", "group_new", "group_add",
+                  "group_show", "triage"],
+            exchanges=[
+                {
+                    "user": "Remind me what I've tagged in this session so far.",
+                    "steps": [{
+                        "preamble": "List the tags in use.",
+                        "tool": "tag_list", "args": {},
+                        "result": {"tags": [{"id": 1, "name": "idor"},
+                                            {"id": 2, "name": "xss"},
+                                            {"id": 3, "name": "auth-bypass"}]},
+                        "interp": "Three tags: `idor` (1), `xss` (2), `auth-bypass` (3). "
+                                  "`tag_list` returns the tag vocabulary, not the flows "
+                                  "wearing each tag — it tells you what you have been "
+                                  "calling things, which is what you want before writing "
+                                  "up findings.",
+                    }],
+                },
+                {
+                    "user": "Collect the IDOR evidence into something I can hand over.",
+                    "steps": [
+                        {
+                            "preamble": "Find the flows whose bodies show the leak.",
+                            "tool": "req_search", "args": {"query": "owner"},
+                            "result": {"flow_ids": [188, 191, 194]},
+                            "interp": "Three flows mention `owner` — the field that "
+                                      "exposed another account on the orders endpoint. "
+                                      "I'll bundle them under a named group.",
+                        },
+                        {
+                            "preamble": "Create the group.",
+                            "tool": "group_new",
+                            "args": {"name": "idor-orders",
+                                     "description": "GET /orders/{id} returns other "
+                                                    "users' orders"},
+                            "result": {"created": True, "group_id": 3,
+                                       "name": "idor-orders", "workspace_id": 1},
+                            "interp": "Group 3 created. `group_new` is create-or-update: "
+                                      "calling it again with the same name only rewrites "
+                                      "the description, so it is safe to re-run.",
+                        },
+                        {
+                            "preamble": "Attach the three flows.",
+                            "tool": "group_add",
+                            "args": {"name": "idor-orders", "flow_ids": [188, 191, 194]},
+                            "result": {"added": [188, 191, 194], "flow_count": 3,
+                                       "group_id": 3, "name": "idor-orders"},
+                            "interp": "All three attached; `flow_count:3` is the size "
+                                      "after the add. Adding a flow twice is a no-op.",
+                        },
+                        {
+                            "preamble": "Read the group back as the reviewer will see it.",
+                            "tool": "group_show", "args": {"name": "idor-orders"},
+                            "result": {"count": 3, "group": {
+                                "id": 3, "name": "idor-orders",
+                                "description": "GET /orders/{id} returns other users' "
+                                               "orders",
+                                "workspace_id": 1, "created_at": 1781451200310}, "flows": [
+                                {"id": 188, "authority": t.host, "method": "GET",
+                                 "path": "/orders/5012", "status": 200, "protocol": "h2"},
+                                {"id": 191, "authority": t.host, "method": "GET",
+                                 "path": "/orders/5013", "status": 200, "protocol": "h2"},
+                                {"id": 194, "authority": t.host, "method": "GET",
+                                 "path": "/orders/5014", "status": 200, "protocol": "h2"},
+                            ]},
+                            "interp": "The group renders like `req_list`: three `200`s on "
+                                      "consecutive `/orders/<id>` values, which is the "
+                                      "whole finding in one view. A group is a label, not "
+                                      "a move — the flows remain in the session and in "
+                                      "any other group. Use `session_export` when you "
+                                      "need the evidence as a portable bundle.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 4. Interception hygiene: narrow the scope, drop a beacon, stand down. --
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "intercept_scope", "intercept_enable",
+                  "await_intercept", "intercept_drop", "intercept_list",
+                  "intercept_disable", "intercept"],
+            exchanges=[
+                {
+                    "user": "I want to tamper the checkout POST, but last time every "
+                            "single request parked and the browser hung.",
+                    "steps": [
+                        {
+                            "preamble": "Narrow what blocks before turning interception on.",
+                            "tool": "intercept_scope",
+                            "args": {"host": t.host, "path": "/cart/checkout",
+                                     "method": "POST"},
+                            "result": {"ok": True},
+                            "interp": "Scope set. Only `POST` requests whose host and path "
+                                      "match will park; everything else passes straight "
+                                      "through and is *still captured*. Host and path are "
+                                      "case-insensitive substrings, `method` is exact — "
+                                      "so a path of `/cart/checkout` also catches "
+                                      "`/cart/checkout/confirm`.",
+                        },
+                        {
+                            "preamble": "Now enable interception.",
+                            "tool": "intercept_enable", "args": {},
+                            "result": {"ok": True},
+                            "interp": "Interception on, and scoped. Order matters here: "
+                                      "scope first, enable second, or you get exactly the "
+                                      "storm of parked requests you just described.",
+                        },
+                    ],
+                },
+                {
+                    "user": "OK, I clicked checkout.",
+                    "steps": [
+                        {
+                            "preamble": "Long-poll for the parked request.",
+                            "tool": "await_intercept", "args": {"timeout_secs": 60},
+                            "result": {"pending": True, "intercept": {
+                                "id": 4, "kind": "request", "host": t.host,
+                                "method": "POST", "path": "/cart/checkout/beacon"}},
+                            "interp": "Something parked, but read it before forwarding: "
+                                      "id 4 is `POST /cart/checkout/beacon`, not the "
+                                      "checkout itself. That is the substring match "
+                                      "biting — an analytics beacon under the same path "
+                                      "prefix. I'll drop it rather than forward it.",
+                        },
+                        {
+                            "preamble": "Drop the beacon so it never reaches the server.",
+                            "tool": "intercept_drop", "args": {"id": 4},
+                            "result": {"found": True},
+                            "interp": "Dropped (`found:true`) — the request is discarded, "
+                                      "the client sees a failed connection, and nothing "
+                                      "was sent upstream. `found:false` would mean the id "
+                                      "had already been forwarded or dropped; an id that "
+                                      "was never parked is an error "
+                                      "(`BW-INPUT-011`), not a silent no-op.",
+                        },
+                        {
+                            "preamble": "Check whether the real checkout is waiting.",
+                            "tool": "intercept_list", "args": {},
+                            "result": {"intercepts": [
+                                {"id": 5, "kind": "request", "host": t.host,
+                                 "method": "POST", "path": "/cart/checkout"},
+                            ]},
+                            "interp": "There it is — id 5, the genuine "
+                                      "`POST /cart/checkout`, parked and waiting. "
+                                      "`intercept_forward` it with `set_body` to tamper "
+                                      "the quantity or price. Unlike `await_intercept`, "
+                                      "`intercept_list` does not block: it is the "
+                                      "\"what's queued right now\" view.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Forwarded it manually. Stand interception down, I'm going "
+                            "back to passive capture.",
+                    "steps": [{
+                        "preamble": "Disable interception.",
+                        "tool": "intercept_disable", "args": {},
+                        "result": {"ok": True},
+                        "interp": "Interception off; traffic flows normally and is still "
+                                  "captured. Worth knowing: this stops the *parking*, it "
+                                  "does not clear the scope you set — re-enabling later "
+                                  "resumes with the same `/cart/checkout` filter. Call "
+                                  "`intercept_scope` with `clear:true` if you want the "
+                                  "next session to intercept everything again.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # --- 5. Token workshop over MCP: read a captured token, forge, replay. ------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "decode", "encode", "req_replay", "jwt", "authz"],
+            exchanges=[
+                {
+                    "user": "Flow 77 carries a JWT. What's actually in it?",
+                    "steps": [{
+                        "preamble": "Decode the token's segments.",
+                        "tool": "decode",
+                        "args": {"scheme": "jwt",
+                                 "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                                          "eyJzdWIiOiI1MDEyIiwicm9sZSI6ImN1c3RvbWVyIn0.Zm9v"},
+                        "result": {"scheme": "jwt", "alg": "HS256", "verified": False,
+                                   "header": {"alg": "HS256", "typ": "JWT"},
+                                   "claims": {"sub": "5012", "role": "customer"},
+                                   "signature": "Zm9v"},
+                        "interp": "`alg HS256`, claims `sub:5012` / `role:customer`. The "
+                                  "important member is `verified:false`: burpwn decodes, "
+                                  "it never checks the signature — so nothing here tells "
+                                  "you whether the *server* validates it. That is the "
+                                  "experiment to run.",
+                    }],
+                },
+                {
+                    "user": "So forge a role:admin payload and see if the server bites.",
+                    "steps": [
+                        {
+                            "preamble": "Encode the tampered payload segment.",
+                            "tool": "encode",
+                            "args": {"scheme": "base64url",
+                                     "value": '{"sub":"5012","role":"admin"}'},
+                            "result": {"scheme": "base64url",
+                                       "encoded": "eyJzdWIiOiI1MDEyIiwicm9sZSI6ImFkbWluIn0"},
+                            "interp": "Encoded. `base64url` is the right scheme for a JWT "
+                                      "segment: URL-safe alphabet, no `=` padding — plain "
+                                      "`base64` would produce a token the server rejects "
+                                      "as malformed before it ever reaches the signature "
+                                      "check, which would look like a false negative.",
+                        },
+                        {
+                            "preamble": "Replay flow 77 with the forged token spliced in.",
+                            "tool": "req_replay",
+                            "args": {"id": 77, "set_headers": [{
+                                "name": "Authorization",
+                                "value": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                                         "eyJzdWIiOiI1MDEyIiwicm9sZSI6ImFkbWluIn0.Zm9v"}]},
+                            "result": {"status": 401,
+                                       "response": "HTTP/1.1 401 Unauthorized\r\n"
+                                                   "content-type: application/json\r\n\r\n"
+                                                   "{\"error\":\"invalid signature\"}"},
+                            "interp": "`401 invalid signature` — the server **does** "
+                                      "verify HS256, so the naive payload swap is "
+                                      "correctly rejected. That is a negative result, and "
+                                      "it is worth reporting as one rather than moving on "
+                                      "quietly: it rules out the whole class. The "
+                                      "remaining angles are `alg:none` / algorithm "
+                                      "confusion (forge the *header* too and re-replay) "
+                                      "or a weak secret you could crack offline — not "
+                                      "more variations on this same swap.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 6. Rewrite-rule + auth-injection audit. -------------------------------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "match_replace_list", "match_replace_add",
+                  "session_auth_status", "session_auth_refresh", "auth"],
+            exchanges=[
+                {
+                    "user": "Everything started coming back 401 halfway through the run. "
+                            "What's rewriting my requests?",
+                    "steps": [
+                        {
+                            "preamble": "List the active rewrite rules.",
+                            "tool": "match_replace_list", "args": {},
+                            "result": {"rules": [
+                                {"id": 1, "scope": "", "match_kind": "header",
+                                 "pattern": "User-Agent", "replacement": "burpwn/0.3.4",
+                                 "on_request": True, "enabled": True},
+                                {"id": 2, "scope": "auth.fintrack.dev",
+                                 "match_kind": "header", "pattern": "Authorization",
+                                 "replacement": "Bearer eyJ0…q8Zg", "on_request": True,
+                                 "enabled": True},
+                            ]},
+                            "interp": "Two enabled request-side rules: a global User-Agent "
+                                      "override, and rule 2 injecting a bearer token on "
+                                      "`auth.fintrack.dev`. Rule 2 is the suspect — an "
+                                      "injected token that has since expired produces "
+                                      "exactly the 401 wall you are seeing. Note the rule "
+                                      "is still `enabled:true`; a stale token fails "
+                                      "loudly, not silently.",
+                        },
+                        {
+                            "preamble": "Check the auth profile behind that rule.",
+                            "tool": "session_auth_status", "args": {},
+                            "result": {"profiles": [{
+                                "id": 1, "host": "auth.fintrack.dev",
+                                "login_cmd": "curl -s https://auth.fintrack.dev/login "
+                                             "-d user=analyst -d pass=s3cr3t",
+                                "header_template": "Authorization: Bearer {}",
+                                "token_set": True, "token": "eyJ0…q8Zg", "rule_id": 3,
+                            }]},
+                            "interp": "Confirmed: profile 1 owns the injection. Note "
+                                      "`rule_id:3` here versus rule 2 in the list above — "
+                                      "the profile points at the rule id it *last* "
+                                      "installed, so a mismatch means the rule was "
+                                      "recreated (each `refresh` can install a new one). "
+                                      "The token is masked in output and never printed in "
+                                      "full.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Mint a fresh one.",
+                    "steps": [
+                        {
+                            "preamble": "Re-run the stored login through the sandbox.",
+                            "tool": "session_auth_refresh", "args": {"host": "auth.fintrack.dev"},
+                            "result": {"refreshed": [{"host": "auth.fintrack.dev",
+                                                      "rule_id": 4, "token": "eyJ0…7bQx"}]},
+                            "interp": "New token minted and installed as rule 4. The login "
+                                      "command runs **inside the sandbox**, so the "
+                                      "authentication exchange is itself captured — "
+                                      "convenient, but remember your credentials are now "
+                                      "in the session store too.",
+                        },
+                        {
+                            "preamble": "Re-read the rules to see the effect.",
+                            "tool": "match_replace_list", "args": {},
+                            "result": {"rules": [
+                                {"id": 1, "scope": "", "match_kind": "header",
+                                 "pattern": "User-Agent", "replacement": "burpwn/0.3.4",
+                                 "on_request": True, "enabled": True},
+                                {"id": 2, "scope": "auth.fintrack.dev",
+                                 "match_kind": "header", "pattern": "Authorization",
+                                 "replacement": "Bearer eyJ0…q8Zg", "on_request": True,
+                                 "enabled": False},
+                                {"id": 4, "scope": "auth.fintrack.dev",
+                                 "match_kind": "header", "pattern": "Authorization",
+                                 "replacement": "Bearer eyJ0…7bQx", "on_request": True,
+                                 "enabled": True},
+                            ]},
+                            "interp": "Rule 4 is live with the new token and the stale "
+                                      "rule 2 is now `enabled:false` — `refresh` "
+                                      "supersedes rather than deletes, so the history "
+                                      "stays visible. Retry the requests that were 401ing. "
+                                      "There is no MCP tool to remove a rule: the store "
+                                      "exposes add and list only, so rules accumulate for "
+                                      "the life of the session.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 7. Fuzz campaign review, days later. ----------------------------------
+    ffid = _idbase(_t("mobapi")) + 1
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "multi-turn", "fuzz_list", "fuzz_results", "note_add",
+                  "intruder", "triage"],
+            exchanges=[
+                {
+                    "user": "I ran some Intruder attacks on Friday and can't remember "
+                            "what I found. What's stored?",
+                    "steps": [{
+                        "preamble": "List the stored attacks.",
+                        "tool": "fuzz_list", "args": {},
+                        "result": {"attacks": [
+                            {"id": 1, "name": "login-bf", "workspace": "default",
+                             "base_flow_id": ffid, "status": "done", "results": 40,
+                             "created_ts": 1781190000000},
+                            {"id": 2, "name": "idor-sweep", "workspace": "default",
+                             "base_flow_id": ffid + 3, "status": "done", "results": 120,
+                             "created_ts": 1781193600000},
+                        ], "count": 2},
+                        "interp": "Two attacks survived the weekend: `login-bf` (40 "
+                                  "results) and `idor-sweep` (120). Attacks are stored in "
+                                  "the session, so they outlive the daemon — "
+                                  "`fuzz_results` replays what happened without re-running "
+                                  "anything against the target, which is the point when "
+                                  "you are reviewing rather than attacking.",
+                    }],
+                },
+                {
+                    "user": "The IDOR one. Show me only the interesting rows.",
+                    "steps": [
+                        {
+                            "preamble": "Pull attack 2's top results by anomaly score.",
+                            "tool": "fuzz_results",
+                            "args": {"attack_id": 2, "sort": "anomaly", "limit": 3},
+                            "result": {
+                                "attack": {"id": 2, "name": "idor-sweep", "status": "done",
+                                           "base_flow_id": ffid + 3, "mode": "sniper"},
+                                "results": [
+                                    {"id": 512, "payload": "5013", "status_code": 200,
+                                     "resp_len": 648, "latency_ms": 41,
+                                     "anomaly_score": 0.94},
+                                    {"id": 513, "payload": "5014", "status_code": 200,
+                                     "resp_len": 651, "latency_ms": 39,
+                                     "anomaly_score": 0.93},
+                                    {"id": 561, "payload": "9999", "status_code": 404,
+                                     "resp_len": 44, "latency_ms": 18,
+                                     "anomaly_score": 0.31},
+                                ], "count": 3},
+                            "interp": "Two clear hits: payloads `5013` and `5014` both "
+                                      "return `200` with ~650-byte bodies (anomaly "
+                                      "0.94/0.93) where `9999` correctly 404s. Full "
+                                      "records for ids you were never issued = IDOR. Be "
+                                      "precise about `anomaly_score` though: it is a "
+                                      "*statistical* outlier measure over status, length "
+                                      "and timing, not a vulnerability judgement — a "
+                                      "high score on a uniform error page means nothing. "
+                                      "Here the pattern happens to be real.",
+                        },
+                        {
+                            "preamble": "Record the conclusion on the base flow.",
+                            "tool": "note_add",
+                            "args": {"flow_id": ffid + 3,
+                                     "body": "idor-sweep (attack 2): ids 5013/5014 return "
+                                             "200 + full order body; 9999 404s. Sequential "
+                                             "order ids are enumerable."},
+                            "result": {"note_id": 4},
+                            "interp": "Noted on the base flow (note_id 4), which is where "
+                                      "you will look when writing this up — the attack id "
+                                      "alone is easy to lose. The MCP `note_add` takes "
+                                      "`body`; the CLI takes a positional `<TEXT>`.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    return out
+
+
 def fam_shell_offensive() -> list[dict[str, Any]]:
     """`Bash`-tool-call (shell) driving of the 0.2.0 offensive surface: fuzz,
     compare, encode/decode, session auth."""
@@ -6575,6 +7183,7 @@ FAMILIES = [
     fam_init_check_stats,
     fam_mcp_offensive,
     fam_mcp_offensive_convos,
+    fam_mcp_housekeeping_convos,
     fam_shell_offensive,
     # 0.3.x surface: groups, session bundle, hooks.
     fam_groups,
