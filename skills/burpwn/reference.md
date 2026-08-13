@@ -326,6 +326,13 @@ for the rest of the conversation: listings omit `null` members, `fuzz_results` d
 `raw_request` / `raw_response` **instead of** the decoded `headers`/`body` (the same bytes twice),
 keeping the decoded method / path / status / timings either way.
 
+`compare` is the one reply whose size the TARGET decides — two HTML pages that differ share almost
+no lines — so its `body.only_in_a` / `only_in_b` are capped at **200 lines per side**. The cut is
+never silent: the reply then carries `body.truncated = {only_in_a|only_in_b: {shown, total}}`, only
+for the sides actually cut and absent entirely when nothing was. Pass a larger `max_lines` for
+more, or a NEGATIVE `max_lines` for the whole diff (`0` or absent = the 200-line default). The
+`burpwn compare` CLI command is not capped: a human asking for a diff gets all of it.
+
 There is deliberately no `session_import` tool: loading a session file that came
 from somewhere else is an operator decision (`burpwn session import`), not
 something an agent should do on its own say-so.

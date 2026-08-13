@@ -838,6 +838,13 @@ pub fn fuzz_results(
 // --- compare ----------------------------------------------------------------
 
 /// `compare` — structured diff of two flows.
+///
+/// The one reply in this surface whose size is set by the TARGET rather than by
+/// the caller: two HTML pages that differ share almost no lines, so the raw
+/// per-side line lists run to thousands. They are capped here (200 lines a side
+/// by default, `max_lines` to change it, negative to lift it) and the cut is
+/// declared in `body.truncated` — a diff that quietly stops at line 200 would
+/// have the agent conclude things about a body it never saw.
 pub fn compare(
     paths: &Paths,
     session: &str,
@@ -868,7 +875,12 @@ pub fn compare(
         })?,
         None => burpwn_cli::compare::CompareWhat::All,
     };
-    Ok(burpwn_cli::compare::diff_flows(&a, &b, what))
+    let mut v = burpwn_cli::compare::diff_flows(&a, &b, what);
+    burpwn_cli::compare::cap_body_lines(
+        &mut v,
+        burpwn_cli::compare::resolve_max_lines(params.max_lines),
+    );
+    Ok(v)
 }
 
 // --- encode / decode --------------------------------------------------------
@@ -1240,6 +1252,91 @@ mod tests {
         drop(w);
         drop(store);
         fid
+    }
+
+    /// `compare` is the one reply whose size the target decides, so the MCP
+    /// path must cap it BY DEFAULT — and say that it did.
+    #[tokio::test]
+    async fn compare_caps_the_body_diff_and_declares_it() {
+        async fn seed_body(paths: &Paths, session: &str, body: Vec<u8>) -> i64 {
+            let store = open_store(paths, session).unwrap();
+            let w = store.writer();
+            let fid = w
+                .flow_start(FlowStart {
+                    workspace_id: 1,
+                    ts_start: 0,
+                    exec_id: None,
+                    client_addr: "127.0.0.1:1".into(),
+                    dst_ip: "1.2.3.4".into(),
+                    dst_port: 443,
+                    sni: Some("example.com".into()),
+                    scheme: "https".into(),
+                    protocol: Protocol::H1,
+                    intercepted: false,
+                })
+                .await
+                .unwrap();
+            w.request(
+                fid,
+                RequestData {
+                    method: "GET".into(),
+                    authority: "example.com".into(),
+                    path: "/page".into(),
+                    http_version: "HTTP/1.1".into(),
+                    headers: b"host: example.com\r\n".to_vec(),
+                    body: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            w.response(
+                fid,
+                ResponseData {
+                    status: 200,
+                    http_version: "HTTP/1.1".into(),
+                    headers: b"content-type: text/html\r\n".to_vec(),
+                    body,
+                    timing_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+            drop(w);
+            drop(store);
+            fid
+        }
+
+        let (_d, paths, s) = temp_session().await;
+        let big: Vec<u8> = (0..1_000)
+            .map(|i| format!("<div id=\"row-{i}\">a</div>\n"))
+            .collect::<String>()
+            .into_bytes();
+        let a = seed_body(&paths, &s, big).await;
+        let b = seed_body(&paths, &s, b"<div>denied</div>\n".to_vec()).await;
+
+        let params = crate::params::CompareParams {
+            flow_a: a,
+            flow_b: b,
+            what: None,
+            max_lines: None,
+        };
+        let v = compare(&paths, &s, &params).unwrap();
+        assert_eq!(v["body"]["only_in_a"].as_array().unwrap().len(), 200);
+        assert_eq!(v["body"]["truncated"]["only_in_a"]["shown"], 200);
+        assert_eq!(v["body"]["truncated"]["only_in_a"]["total"], 1_000);
+
+        // …and an agent that read the marker can ask for the whole thing.
+        let v = compare(
+            &paths,
+            &s,
+            &crate::params::CompareParams {
+                max_lines: Some(-1),
+                ..params
+            },
+        )
+        .unwrap();
+        assert_eq!(v["body"]["only_in_a"].as_array().unwrap().len(), 1_000);
+        assert!(v["body"].get("truncated").is_none());
     }
 
     #[tokio::test]

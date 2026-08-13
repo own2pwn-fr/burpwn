@@ -319,7 +319,9 @@ flows.
   is no import tool — opening a file from elsewhere is an operator decision).
   Repeater/Intruder:
   `req_replay` (Repeater parity — replay/edit stored flows), `fuzz`, `fuzz_list`,
-  `fuzz_results`. Analysis: `compare`, `encode`, `decode`. Auth: `session_auth_set`,
+  `fuzz_results`. Analysis: `compare` (its body line lists are capped at 200 per
+  side and say so via `body.truncated`; pass a negative `max_lines` for all of
+  it), `encode`, `decode`. Auth: `session_auth_set`,
   `session_auth_refresh`, `session_auth_status`. Interception: `intercept_enable`,
   `intercept_disable`, `intercept_list`, `await_intercept` (long-poll),
   `intercept_forward` (takes `method`/`path`), `intercept_scope`, `intercept_drop`.

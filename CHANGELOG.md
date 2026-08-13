@@ -5,6 +5,24 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — the MCP `compare` tool stops handing over a whole page of diff
+`compare` returns the body diff as two lists of lines, one per side. Two HTML pages that differ
+share almost no lines, so those lists are routinely thousands of lines long — and unlike every
+other reply in the tool surface, that size is set by the *target*, not by anything the caller
+asked for. It was the largest remaining token risk in the MCP surface.
+
+The MCP tool now caps them at **200 lines per side**, and never silently: when the cap cuts
+anything, the reply carries `body.truncated = { only_in_a: { shown, total }, only_in_b: … }`, with
+only the sides that were actually cut, and the object absent entirely when nothing was — like the
+`warning` on a raw bundle, a marker that means "there is more" must never appear where there is
+not. `max_lines` raises the cap; a **negative** `max_lines` lifts it completely, deliberately not
+spelled `0`, so "I did not think about it" and "I want the whole diff" can never be the same
+request. The tool description says all of this, because an agent that does not know its diff was
+cut will happily conclude things about a body it never saw.
+
+**The `burpwn compare` CLI is untouched**: a human who asked for a diff wants the diff. Capping is
+a separate, explicit step applied by the MCP handler, not a change to the diff itself.
+
 ### Fixed — a cold cache no longer costs the burst its token
 An `exec` hook runs one command at a time for the whole proxy, and the requests that lost that
 race were forwarded **un-hooked, immediately**. On a warm TTL cache nobody ever noticed. On a cold

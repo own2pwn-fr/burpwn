@@ -530,7 +530,7 @@ impl BurpwnServer {
     // --- compare / encode -------------------------------------------------
 
     #[tool(
-        description = "Structured diff of two flows: status-line delta, header add/remove/change, line-based body diff, and a reflection check (tokens from flow A's request echoed in flow B's response). what = headers|body|all."
+        description = "Structured diff of two flows: status-line delta, header add/remove/change, line-based body diff, and a reflection check (tokens from flow A's request echoed in flow B's response). what = headers|body|all. The body line lists are capped at 200 lines per side; when that cuts anything the reply carries body.truncated = {only_in_a|only_in_b: {shown, total}} — re-call with a larger max_lines (or a negative one for no cap) to get the rest."
     )]
     async fn compare(
         &self,
