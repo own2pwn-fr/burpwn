@@ -145,6 +145,67 @@ migrated on the way in, and one from a newer burpwn is refused rather than half-
 > responses. Bundles are written `0600`; move them the way you would move the credentials inside.
 > The CA private key is never included.
 
+## Output: aligned for you, terse for whatever reads it next
+
+burpwn is driven by people **and** by agents, and they want opposite things. So every command looks
+at what stdout actually is, once, at startup:
+
+**A terminal** gets columns measured on the data, headers, semantic colour (status classes, the
+fuzz anomaly gradient, your tag colours, `yes`/`NO`), and a summary footer. Long values are cut
+with an ellipsis so a row never wraps:
+
+```text
+$ burpwn req list --host api.example.com
+
+  ID  PROTO  METHOD  URL                                                          STATUS
+  12  https  GET     https://api.example.com/v2/users?page=1                         200
+  13  https  POST    https://api.example.com/v2/login                                401
+  14  https  POST    https://api.example.com/v2/login                                200
+  15  https  GET     https://api.example.com/v2/users/4711/permissions/effective…    403
+
+  4 flows  ·  workspace default  ·  group auth-flow
+```
+
+**A pipe, a file, or an agent's capture buffer** gets the data and nothing else: one record per
+line, TAB-separated, no header, no footer, no padding, no colour — and no truncation, so the value
+comes out whole. Decoration in a capture buffer is tokens the agent pays for on every later turn.
+
+```text
+$ burpwn req list --host api.example.com | cat
+12→https→GET→https://api.example.com/v2/users?page=1→200
+13→https→POST→https://api.example.com/v2/login→401
+14→https→POST→https://api.example.com/v2/login→200
+15→https→GET→https://api.example.com/v2/users/4711/permissions/effective?include=roles&expand=all→403
+```
+
+(`→` is a tab.) `awk` splits on it by default and `cut -f` uses it as its delimiter, so
+`burpwn req list | awk -F'\t' '$5>=500 {print $1}'` works; an empty field is emitted as `-` so the
+positions never shift. An empty listing prints **nothing** rather than `(no flows)`.
+
+The same split applies everywhere: `doctor` prints its checks in both modes but keeps the verdict
+line for the terminal (the exit code and `--json` already carry it), `req replay` drops the
+`replayed flow 42 -> 200` line and hands over just the response bytes, and `compare` / `decode jwt`
+come back as rows instead of re-indented JSON.
+
+```text
+$ burpwn doctor
+
+  unprivileged userns  yes
+  subuid entry         yes      informational
+  bubblewrap           yes      bwrap
+  nftables             NO       nft
+  iproute2             yes      ip
+  CA                   yes
+  probe dummy_device   ok
+  probe nft_redirect   ok
+
+  ready
+```
+
+**`--json`** is unchanged and remains the machine contract: exactly one envelope line on stdout and
+nothing else, ever. Colour follows [`NO_COLOR`](https://no-color.org) (present, any value → off)
+and `CLICOLOR_FORCE` (present, not `0` → on even in a pipe); `COLUMNS` overrides the detected width.
+
 ## Errors, exit codes and debug reports
 
 Every failure comes out the same way: a stable code, the verbatim cause chain,

@@ -37,6 +37,35 @@ fn open_store(paths: &Paths, session: &str) -> Result<Store> {
     Store::open(&db).with_context(|| format!("opening session store {}", db.display()))
 }
 
+/// Recursively drop `null` members from every object in `v`.
+///
+/// A tool result is not a screen, it is CONTEXT: whatever comes back is carried
+/// by the agent for the rest of the conversation and paid for on every
+/// subsequent turn. `"sni":null` costs a key, a colon, four letters and a comma
+/// to say precisely what an absent key says, and a capture of DNS and raw-TCP
+/// flows is mostly nulls — a listing of them shrinks by about a third. The
+/// shape is otherwise untouched: a consumer reading `row.sni` gets `undefined`
+/// instead of `null`, which every JSON consumer already treats the same way.
+///
+/// Only ever applied to LISTINGS, never to a single-value reply where a field
+/// being explicitly null is the answer.
+fn prune_nulls(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            map.retain(|_, val| !val.is_null());
+            for val in map.values_mut() {
+                prune_nulls(val);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                prune_nulls(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 // --- session ---------------------------------------------------------------
 
 /// `session_list` — names of all sessions + the active one.
@@ -111,30 +140,47 @@ pub fn req_list(
         ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
-    Ok(json!({ "flows": rows, "count": rows.len() }))
+    let mut flows = serde_json::to_value(&rows)?;
+    prune_nulls(&mut flows);
+    Ok(json!({ "flows": flows, "count": rows.len() }))
 }
 
 /// JSON view of a flow detail, bodies decoded as lossy UTF-8 (mirrors the CLI's
-/// `req show --json`). When `raw` is set, also include the verbatim head+body.
+/// `req show --json`).
+///
+/// When `raw` is set, the verbatim head+body goes in `raw_request` /
+/// `raw_response` and the decoded view drops its own `headers`/`body` copies:
+/// the raw form already contains them byte for byte, and sending a 40 KB
+/// response twice doubles what the agent pays to look at one flow. The decoded
+/// METADATA (method, path, status, timings) stays either way — it is what the
+/// agent branches on without reading the bytes.
 fn flow_detail_json(detail: &FlowDetail, raw: bool) -> Value {
     let req = detail.request.as_ref().map(|r| {
-        json!({
+        let mut v = json!({
             "method": r.method,
             "authority": r.authority,
             "path": r.path,
             "http_version": r.http_version,
-            "headers": String::from_utf8_lossy(&r.headers),
-            "body": String::from_utf8_lossy(&r.body),
-        })
+        });
+        if !raw {
+            let obj = v.as_object_mut().expect("object");
+            obj.insert("headers".into(), json!(String::from_utf8_lossy(&r.headers)));
+            obj.insert("body".into(), json!(String::from_utf8_lossy(&r.body)));
+        }
+        v
     });
     let resp = detail.response.as_ref().map(|r| {
-        json!({
+        let mut v = json!({
             "status": r.status,
             "http_version": r.http_version,
-            "headers": String::from_utf8_lossy(&r.headers),
-            "body": String::from_utf8_lossy(&r.body),
             "timing_ms": r.timing_ms,
-        })
+        });
+        if !raw {
+            let obj = v.as_object_mut().expect("object");
+            obj.insert("headers".into(), json!(String::from_utf8_lossy(&r.headers)));
+            obj.insert("body".into(), json!(String::from_utf8_lossy(&r.body)));
+        }
+        v
     });
     let mut v = json!({
         "id": detail.flow.id,
@@ -201,19 +247,25 @@ pub fn req_search(
 /// `workspace_list`.
 pub fn workspace_list(paths: &Paths, session: &str) -> Result<Value> {
     let store = open_store(paths, session)?;
-    Ok(json!({ "workspaces": store.reader().list_workspaces()? }))
+    let mut v = json!({ "workspaces": store.reader().list_workspaces()? });
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 /// `tag_list`.
 pub fn tag_list(paths: &Paths, session: &str) -> Result<Value> {
     let store = open_store(paths, session)?;
-    Ok(json!({ "tags": store.reader().list_tags()? }))
+    let mut v = json!({ "tags": store.reader().list_tags()? });
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 /// `match_replace_list`.
 pub fn match_replace_list(paths: &Paths, session: &str) -> Result<Value> {
     let store = open_store(paths, session)?;
-    Ok(json!({ "rules": store.reader().list_match_replace()? }))
+    let mut v = json!({ "rules": store.reader().list_match_replace()? });
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 // --- mutation --------------------------------------------------------------
@@ -332,7 +384,9 @@ pub fn hook_list(paths: &Paths, session: &str) -> Result<Value> {
         .iter()
         .map(burpwn_cli::hooks::to_json)
         .collect();
-    Ok(json!({ "hooks": hooks }))
+    let mut v = json!({ "hooks": hooks });
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 /// Resolve a hook id or fail with a code the agent can branch on.
@@ -485,7 +539,7 @@ pub fn group_show(
     let reader = store.reader();
     let group = resolve_group(&reader, &params.name, None)?;
     let flows = reader.flows_in_group(group.id)?;
-    Ok(json!({
+    let mut v = json!({
         "group": {
             "id": group.id,
             "name": group.name,
@@ -495,7 +549,9 @@ pub fn group_show(
         },
         "flows": flows,
         "count": flows.len(),
-    }))
+    });
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 /// `group_rm` — delete a group; the flows it held stay captured.
@@ -566,6 +622,7 @@ fn control_value(resp: burpwn_cli::control::ControlResponse) -> Result<Value> {
         })),
         R::Ack => Ok(json!({ "ok": true })),
         R::Intercepts { items } => Ok(json!({ "intercepts": items })),
+        // (a parked intercept has no optional fields to prune)
         R::Pending { item } => match item {
             Some(it) => Ok(json!({ "pending": true, "intercept": it })),
             None => Ok(json!({ "pending": false })),
@@ -744,7 +801,9 @@ pub fn fuzz_list(
     session: &str,
     params: &crate::params::FuzzListParams,
 ) -> Result<Value> {
-    burpwn_cli::fuzz::fuzz_list(paths, session, params.workspace.as_deref())
+    let mut v = burpwn_cli::fuzz::fuzz_list(paths, session, params.workspace.as_deref())?;
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 /// `fuzz_results` — one attack's per-payload results.
@@ -762,7 +821,18 @@ pub fn fuzz_results(
         })?,
         None => burpwn_cli::fuzz::ResultSort::Anomaly,
     };
-    burpwn_cli::fuzz::fuzz_show(paths, session, params.attack_id, sort, params.limit)
+    let mut v = burpwn_cli::fuzz::fuzz_show(paths, session, params.attack_id, sort, params.limit)?;
+    // Every result row carries the `attack_id` that was the ARGUMENT of this
+    // call — a few hundred rows repeating a number the caller just supplied.
+    if let Some(rows) = v["results"].as_array_mut() {
+        for row in rows {
+            if let Some(obj) = row.as_object_mut() {
+                obj.remove("attack_id");
+            }
+        }
+    }
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 // --- compare ----------------------------------------------------------------
@@ -877,7 +947,9 @@ pub fn session_auth_status(paths: &Paths, session: &str) -> Result<Value> {
             })
         })
         .collect();
-    Ok(json!({ "profiles": profiles }))
+    let mut v = json!({ "profiles": profiles });
+    prune_nulls(&mut v);
+    Ok(v)
 }
 
 /// `session_auth_refresh` — re-mint the token(s) + update the injection rule(s).
@@ -1234,6 +1306,63 @@ mod tests {
             burpwn_cli::diag::diagnose(&err).code,
             ErrorCode::InputFileExists
         );
+    }
+
+    /// A tool result is context the agent re-reads on every later turn, so the
+    /// two cheapest wins are pinned here: no `null` members in a listing, and
+    /// the raw bytes of a flow sent once rather than twice.
+    #[tokio::test]
+    async fn tool_replies_do_not_pay_for_nulls_or_duplicated_bodies() {
+        let (_d, paths, s) = temp_session().await;
+        let fid = seed_one_flow(&paths, &s).await;
+
+        let v = req_list(&paths, &s, &crate::params::ReqListParams::default()).unwrap();
+        let row = v["flows"][0].as_object().unwrap();
+        assert!(
+            row.values().all(|v| !v.is_null()),
+            "a null field is a key an agent pays for to learn nothing: {row:?}"
+        );
+        // Pruning removes members, never renames or reshapes them.
+        assert_eq!(row["id"], json!(fid));
+        assert_eq!(row["status"], json!(200));
+
+        let decoded = req_show(
+            &paths,
+            &s,
+            &crate::params::ReqShowParams {
+                id: fid,
+                raw: false,
+            },
+        )
+        .unwrap();
+        let raw = req_show(
+            &paths,
+            &s,
+            &crate::params::ReqShowParams { id: fid, raw: true },
+        )
+        .unwrap();
+        // Decoded view: the bytes, once. Raw view: the bytes, once, verbatim.
+        assert!(decoded["response"]["body"].is_string());
+        assert!(raw.get("raw_response").is_some());
+        assert!(
+            raw["response"].get("body").is_none(),
+            "the body came back twice: {raw}"
+        );
+        // …and the metadata an agent branches on is in both.
+        assert_eq!(raw["response"]["status"], decoded["response"]["status"]);
+        assert_eq!(raw["request"]["path"], decoded["request"]["path"]);
+        assert!(raw.to_string().len() < decoded.to_string().len() * 2);
+    }
+
+    #[test]
+    fn prune_nulls_only_removes_nulls() {
+        let mut v = json!({
+            "keep": 1,
+            "gone": null,
+            "nested": [{ "a": null, "b": "x" }],
+        });
+        prune_nulls(&mut v);
+        assert_eq!(v, json!({ "keep": 1, "nested": [{ "b": "x" }] }));
     }
 
     #[tokio::test]

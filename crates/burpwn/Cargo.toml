@@ -23,3 +23,9 @@ burpwn-cli.workspace = true
 burpwn-error.workspace = true
 burpwn-mcp.workspace = true
 burpwn-sandbox.workspace = true
+
+[dev-dependencies]
+# The output-contract test drives the real binary and needs a throwaway
+# HOME/XDG tree (see tests/cli_output.rs).
+tempfile = "3"
+serde_json.workspace = true

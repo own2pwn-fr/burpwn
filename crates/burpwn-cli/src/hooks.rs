@@ -316,8 +316,11 @@ fn check_template(template: &str, flag: &str) -> Result<()> {
     Ok(())
 }
 
-/// A one-line human rendering of a hook, for `hook list`.
-pub fn describe(hook: &Hook) -> String {
+/// The hook's match scope as one field (`*` when it matches everything). One
+/// half of the `hook list` / `hook show` row (the other is
+/// [`action_summary`]); they are separate fields because the listing puts them
+/// in separate columns.
+pub fn scope_summary(hook: &Hook) -> String {
     let mut scope = Vec::new();
     if !hook.scope.host.is_empty() {
         scope.push(format!("host~{}", hook.scope.host));
@@ -331,12 +334,16 @@ pub fn describe(hook: &Hook) -> String {
     if let Some(s) = hook.scope.status {
         scope.push(format!("status={s}"));
     }
-    let scope = if scope.is_empty() {
+    if scope.is_empty() {
         "*".to_string()
     } else {
         scope.join(" ")
-    };
-    let action = match &hook.action {
+    }
+}
+
+/// What the hook DOES, as one field.
+pub fn action_summary(hook: &Hook) -> String {
+    match &hook.action {
         HookAction::AddHeader { name, value } => format!("add-header {name}: {value}"),
         HookAction::SetHeader { name, value } => format!("set-header {name}: {value}"),
         HookAction::RemoveHeader { name } => format!("remove-header {name}"),
@@ -348,16 +355,7 @@ pub fn describe(hook: &Hook) -> String {
             inject.name,
             inject.value_template
         ),
-    };
-    format!(
-        "{:>4} [{}] {} {} {} (order {})",
-        hook.id,
-        if hook.enabled { "on" } else { "off" },
-        hook.phase.as_str(),
-        scope,
-        action,
-        hook.order
-    )
+    }
 }
 
 /// The JSON view of a hook, shared by the CLI and the MCP tools.

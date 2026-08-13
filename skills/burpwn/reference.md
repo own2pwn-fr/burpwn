@@ -7,6 +7,22 @@ Verified against `burpwn <cmd> --help`. Global option on every command:
 burpwn [--json] <command>
 ```
 
+## Output
+
+Every command looks at what stdout is, once, and renders accordingly.
+
+- **Not a terminal** (a tool call capturing stdout, a pipe, a redirect) — the data and nothing
+  else: one record per line, fields TAB-separated, no header row, no summary footer, no padding,
+  no colour, and **nothing truncated**. An empty listing prints nothing at all. Parse it with
+  `cut -f2` or `awk -F'\t' '{print $2}'`; an empty field comes out as `-` so positions never shift.
+- **A terminal** — the same rows with headers, columns measured on the data, semantic colour
+  (status classes, fuzz anomaly gradient, tag colours, `yes`/`NO`), a summary footer, and the
+  longest column ellipsised to fit the width.
+- **`--json`** — exactly one `{ok, data, error}` envelope line on stdout and nothing else. Use it
+  whenever you need typed values rather than columns.
+
+`NO_COLOR` disables colour, `CLICOLOR_FORCE` forces it, `COLUMNS` overrides the width.
+
 ## Errors
 
 Every failure carries a stable code, a cause chain, remediation, and a debug report.
@@ -298,6 +314,12 @@ closes). Exposes 42 tools: `session_list`, `session_current`, `session_stats`,
 `intercept_enable`, `intercept_disable`, `intercept_list`, `intercept_scope`,
 `await_intercept`, `intercept_forward`, `intercept_drop`, `exec`, `fuzz`,
 `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.
+
+Tool replies are kept as small as the answer allows, because a result is context the agent carries
+for the rest of the conversation: listings omit `null` members, `fuzz_results` does not repeat the
+`attack_id` it was called with, and `req_show` with `raw: true` returns the verbatim
+`raw_request` / `raw_response` **instead of** the decoded `headers`/`body` (the same bytes twice),
+keeping the decoded method / path / status / timings either way.
 
 There is deliberately no `session_import` tool: loading a session file that came
 from somewhere else is an operator decision (`burpwn session import`), not

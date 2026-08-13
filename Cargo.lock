@@ -236,6 +236,8 @@ dependencies = [
  "burpwn-sandbox",
  "clap",
  "rustls",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -245,6 +247,8 @@ dependencies = [
 name = "burpwn-cli"
 version = "0.3.4"
 dependencies = [
+ "anstream",
+ "anstyle",
  "anyhow",
  "async-trait",
  "burpwn-error",

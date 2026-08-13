@@ -27,6 +27,12 @@ burpwn-proxy.workspace = true
 burpwn-sandbox.workspace = true
 burpwn-wrap.workspace = true
 async-trait.workspace = true
+# Already in the workspace lock (clap pulls both for its own `color` feature),
+# so making them direct dependencies costs nothing in build weight: `anstyle`
+# describes a style, `anstream` writes it to a stream that strips escapes when
+# stdout is not a terminal. See `render.rs`.
+anstyle = "1.0"
+anstream = "1.0"
 libc.workspace = true
 # Already in the workspace lock (a burpwn-proxy dep); used by `session auth`
 # token extraction + injection-rule building.

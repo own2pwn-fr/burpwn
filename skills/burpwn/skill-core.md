@@ -329,7 +329,11 @@ flows.
   (`tls-passthru`) so you get connection metadata only, not decrypted bodies.
 - The **agent's own LLM/API traffic is never captured** — only what runs inside
   `exec`.
-- Global `--json` emits `{ok, data, error}`; `exec --json` puts its envelope on
-  **fd 3**, not stdout.
+- Global `--json` emits `{ok, data, error}` — exactly one line on stdout; `exec --json` puts its
+  envelope on **fd 3**, not stdout.
+- **Output adapts to what stdout is.** Captured by a tool call (never a terminal), every listing
+  comes back as TAB-separated records with no header, no footer, no padding and nothing truncated,
+  and an empty listing prints **nothing**. Slice it with `cut -f`/`awk -F'\t'`, or pass `--json`
+  when you want typed values. Do not expect the aligned columns and colours a human sees.
 
 Full command reference: run `burpwn <command> --help`.

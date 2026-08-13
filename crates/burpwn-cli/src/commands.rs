@@ -24,33 +24,77 @@ use crate::diag::WithCode;
 use crate::envelope::Envelope;
 use crate::exec;
 use crate::paths::{validate_session_name, Paths, DEFAULT_SESSION};
+use crate::render::{palette, Cell, Column, Render, Table};
 use crate::{har, replay, wrap_hook};
 
 /// How long `exec` waits for a freshly-spawned daemon's control socket.
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A renderer that prints either human text or a JSON envelope, tracking whether
-/// any output has been emitted to stdout (so `exec` knows whether to use fd 3).
+/// The single output path of every command.
+///
+/// There used to be two: [`Output::ok`] for "one line or one blob", and an
+/// open-coded `if json { println!(envelope) } else { … }` in every command that
+/// prints more than a line — thirty-one of them, each free to drift from the
+/// envelope it was supposed to mirror. Everything now goes through
+/// [`Output::emit`]: the JSON branch is written once, and the human branch is
+/// handed the [`Render`] decided at startup, so what a terminal gets and what a
+/// pipe gets are two renderings of the same values rather than two code paths.
 pub struct Output {
-    json: bool,
+    render: Render,
 }
 
 impl Output {
     fn new(json: bool) -> Self {
-        Self { json }
-    }
-
-    /// Emit a success result: `human` text in normal mode, the envelope in JSON.
-    fn ok(&self, human: impl AsRef<str>, data: Value) {
-        if self.json {
-            println!("{}", Envelope::ok(data).to_json_line());
-        } else {
-            let h = human.as_ref();
-            if !h.is_empty() {
-                println!("{h}");
-            }
+        Self {
+            render: Render::detect(json),
         }
     }
+
+    /// An output bound to an explicit renderer (tests, embedding).
+    pub fn with_render(render: Render) -> Self {
+        Self { render }
+    }
+
+    /// The rendering decision, for callers that build their own text.
+    fn render(&self) -> &Render {
+        &self.render
+    }
+
+    /// Whether stdout is reserved for the JSON envelope.
+    fn is_json(&self) -> bool {
+        self.render.is_json()
+    }
+
+    /// Emit a success: the envelope carrying `data` under `--json`, otherwise
+    /// the text `human` builds for the active mode. An empty string prints
+    /// nothing at all — that is how a listing says "no rows" to a pipe, where
+    /// `(no flows)` would be a line a parser has to know about.
+    fn emit(&self, data: Value, human: impl FnOnce(&Render) -> String) {
+        if self.render.is_json() {
+            println!("{}", Envelope::ok(data).to_json_line());
+            return;
+        }
+        let text = human(&self.render);
+        if !text.is_empty() {
+            // `anstream` strips any escape that reached here without a terminal
+            // behind it; the modes above are what decides the STRUCTURE.
+            anstream::println!("{text}");
+        }
+    }
+
+    /// Emit a success whose human form is one fixed line.
+    fn ok(&self, human: impl AsRef<str>, data: Value) {
+        self.emit(data, |_| human.as_ref().to_string());
+    }
+}
+
+/// Render a listing, or — for a human only — the note that says it is empty.
+/// A pipe gets nothing, which is what "no rows" looks like to `wc -l`.
+fn listing(r: &Render, table: &Table, empty: &str) -> String {
+    if table.is_empty() {
+        return r.aside(empty).unwrap_or_default();
+    }
+    table.render(r)
 }
 
 /// Dispatch entry point. Returns the process exit code.
@@ -102,27 +146,25 @@ fn cmd_skill(out: &Output, action: SkillAction) -> Result<i32> {
                     })
                 })
                 .collect();
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(json!({ "targets": rows })).to_json_line()
-                );
-            } else {
-                println!("Supported skill targets:");
-                for t in skill::targets() {
-                    let global = t.global_rel.unwrap_or("(project only)");
-                    println!(
-                        "  {:<12} {:<18} project={}  global={}",
-                        t.slug,
-                        t.format.label(),
-                        t.project_rel,
-                        global
-                    );
-                    if !t.note.is_empty() {
-                        println!("               note: {}", t.note);
-                    }
+            out.emit(json!({ "targets": rows }), |r| {
+                let mut t = Table::new(vec![
+                    Column::left("agent"),
+                    Column::left("format"),
+                    Column::left("project"),
+                    Column::left("global"),
+                    Column::left("note").truncatable(),
+                ]);
+                for target in skill::targets() {
+                    t.row(vec![
+                        Cell::styled(target.slug, palette::IDENT),
+                        Cell::new(target.format.label()),
+                        Cell::new(target.project_rel),
+                        Cell::new(target.global_rel.unwrap_or("")),
+                        Cell::new(target.note),
+                    ]);
                 }
-            }
+                t.render(r)
+            });
             Ok(0)
         }
         SkillAction::Install(args) => cmd_skill_install(out, args),
@@ -275,22 +317,30 @@ fn cmd_mcp_register(out: &Output, args: McpRegisterArgs) -> Result<i32> {
                 })
             })
             .collect();
-        if out.json {
-            println!("{}", Envelope::ok(json!({ "hosts": rows })).to_json_line());
-        } else {
-            println!("Supported MCP hosts (config relative to HOME):");
+        out.emit(json!({ "hosts": rows }), |r| {
+            let mut t = Table::new(vec![
+                Column::left("agent"),
+                Column::left("format"),
+                Column::left("config").truncatable(),
+            ]);
             for h in mcpreg::hosts() {
-                println!(
-                    "  {:<12} {:<5} {}",
-                    h.slug,
-                    match h.kind {
+                t.row(vec![
+                    Cell::styled(h.slug, palette::IDENT),
+                    Cell::new(match h.kind {
                         mcpreg::McpKind::Toml => "toml",
                         mcpreg::McpKind::Json => "json",
-                    },
-                    h.config_rel
-                );
+                    }),
+                    Cell::new(h.config_rel),
+                ]);
             }
-        }
+            let mut text = t.render(r);
+            if let Some(l) = r.aside("paths are relative to HOME") {
+                text.push('\n');
+                text.push('\n');
+                text.push_str(&l);
+            }
+            text
+        });
         return Ok(0);
     }
 
@@ -389,67 +439,116 @@ fn cmd_doctor(out: &Output, paths: &Paths, args: DoctorArgs) -> Result<i32> {
         })),
     });
 
-    if out.json {
-        println!("{}", Envelope::ok(data).to_json_line());
-        return Ok(if ok { 0 } else { 1 });
-    }
+    out.emit(data, |r| {
+        doctor_report(r, &pf, ca_present, probe.as_ref(), args.quick, ok)
+    });
+    Ok(if ok { 0 } else { 1 })
+}
 
-    let yn = |b: bool| if b { "yes" } else { "NO" };
-    println!("burpwn doctor:");
-    println!("  unprivileged userns : {}", yn(pf.userns_enabled));
-    println!("  subuid entry        : {}", yn(pf.subuid_present));
-    println!("  bwrap               : {}", yn(pf.bwrap_present));
-    println!("  nft                 : {}", yn(pf.nft_present));
-    println!("  ip                  : {}", yn(pf.ip_present));
-    println!("  CA present          : {}", yn(ca_present));
-    if let Some(p) = &probe {
-        println!("  live sandbox probe  :");
-        for step in &p.steps {
-            let mark = if step.ok {
-                "ok"
-            } else if step.required {
-                "FAIL"
-            } else {
-                "degraded"
-            };
-            print!("    {:<14} {mark}", step.name);
-            if step.ok {
-                println!();
-            } else {
-                println!(" — {}", step.detail.trim().replace('\n', " "));
+/// The doctor report as text: one `check  verdict  detail` row per
+/// prerequisite, and — for a human only — the verdict and what to do about it.
+///
+/// Pure, so both renderings are testable without a terminal: piped, this is a
+/// grep-able `nftables\tNO\tnot on PATH`; on a TTY it is the aligned block with
+/// the yes/NO coloured.
+fn doctor_report(
+    r: &Render,
+    pf: &burpwn_sandbox::Preflight,
+    ca_present: bool,
+    probe: Option<&burpwn_sandbox::ProbeReport>,
+    quick: bool,
+    ready: bool,
+) -> String {
+    let mut t = crate::render::kv_table();
+    let mut check = |name: &str, ok: bool, detail: &str| {
+        t.row(vec![
+            Cell::new(name),
+            Cell::styled(if ok { "yes" } else { "NO" }, palette::yes_no(ok)),
+            Cell::new(detail),
+        ]);
+    };
+    check("unprivileged userns", pf.userns_enabled, "");
+    check("subuid entry", pf.subuid_present, "informational");
+    check("bubblewrap", pf.bwrap_present, "bwrap");
+    check("nftables", pf.nft_present, "nft");
+    check("iproute2", pf.ip_present, "ip");
+    check(
+        "CA",
+        ca_present,
+        if ca_present {
+            ""
+        } else {
+            "run `burpwn ca init`"
+        },
+    );
+    match probe {
+        Some(p) => {
+            for step in &p.steps {
+                let (mark, style) = if step.ok {
+                    ("ok", palette::GOOD)
+                } else if step.required {
+                    ("FAIL", palette::BAD)
+                } else {
+                    ("degraded", palette::WARN)
+                };
+                t.row(vec![
+                    Cell::new(format!("probe {}", step.name)),
+                    Cell::styled(mark, style),
+                    Cell::new(step.detail.trim().replace('\n', " ")),
+                ]);
+            }
+            if p.wsl {
+                t.row(vec![
+                    Cell::new("host"),
+                    Cell::styled("WSL", palette::WARN),
+                    Cell::new(""),
+                ]);
             }
         }
-        if p.wsl {
-            println!("  host                : WSL");
+        None if quick => {
+            t.row(vec![
+                Cell::new("live sandbox probe"),
+                Cell::styled("skipped", palette::MUTED),
+                Cell::new("--quick"),
+            ]);
         }
-    } else if args.quick {
-        println!("  live sandbox probe  : skipped (--quick)");
+        None => {}
     }
 
-    if ok {
-        println!("=> ready");
-    } else {
-        let mut missing = pf.missing_summary();
-        if !ca_present {
+    let mut text = t.render(r);
+    // The verdict repeats what the rows already say and what the exit code
+    // already carries, so it is a courtesy to a human, not output.
+    if ready {
+        if let Some(l) = r.aside(r.paint("ready", palette::GOOD)) {
+            text.push_str("\n\n");
+            text.push_str(&l);
+        }
+        return text;
+    }
+    let mut missing = pf.missing_summary();
+    if !ca_present {
+        if !missing.is_empty() {
+            missing.push_str(", ");
+        }
+        missing.push_str("CA");
+    }
+    if let Some(p) = probe {
+        if !p.is_ok() {
             if !missing.is_empty() {
                 missing.push_str(", ");
             }
-            missing.push_str("CA (run `burpwn ca init`)");
-        }
-        if let Some(p) = &probe {
-            if !p.is_ok() {
-                if !missing.is_empty() {
-                    missing.push_str(", ");
-                }
-                missing.push_str(&p.summary());
-            }
-        }
-        println!("=> NOT ready: {missing}");
-        for line in probe.as_ref().map(|p| p.remediation()).unwrap_or_default() {
-            println!("   - {line}");
+            missing.push_str(&p.summary());
         }
     }
-    Ok(if ok { 0 } else { 1 })
+    if let Some(l) = r.aside(r.paint(&format!("NOT ready — {missing}"), palette::BAD)) {
+        text.push_str("\n\n");
+        text.push_str(&l);
+        for line in probe.map(|p| p.remediation()).unwrap_or_default() {
+            text.push_str("\n    \u{2192} ");
+            text.push_str(&line);
+        }
+    }
+    text
 }
 
 // --- debug reports ---------------------------------------------------------
@@ -489,41 +588,55 @@ fn cmd_debug_bundle(out: &Output, paths: &Paths, args: DebugBundleArgs) -> Resul
         format!("writing {}", path.display()),
     )?;
 
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(json!({"path": path.display().to_string(), "bytes": body.len()}))
-                .to_json_line()
-        );
-    } else {
-        println!("debug report written to {}", path.display());
-        println!("it contains no credentials (env values and token-shaped strings are redacted)");
-    }
+    out.emit(
+        json!({"path": path.display().to_string(), "bytes": body.len()}),
+        |r| {
+            // A pipe gets the path and nothing else: it is what the next
+            // command in the chain needs, and the reassurance about redaction
+            // is for the person deciding whether to attach the file.
+            let Some(l) = r.aside(format!("debug report written to {}", path.display())) else {
+                return path.display().to_string();
+            };
+            format!(
+                "{l}\n{}",
+                r.aside(
+                    "it contains no credentials (env values and token-shaped strings are redacted)"
+                )
+                .unwrap_or_default()
+            )
+        },
+    );
     Ok(0)
 }
 
 fn cmd_debug_list(out: &Output, paths: &Paths) -> Result<i32> {
     let dir = paths.debug_dir();
     let reports = debugreport::recent(&dir, 100);
-    if out.json {
-        let items: Vec<Value> = reports
-            .iter()
-            .map(|p| json!({"path": p.display().to_string()}))
-            .collect();
-        println!("{}", Envelope::ok(json!({"reports": items})).to_json_line());
-        return Ok(0);
-    }
-    if reports.is_empty() {
-        println!(
-            "no debug reports in {} (nothing has failed yet)",
-            dir.display()
-        );
-        return Ok(0);
-    }
-    println!("debug reports in {} (newest first):", dir.display());
-    for path in &reports {
-        println!("  {}", path.display());
-    }
+    let items: Vec<Value> = reports
+        .iter()
+        .map(|p| json!({"path": p.display().to_string()}))
+        .collect();
+    out.emit(json!({"reports": items}), |r| {
+        let mut t = Table::new(vec![Column::left("report").truncatable()]);
+        for path in &reports {
+            t.row(vec![Cell::new(path.display().to_string())]);
+        }
+        if !t.is_empty() {
+            t.footer(format!(
+                "{} report(s) in {}, newest first",
+                t.len(),
+                dir.display()
+            ));
+        }
+        listing(
+            r,
+            &t,
+            &format!(
+                "no debug reports in {} (nothing has failed yet)",
+                dir.display()
+            ),
+        )
+    });
     Ok(0)
 }
 
@@ -545,13 +658,10 @@ fn cmd_debug_show(out: &Output, paths: &Paths, path: Option<String>) -> Result<i
         ErrorCode::InputFileUnreadable,
         format!("reading {}", path.display()),
     )?;
-    if out.json {
-        // Re-emit as data so `--json` stays one envelope per invocation.
-        let doc: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        println!("{}", Envelope::ok(doc).to_json_line());
-    } else {
-        println!("{body}");
-    }
+    // Re-emit as data so `--json` stays one envelope per invocation; the
+    // human form is the file itself, verbatim, in every other mode.
+    let doc: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    out.emit(doc, |_| body.clone());
     Ok(0)
 }
 
@@ -642,26 +752,39 @@ fn cmd_init_check(out: &Output, home: &std::path::Path, agent: Option<&str>) -> 
         })
         .collect();
 
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(json!({ "checks": data, "ok": !failed })).to_json_line()
-        );
-    } else {
-        for r in &reports {
-            let mark = match r.verdict {
-                Verdict::Pass => "PASS",
-                Verdict::Fail => "FAIL",
-                Verdict::Advisory => "ADVISORY",
+    out.emit(json!({ "checks": data, "ok": !failed }), |r| {
+        let mut t = Table::new(vec![
+            Column::left("verdict"),
+            Column::left("agent"),
+            Column::left("detail").truncatable(),
+        ]);
+        for rep in &reports {
+            let (mark, style) = match rep.verdict {
+                Verdict::Pass => ("PASS", palette::GOOD),
+                Verdict::Fail => ("FAIL", palette::BAD),
+                Verdict::Advisory => ("ADVISORY", palette::WARN),
             };
-            println!("  {mark:<8} {:<12} {}", r.agent, r.detail);
+            t.row(vec![
+                Cell::styled(mark, style),
+                Cell::styled(rep.agent.clone(), palette::IDENT),
+                Cell::new(rep.detail.clone()),
+            ]);
         }
-        if failed {
-            println!("=> FAIL: at least one agent does not rewrite commands through `burpwn exec`");
+        let mut text = t.render(r);
+        let verdict = if failed {
+            r.paint(
+                "FAIL: at least one agent does not rewrite commands through `burpwn exec`",
+                palette::BAD,
+            )
         } else {
-            println!("=> ok");
+            r.paint("ok", palette::GOOD)
+        };
+        if let Some(l) = r.aside(verdict) {
+            text.push_str("\n\n");
+            text.push_str(&l);
         }
-    }
+        text
+    });
     Ok(if failed { 1 } else { 0 })
 }
 
@@ -741,7 +864,9 @@ fn cmd_ca(out: &Output, paths: &Paths, action: CaAction) -> Result<i32> {
             let ca = CertAuthority::load_or_generate(paths.ca_dir())
                 .map_err(|e| crate::coded!(ErrorCode::TlsCaLoad, "CA load failed: {e}"))?;
             let pem = ca.cert_pem();
-            if out.json {
+            // The PEM is the payload, not a rendering of it: no decoration in
+            // any mode, and no trailing newline added to a file format.
+            if out.is_json() {
                 println!("{}", Envelope::ok(json!({ "pem": pem })).to_json_line());
             } else {
                 print!("{pem}");
@@ -769,19 +894,17 @@ async fn cmd_session(out: &Output, paths: &Paths, action: SessionAction) -> Resu
         SessionAction::List => {
             let active = paths.active_session();
             let names = paths.list_sessions();
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(json!({ "active": active, "sessions": names })).to_json_line()
-                );
-            } else if names.is_empty() {
-                println!("(no sessions)");
-            } else {
+            out.emit(json!({ "active": active, "sessions": names }), |r| {
+                let mut t = Table::new(vec![Column::left("session"), Column::left("state")]);
                 for n in &names {
-                    let marker = if *n == active { "*" } else { " " };
-                    println!("{marker} {n}");
+                    let is_active = *n == active;
+                    t.row(vec![
+                        Cell::styled(n.clone(), palette::IDENT),
+                        Cell::styled(if is_active { "active" } else { "" }, palette::GOOD),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no sessions)")
+            });
             Ok(0)
         }
         SessionAction::Use { name } => {
@@ -847,10 +970,7 @@ fn cmd_session_import(
     let c = &outcome.counts;
     let m = &outcome.manifest;
 
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(json!({
+    let data = json!({
                 "session": outcome.session,
                 "from": {
                     "session": m.session,
@@ -869,33 +989,45 @@ fn cmd_session_import(
                 "notes": c.notes,
                 "attacks": c.attacks,
                 "warning": (!m.redacted).then_some(crate::bundle::RAW_WARNING),
-            }))
-            .to_json_line()
-        );
-        return Ok(0);
-    }
+    });
 
-    println!(
-        "imported session {} from {file} (exported from '{}' by burpwn {})",
-        outcome.session, m.session, m.burpwn_version
-    );
-    println!(
-        "  {} flows, {} workspaces, {} groups, {} tags, {} notes, {} attacks",
-        c.flows, c.workspaces, c.groups, c.tags, c.notes, c.attacks
-    );
-    if let Some(from) = outcome.migrated_from {
-        println!(
-            "  schema v{from} migrated up to v{}",
-            burpwn_store::schema::SCHEMA_VERSION
+    out.emit(data, |r| {
+        let mut text = format!(
+            "imported session {} from {file} ({} flows, {} workspaces, {} groups, \
+             {} tags, {} notes, {} attacks)",
+            outcome.session, c.flows, c.workspaces, c.groups, c.tags, c.notes, c.attacks
         );
-    }
-    if !m.redacted {
+        if let Some(l) = r.aside(format!(
+            "exported from '{}' by burpwn {}",
+            m.session, m.burpwn_version
+        )) {
+            text.push('\n');
+            text.push_str(&l);
+        }
+        if let Some(from) = outcome.migrated_from {
+            if let Some(l) = r.aside(format!(
+                "schema v{from} migrated up to v{}",
+                burpwn_store::schema::SCHEMA_VERSION
+            )) {
+                text.push('\n');
+                text.push_str(&l);
+            }
+        }
+        let next = if outcome.activated {
+            "it is now the active session".to_string()
+        } else {
+            format!("`burpwn session use {}` to switch to it", outcome.session)
+        };
+        if let Some(l) = r.aside(next) {
+            text.push('\n');
+            text.push_str(&l);
+        }
+        text
+    });
+    // The credential warning belongs on stderr in every non-JSON mode: it is
+    // not part of the result and must never reach a parser reading stdout.
+    if !m.redacted && !out.is_json() {
         eprintln!("⚠ {}", crate::bundle::RAW_WARNING);
-    }
-    if outcome.activated {
-        println!("  it is now the active session");
-    } else {
-        println!("  `burpwn session use {}` to switch to it", outcome.session);
     }
     Ok(0)
 }
@@ -917,36 +1049,63 @@ fn cmd_session_stats(out: &Output, paths: &Paths, session: Option<String>) -> Re
         .map(|e| json!({ "exec_id": e.exec_id, "cmd": e.cmd }))
         .collect();
 
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(json!({
-                "session": session,
-                "total_execs": stats.total_execs,
-                "total_flows": stats.total_flows,
-                "network_execs": stats.network_execs,
-                "network_zero_flow_execs": stats.network_zero_flow_execs,
-                "escaped_execs": escaped,
-            }))
-            .to_json_line()
-        );
-    } else {
-        println!("session {session}:");
-        println!("  execs recorded        : {}", stats.total_execs);
-        println!("  flows captured        : {}", stats.total_flows);
-        println!("  network-facing execs  : {}", stats.network_execs);
-        println!(
-            "  network execs w/ ZERO captures : {}",
-            stats.network_zero_flow_execs
-        );
-        if !escaped.is_empty() {
-            println!("  ⚠ traffic likely escaped capture for:");
+    out.emit(
+        json!({
+            "session": session,
+            "total_execs": stats.total_execs,
+            "total_flows": stats.total_flows,
+            "network_execs": stats.network_execs,
+            "network_zero_flow_execs": stats.network_zero_flow_execs,
+            "escaped_execs": escaped,
+        }),
+        |r| {
+            let zero = stats.network_zero_flow_execs;
+            let mut t = crate::render::kv_pair();
+            let mut row = |k: &str, v: String, style| {
+                t.row(vec![Cell::new(k), Cell::styled(v, style)]);
+            };
+            row(
+                "execs recorded",
+                stats.total_execs.to_string(),
+                palette::LABEL,
+            );
+            row(
+                "flows captured",
+                stats.total_flows.to_string(),
+                palette::LABEL,
+            );
+            row(
+                "network-facing execs",
+                stats.network_execs.to_string(),
+                palette::LABEL,
+            );
+            // The one number that means something is wrong, aligned like the
+            // rest of them: it used to be the one line that was NOT.
+            row(
+                "network execs, zero captures",
+                zero.to_string(),
+                if zero > 0 {
+                    palette::BAD
+                } else {
+                    palette::GOOD
+                },
+            );
             for e in &escaped {
-                println!("      {}", e["cmd"].as_str().unwrap_or("-"));
+                t.row(vec![
+                    Cell::styled("escaped capture", palette::WARN),
+                    Cell::new(e["cmd"].as_str().unwrap_or("")),
+                ]);
             }
-            println!("    (run `burpwn init --check` to verify the agent hook)");
-        }
-    }
+            let mut text = t.render(r);
+            if !escaped.is_empty() {
+                if let Some(l) = r.aside("run `burpwn init --check` to verify the agent hook") {
+                    text.push_str("\n\n");
+                    text.push_str(&l);
+                }
+            }
+            text
+        },
+    );
     Ok(0)
 }
 
@@ -990,26 +1149,28 @@ async fn cmd_session_auth(out: &Output, paths: &Paths, action: SessionAuthAction
                     })
                 })
                 .collect();
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(json!({ "profiles": view })).to_json_line()
-                );
-            } else if profiles.is_empty() {
-                println!("(no auth profiles)");
-            } else {
+            out.emit(json!({ "profiles": view }), |r| {
+                let mut t = Table::new(vec![
+                    Column::right("id"),
+                    Column::left("host"),
+                    Column::left("header").truncatable(),
+                    Column::left("token"),
+                ]);
                 for p in &profiles {
                     let scope = if p.host.is_empty() { "*" } else { &p.host };
-                    let tok = match &p.token {
-                        Some(t) => crate::auth::mask_token(t),
-                        None => "(none)".into(),
+                    let (tok, style) = match &p.token {
+                        Some(t) => (crate::auth::mask_token(t), palette::GOOD),
+                        None => ("none".to_string(), palette::MUTED),
                     };
-                    println!(
-                        "  {:>3} {:<24} header={:?} token={tok}",
-                        p.id, scope, p.header_template
-                    );
+                    t.row(vec![
+                        Cell::new(p.id.to_string()),
+                        Cell::new(scope),
+                        Cell::new(p.header_template.clone()),
+                        Cell::styled(tok, style),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no auth profiles)")
+            });
             Ok(0)
         }
         SessionAuthAction::Refresh { host, session } => {
@@ -1070,21 +1231,25 @@ async fn cmd_session_auth_refresh(
         }));
     }
 
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(json!({ "refreshed": results })).to_json_line()
-        );
-    } else {
-        for r in &results {
-            println!(
-                "refreshed auth for {} (rule {}, token {})",
-                r["host"].as_str().unwrap_or("*"),
-                r["rule_id"],
-                r["token"].as_str().unwrap_or("")
-            );
+    out.emit(json!({ "refreshed": results }), |r| {
+        let mut t = Table::new(vec![
+            Column::left("host"),
+            Column::right("rule"),
+            Column::left("token"),
+        ]);
+        for res in &results {
+            let host = res["host"].as_str().unwrap_or("");
+            t.row(vec![
+                Cell::new(if host.is_empty() { "*" } else { host }),
+                Cell::new(res["rule_id"].as_i64().unwrap_or(0).to_string()),
+                Cell::styled(res["token"].as_str().unwrap_or(""), palette::GOOD),
+            ]);
         }
-    }
+        if !t.is_empty() {
+            t.footer(format!("refreshed {} profile(s)", t.len()));
+        }
+        listing(r, &t, "(nothing to refresh)")
+    });
     Ok(0)
 }
 
@@ -1427,16 +1592,18 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
         ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(serde_json::to_value(&rows)?).to_json_line()
-        );
-    } else if rows.is_empty() {
-        println!("(no flows)");
-    } else {
-        print_flow_rows(&rows);
-    }
+    out.emit(serde_json::to_value(&rows)?, |r| {
+        let mut t = flow_table(&rows);
+        let mut scope = vec![format!("{} flows", rows.len())];
+        if let Some(w) = &args.workspace {
+            scope.push(format!("workspace {w}"));
+        }
+        if let Some(g) = &args.group {
+            scope.push(format!("group {g}"));
+        }
+        t.footer(scope.join("  ·  "));
+        listing(r, &t, "(no flows)")
+    });
     Ok(0)
 }
 
@@ -1465,35 +1632,43 @@ fn req_show(out: &Output, paths: &Paths, session: &str, id: i64, raw: bool) -> R
         return Ok(0);
     }
 
-    if out.json {
-        println!("{}", Envelope::ok(flow_detail_json(&detail)).to_json_line());
-    } else {
-        println!(
-            "flow {id}: {} -> {}",
-            detail.client_addr, detail.flow.dst_ip
-        );
+    out.emit(flow_detail_json(&detail), |r| {
+        let mut t = crate::render::kv_table();
+        t.row(vec![
+            Cell::new("flow"),
+            Cell::styled(id.to_string(), palette::IDENT),
+            Cell::new(format!("{} -> {}", detail.client_addr, detail.flow.dst_ip)),
+        ]);
         if let Some(req) = &detail.request {
-            println!(
-                "  request: {} {} ({} bytes body)",
-                req.method,
-                req.path,
-                req.body.len()
-            );
+            t.row(vec![
+                Cell::new("request"),
+                Cell::new(req.method.clone()),
+                Cell::new(format!("{} ({} bytes body)", req.path, req.body.len())),
+            ]);
         }
         if let Some(resp) = &detail.response {
-            println!(
-                "  response: {} ({} bytes body)",
-                resp.status,
-                resp.body.len()
-            );
+            t.row(vec![
+                Cell::new("response"),
+                Cell::styled(resp.status.to_string(), palette::status(resp.status)),
+                Cell::new(format!("{} bytes body", resp.body.len())),
+            ]);
         }
         if !detail.tags.is_empty() {
-            println!("  tags: {}", detail.tags.join(", "));
+            t.row(vec![
+                Cell::new("tags"),
+                Cell::new(detail.tags.join(",")),
+                Cell::new(""),
+            ]);
         }
         for note in &detail.notes {
-            println!("  note: {note}");
+            t.row(vec![
+                Cell::new("note"),
+                Cell::new(note.clone()),
+                Cell::new(""),
+            ]);
         }
-    }
+        t.render(r)
+    });
     Ok(0)
 }
 
@@ -1539,18 +1714,18 @@ fn flow_detail_json(detail: &burpwn_store::model::FlowDetail) -> Value {
 fn req_search(out: &Output, paths: &Paths, session: &str, query: &str) -> Result<i32> {
     let store = open_store(paths, session)?;
     let ids = store.reader().search(query)?;
-    if out.json {
-        println!(
-            "{}",
-            Envelope::ok(json!({ "flow_ids": ids })).to_json_line()
-        );
-    } else if ids.is_empty() {
-        println!("(no matches)");
-    } else {
+    out.emit(json!({ "flow_ids": ids }), |r| {
+        // Bare ids, one per line: the shape `burpwn req show $(…)` wants, and
+        // the one an agent can feed straight back into another call.
+        let mut t = Table::new(vec![Column::right("id")]);
         for id in &ids {
-            println!("{id}");
+            t.row(vec![Cell::styled(id.to_string(), palette::IDENT)]);
         }
-    }
+        if !t.is_empty() {
+            t.footer(format!("{} match(es)", ids.len()));
+        }
+        listing(r, &t, "(no matches)")
+    });
     Ok(0)
 }
 
@@ -1588,7 +1763,7 @@ async fn req_replay(
     let result =
         replay::replay_flow(&store, args.id, args.method.as_deref(), &headers, body).await?;
 
-    if out.json {
+    if out.is_json() {
         println!(
             "{}",
             Envelope::ok(json!({
@@ -1598,7 +1773,14 @@ async fn req_replay(
             .to_json_line()
         );
     } else {
-        println!("replayed flow {} -> {}", args.id, result.status);
+        // The response bytes ARE the result; the "replayed flow N -> 200" line
+        // above them is a courtesy to a human and noise in a capture buffer.
+        if let Some(l) = out
+            .render()
+            .aside(format!("replayed flow {} -> {}", args.id, result.status))
+        {
+            anstream::println!("{l}");
+        }
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(&result.raw_response);
         let _ = writeln!(stdout);
@@ -1693,11 +1875,7 @@ fn render_control(out: &Output, resp: ControlResponse) -> Result<()> {
         );
     }
     let data = serde_json::to_value(&resp).unwrap_or(Value::Null);
-    if out.json {
-        println!("{}", Envelope::ok(data).to_json_line());
-        return Ok(());
-    }
-    match resp {
+    out.emit(data, |r| match resp {
         ControlResponse::Status {
             session,
             intercept_enabled,
@@ -1705,35 +1883,74 @@ fn render_control(out: &Output, resp: ControlResponse) -> Result<()> {
             dns_port,
             ..
         } => {
-            println!(
-                "session {session}: intercept {}, {pending} pending, dns_port {dns_port}",
-                if intercept_enabled { "ON" } else { "off" }
-            );
+            let mut t = crate::render::kv_table();
+            t.row(vec![
+                Cell::new("session"),
+                Cell::styled(session, palette::IDENT),
+                Cell::new(""),
+            ]);
+            t.row(vec![
+                Cell::new("intercept"),
+                Cell::styled(
+                    if intercept_enabled { "ON" } else { "off" },
+                    if intercept_enabled {
+                        palette::WARN
+                    } else {
+                        palette::MUTED
+                    },
+                ),
+                Cell::new(format!("{pending} pending")),
+            ]);
+            t.row(vec![
+                Cell::new("dns port"),
+                Cell::new(dns_port.to_string()),
+                Cell::new(""),
+            ]);
+            t.render(r)
         }
-        ControlResponse::Ack => println!("ok"),
+        ControlResponse::Ack => "ok".to_string(),
         ControlResponse::Intercepts { items } => {
-            if items.is_empty() {
-                println!("(no parked intercepts)");
+            let mut t = intercept_table();
+            for i in &items {
+                t.row(intercept_row(i));
             }
-            for i in items {
-                println!(
-                    "{:>4} {:<8} {} {} {}",
-                    i.id, i.kind, i.method, i.host, i.path
-                );
-            }
+            listing(r, &t, "(no parked intercepts)")
         }
         ControlResponse::Pending { item } => match item {
-            Some(i) => println!("{} {} {} {} {}", i.id, i.kind, i.method, i.host, i.path),
-            None => println!("(timed out, none parked)"),
+            Some(i) => {
+                let mut t = intercept_table();
+                t.row(intercept_row(&i));
+                t.render(r)
+            }
+            None => r.aside("(timed out, none parked)").unwrap_or_default(),
         },
-        ControlResponse::Resolved { found } => {
-            println!("resolved");
-            let _ = found; // `found: false` is rejected before we get here.
-        }
+        ControlResponse::Resolved { .. } => "resolved".to_string(),
         // Already turned into a coded failure above.
         ControlResponse::Error { .. } => unreachable!("handled before rendering"),
-    }
+    });
     Ok(())
+}
+
+/// The parked-intercept listing: `intercept list` and `intercept await` show
+/// the same row, because the id in it is what `forward`/`drop` takes next.
+fn intercept_table() -> Table {
+    Table::new(vec![
+        Column::right("id"),
+        Column::left("phase"),
+        Column::left("method"),
+        Column::left("host"),
+        Column::left("path").truncatable(),
+    ])
+}
+
+fn intercept_row(i: &crate::control::InterceptItem) -> Vec<Cell> {
+    vec![
+        Cell::styled(i.id.to_string(), palette::IDENT),
+        Cell::new(i.kind.clone()),
+        Cell::new(i.method.clone()),
+        Cell::new(i.host.clone()),
+        Cell::new(i.path.clone()),
+    ]
 }
 
 // --- match-replace ---------------------------------------------------------
@@ -1772,27 +1989,40 @@ async fn cmd_match_replace(out: &Output, paths: &Paths, action: MatchReplaceActi
         }
         MatchReplaceAction::List => {
             let rules = store.reader().list_match_replace()?;
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(serde_json::to_value(&rules)?).to_json_line()
-                );
-            } else if rules.is_empty() {
-                println!("(no rules)");
-            } else {
-                for r in &rules {
-                    println!(
-                        "{:>4} [{}] {} {:?} {:?} -> {:?} ({})",
-                        r.id,
-                        if r.enabled { "on" } else { "off" },
-                        r.scope,
-                        r.match_kind,
-                        r.pattern,
-                        r.replacement,
-                        if r.on_request { "request" } else { "response" }
-                    );
+            out.emit(serde_json::to_value(&rules)?, |r| {
+                let mut t = Table::new(vec![
+                    Column::right("id"),
+                    Column::left("state"),
+                    Column::left("on"),
+                    Column::left("scope"),
+                    Column::left("kind"),
+                    Column::left("pattern").truncatable(),
+                    Column::left("replacement").truncatable(),
+                ]);
+                for rule in &rules {
+                    t.row(vec![
+                        Cell::styled(rule.id.to_string(), palette::IDENT),
+                        Cell::styled(
+                            if rule.enabled { "on" } else { "off" },
+                            if rule.enabled {
+                                palette::GOOD
+                            } else {
+                                palette::MUTED
+                            },
+                        ),
+                        Cell::new(if rule.on_request {
+                            "request"
+                        } else {
+                            "response"
+                        }),
+                        Cell::new(rule.scope.clone()),
+                        Cell::new(format!("{:?}", rule.match_kind).to_lowercase()),
+                        Cell::new(rule.pattern.clone()),
+                        Cell::new(rule.replacement.clone()),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no rules)")
+            });
         }
         MatchReplaceAction::Rm { id } => {
             store.writer().delete_match_replace(id).await?;
@@ -1824,6 +2054,37 @@ fn resolve_hook(store: &Store, id: i64) -> Result<burpwn_store::model::Hook> {
         Some(h) => Ok(h),
         None => crate::fail!(ErrorCode::InputNoSuchHook, "no such hook: {id}"),
     }
+}
+
+/// The hook listing: id, state, phase, scope, action, order — the same row for
+/// `hook list` and `hook show`, since the second is the first plus its knobs.
+fn hook_table() -> Table {
+    Table::new(vec![
+        Column::right("id"),
+        Column::left("state"),
+        Column::left("phase"),
+        Column::left("scope").truncatable(),
+        Column::left("action").truncatable(),
+        Column::right("order"),
+    ])
+}
+
+fn hook_row(h: &burpwn_store::model::Hook) -> Vec<Cell> {
+    vec![
+        Cell::styled(h.id.to_string(), palette::IDENT),
+        Cell::styled(
+            if h.enabled { "on" } else { "off" },
+            if h.enabled {
+                palette::GOOD
+            } else {
+                palette::MUTED
+            },
+        ),
+        Cell::new(h.phase.as_str()),
+        Cell::new(crate::hooks::scope_summary(h)),
+        Cell::new(crate::hooks::action_summary(h)),
+        Cell::new(h.order.to_string()),
+    ]
 }
 
 async fn cmd_hook(out: &Output, paths: &Paths, action: HookAction) -> Result<i32> {
@@ -1869,30 +2130,38 @@ async fn cmd_hook(out: &Output, paths: &Paths, action: HookAction) -> Result<i32
         }
         HookAction::List => {
             let hooks = store.reader().list_hooks()?;
-            if out.json {
-                let rows: Vec<Value> = hooks.iter().map(crate::hooks::to_json).collect();
-                println!("{}", Envelope::ok(json!({ "hooks": rows })).to_json_line());
-            } else if hooks.is_empty() {
-                println!("(no hooks)");
-            } else {
+            let rows: Vec<Value> = hooks.iter().map(crate::hooks::to_json).collect();
+            out.emit(json!({ "hooks": rows }), |r| {
+                let mut t = hook_table();
                 for h in &hooks {
-                    println!("{}", crate::hooks::describe(h));
+                    t.row(hook_row(h));
                 }
-            }
+                listing(r, &t, "(no hooks)")
+            });
         }
         HookAction::Show { id } => {
             let hook = resolve_hook(&store, id)?;
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(crate::hooks::to_json(&hook)).to_json_line()
-                );
-            } else {
-                println!("{}", crate::hooks::describe(&hook));
-                println!("     name       {}", hook.name);
-                println!("     timeout_ms {}", hook.timeout_ms);
-                println!("     ttl_ms     {}", hook.ttl_ms);
-            }
+            out.emit(crate::hooks::to_json(&hook), |r| {
+                let mut t = hook_table();
+                t.row(hook_row(&hook));
+                let mut text = t.render(r);
+                let mut kv = crate::render::kv_pair();
+                kv.row(vec![
+                    Cell::new("name"),
+                    Cell::styled(hook.name.clone(), palette::IDENT),
+                ]);
+                kv.row(vec![
+                    Cell::new("timeout_ms"),
+                    Cell::new(hook.timeout_ms.to_string()),
+                ]);
+                kv.row(vec![
+                    Cell::new("ttl_ms"),
+                    Cell::new(hook.ttl_ms.to_string()),
+                ]);
+                text.push('\n');
+                text.push_str(&kv.render(r));
+                text
+            });
         }
         HookAction::Rm { id } => {
             resolve_hook(&store, id)?;
@@ -1938,23 +2207,58 @@ async fn cmd_hook(out: &Output, paths: &Paths, action: HookAction) -> Result<i32
                 runner.as_ref().map(|r| r as &dyn burpwn_proxy::HookRunner),
             )
             .await?;
-            if out.json {
-                println!("{}", Envelope::ok(report).to_json_line());
-            } else {
-                println!(
-                    "hook {id} on flow {flow}: matched={} changed={} dropped={}",
-                    report["matched"], report["changed"], report["dropped"]
-                );
+            out.emit(report.clone(), |r| {
+                let flag = |k: &str| report[k].as_bool().unwrap_or(false);
+                let yes_no =
+                    |b: bool| Cell::styled(if b { "yes" } else { "no" }, palette::yes_no(b));
+                let mut t = crate::render::kv_table();
+                t.row(vec![
+                    Cell::new("hook"),
+                    Cell::styled(id.to_string(), palette::IDENT),
+                    Cell::new(format!("on flow {flow}")),
+                ]);
+                t.row(vec![
+                    Cell::new("matched"),
+                    yes_no(flag("matched")),
+                    Cell::new(""),
+                ]);
+                t.row(vec![
+                    Cell::new("changed"),
+                    yes_no(flag("changed")),
+                    Cell::new(""),
+                ]);
+                t.row(vec![
+                    Cell::new("dropped"),
+                    yes_no(flag("dropped")),
+                    Cell::new(""),
+                ]);
                 if let Some(exec) = report["exec"].as_object() {
-                    println!("  exec: {}", Value::Object(exec.clone()));
+                    t.row(vec![
+                        Cell::new("exec"),
+                        Cell::new(Value::Object(exec.clone()).to_string()),
+                        Cell::new(""),
+                    ]);
                 }
-                println!("  before: {}", report["before"]["url"]);
-                println!("  after:  {}", report["after"]["url"]);
-                println!(
-                    "{}",
-                    report["after"]["headers"].as_str().unwrap_or_default()
-                );
-            }
+                t.row(vec![
+                    Cell::new("before"),
+                    Cell::new(report["before"]["url"].as_str().unwrap_or("").to_string()),
+                    Cell::new(""),
+                ]);
+                t.row(vec![
+                    Cell::new("after"),
+                    Cell::new(report["after"]["url"].as_str().unwrap_or("").to_string()),
+                    Cell::new(""),
+                ]);
+                let mut text = t.render(r);
+                // The rewritten header block is the thing being debugged, so it
+                // is printed verbatim rather than squeezed into a column.
+                let headers = report["after"]["headers"].as_str().unwrap_or_default();
+                if !headers.is_empty() {
+                    text.push('\n');
+                    text.push_str(headers.trim_end());
+                }
+                text
+            });
         }
     }
     Ok(0)
@@ -1978,16 +2282,16 @@ async fn cmd_workspace(out: &Output, paths: &Paths, action: WorkspaceAction) -> 
         }
         WorkspaceAction::List => {
             let ws = store.reader().list_workspaces()?;
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(serde_json::to_value(&ws)?).to_json_line()
-                );
-            } else {
+            out.emit(serde_json::to_value(&ws)?, |r| {
+                let mut t = Table::new(vec![Column::right("id"), Column::left("workspace")]);
                 for w in &ws {
-                    println!("{:>4} {}", w.id, w.name);
+                    t.row(vec![
+                        Cell::styled(w.id.to_string(), palette::IDENT),
+                        Cell::new(w.name.clone()),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no workspaces)")
+            });
         }
         WorkspaceAction::Use { name } => {
             // Resolve to an id for the caller's convenience; persistence of the
@@ -2019,21 +2323,23 @@ async fn cmd_tag(out: &Output, paths: &Paths, action: TagAction) -> Result<i32> 
         }
         TagAction::List => {
             let tags = store.reader().list_tags()?;
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(serde_json::to_value(&tags)?).to_json_line()
-                );
-            } else if tags.is_empty() {
-                println!("(no tags)");
-            } else {
-                for t in &tags {
-                    match &t.color {
-                        Some(c) => println!("{:>4} {} ({c})", t.id, t.name),
-                        None => println!("{:>4} {}", t.id, t.name),
-                    }
+            out.emit(serde_json::to_value(&tags)?, |r| {
+                let mut t = Table::new(vec![
+                    Column::right("id"),
+                    Column::left("tag"),
+                    Column::left("color"),
+                ]);
+                for tag in &tags {
+                    // The colour has been in the table since v1 and coloured
+                    // nothing until now: on a terminal the tag wears it.
+                    t.row(vec![
+                        Cell::styled(tag.id.to_string(), palette::IDENT),
+                        Cell::styled(tag.name.clone(), palette::tag(tag.color.as_deref())),
+                        Cell::new(tag.color.clone().unwrap_or_default()),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no tags)")
+            });
         }
     }
     Ok(0)
@@ -2055,18 +2361,19 @@ async fn cmd_note(out: &Output, paths: &Paths, action: NoteAction) -> Result<i32
         }
         NoteAction::List { flow_id } => {
             let notes = store.reader().flow_notes(flow_id)?;
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(serde_json::to_value(&notes)?).to_json_line()
-                );
-            } else if notes.is_empty() {
-                println!("(no notes)");
-            } else {
+            out.emit(serde_json::to_value(&notes)?, |r| {
+                let mut t = Table::new(vec![
+                    Column::right("id"),
+                    Column::left("note").truncatable(),
+                ]);
                 for n in &notes {
-                    println!("{:>4} {}", n.id, n.body);
+                    t.row(vec![
+                        Cell::styled(n.id.to_string(), palette::IDENT),
+                        Cell::new(n.body.clone()),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no notes)")
+            });
         }
     }
     Ok(0)
@@ -2099,26 +2406,45 @@ fn resolve_group(store: &Store, name: &str, workspace_id: Option<i64>) -> Result
     }
 }
 
-/// Print flow summary rows, one per line — shared by `req list` and
-/// `group show` so a group renders exactly like the listing it came from.
-fn print_flow_rows(rows: &[burpwn_store::model::FlowRow]) {
+/// The flow listing, shared by `req list` and `group show` so a group reads
+/// exactly like the listing it came from.
+///
+/// Widths are measured on the rows, not hard-coded: one long URL used to push
+/// every later column out of line for the whole listing. The URL is also the
+/// only column allowed to give ground when the terminal is too narrow — the id,
+/// the method and the status are what the NEXT command takes as arguments, so
+/// losing a character of them would be losing the point.
+fn flow_table(rows: &[burpwn_store::model::FlowRow]) -> Table {
+    let mut t = Table::new(vec![
+        Column::right("id"),
+        Column::left("proto"),
+        Column::left("method"),
+        Column::left("url").truncatable(),
+        Column::right("status"),
+    ]);
     for r in rows {
-        println!(
-            "{:>6}  {:<5} {:<4} {}://{}{}  -> {}",
-            r.id,
-            r.protocol.as_str(),
-            r.method.as_deref().unwrap_or("-"),
-            r.scheme,
-            r.authority
-                .as_deref()
-                .or(r.sni.as_deref())
-                .unwrap_or(&r.dst_ip),
-            r.path.as_deref().unwrap_or(""),
-            r.status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "-".into()),
-        );
+        let host = r
+            .authority
+            .as_deref()
+            .or(r.sni.as_deref())
+            .unwrap_or(&r.dst_ip);
+        let (status, style) = match r.status {
+            Some(s) => (s.to_string(), palette::status(s)),
+            None => ("-".to_string(), palette::MUTED),
+        };
+        t.row(vec![
+            Cell::styled(r.id.to_string(), palette::IDENT),
+            Cell::new(r.protocol.as_str()),
+            Cell::new(r.method.clone().unwrap_or_default()),
+            Cell::new(format!(
+                "{}://{host}{}",
+                r.scheme,
+                r.path.as_deref().unwrap_or("")
+            )),
+            Cell::styled(status, style),
+        ]);
     }
+    t
 }
 
 async fn cmd_group(out: &Output, paths: &Paths, action: GroupAction) -> Result<i32> {
@@ -2211,49 +2537,50 @@ async fn cmd_group(out: &Output, paths: &Paths, action: GroupAction) -> Result<i
                     "flow_count": count,
                 }));
             }
-            if out.json {
-                println!("{}", Envelope::ok(json!({ "groups": view })).to_json_line());
-            } else if groups.is_empty() {
-                println!("(no groups)");
-            } else {
+            out.emit(json!({ "groups": view }), |r| {
+                let mut t = Table::new(vec![
+                    Column::right("id"),
+                    Column::left("group"),
+                    Column::right("flows"),
+                    Column::left("description").truncatable(),
+                ]);
                 for (g, v) in groups.iter().zip(&view) {
-                    let count = v["flow_count"].as_i64().unwrap_or(0);
-                    println!("{:>4} {} ({count} flows)", g.id, g.name);
-                    if let Some(d) = &g.description {
-                        println!("      {d}");
-                    }
+                    t.row(vec![
+                        Cell::styled(g.id.to_string(), palette::IDENT),
+                        Cell::new(g.name.clone()),
+                        Cell::new(v["flow_count"].as_i64().unwrap_or(0).to_string()),
+                        Cell::new(g.description.clone().unwrap_or_default()),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no groups)")
+            });
         }
         GroupAction::Show { name } => {
             let group = resolve_group(&store, &name, None)?;
             let rows = store.reader().flows_in_group(group.id)?;
-            if out.json {
-                println!(
-                    "{}",
-                    Envelope::ok(json!({
-                        "group": {
-                            "id": group.id,
-                            "name": group.name,
-                            "description": group.description,
-                            "workspace_id": group.workspace_id,
-                            "created_at": group.created_at,
-                        },
-                        "flows": rows,
-                        "count": rows.len(),
-                    }))
-                    .to_json_line()
-                );
-            } else {
-                if let Some(d) = &group.description {
-                    println!("{}: {d}", group.name);
-                }
-                if rows.is_empty() {
-                    println!("(no flows in group {name})");
-                } else {
-                    print_flow_rows(&rows);
-                }
-            }
+            out.emit(
+                json!({
+                    "group": {
+                        "id": group.id,
+                        "name": group.name,
+                        "description": group.description,
+                        "workspace_id": group.workspace_id,
+                        "created_at": group.created_at,
+                    },
+                    "flows": rows,
+                    "count": rows.len(),
+                }),
+                |r| {
+                    let mut t = flow_table(&rows);
+                    let mut foot = format!("{} flows  ·  group {}", rows.len(), group.name);
+                    if let Some(d) = &group.description {
+                        foot.push_str("  ·  ");
+                        foot.push_str(d);
+                    }
+                    t.footer(foot);
+                    listing(r, &t, &format!("(no flows in group {name})"))
+                },
+            );
         }
         GroupAction::Rm { name } => {
             let group = resolve_group(&store, &name, None)?;
@@ -2317,11 +2644,16 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
                     );
                 }
                 None => {
-                    if out.json {
-                        println!("{}", Envelope::ok(har).to_json_line());
-                    } else {
-                        println!("{text}");
-                    }
+                    // A HAR on stdout is a file, not a listing: it goes out
+                    // whole. Indented for a human, compact for a pipe — the
+                    // indentation of a 5 MB export is pure padding to a parser.
+                    out.emit(har.clone(), |r| {
+                        if r.is_pretty() {
+                            text.clone()
+                        } else {
+                            har.to_string()
+                        }
+                    });
                 }
             }
             Ok(0)
@@ -2343,29 +2675,29 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
                 },
             )?;
             let m = &outcome.manifest;
-            if out.json {
-                // The warning goes in the envelope, never on stdout as prose:
-                // the MCP layer parses the last stdout line as the envelope.
-                println!(
-                    "{}",
-                    Envelope::ok(json!({
-                        "path": outcome.path.display().to_string(),
-                        "bytes": outcome.bytes,
-                        "session": m.session,
-                        "flows": m.flow_count,
-                        "schema_version": m.schema_version,
-                        "redacted": m.redacted,
-                        "warning": outcome.warning(),
-                    }))
-                    .to_json_line()
-                );
-            } else {
-                println!(
-                    "wrote {} ({} flows, {} bytes)",
-                    outcome.path.display(),
-                    m.flow_count,
-                    outcome.bytes
-                );
+            // The warning goes in the envelope (never on stdout as prose: the
+            // MCP layer parses the last stdout line as the envelope) and on
+            // stderr everywhere else.
+            out.emit(
+                json!({
+                    "path": outcome.path.display().to_string(),
+                    "bytes": outcome.bytes,
+                    "session": m.session,
+                    "flows": m.flow_count,
+                    "schema_version": m.schema_version,
+                    "redacted": m.redacted,
+                    "warning": outcome.warning(),
+                }),
+                |_| {
+                    format!(
+                        "wrote {} ({} flows, {} bytes)",
+                        outcome.path.display(),
+                        m.flow_count,
+                        outcome.bytes
+                    )
+                },
+            );
+            if !out.is_json() {
                 eprintln!("⚠ {}", outcome.warning());
             }
             Ok(0)
@@ -2382,31 +2714,103 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
 
 // --- fuzz (Intruder) --------------------------------------------------------
 
+/// A `serde_json` scalar rendered as the value it holds.
+///
+/// This is the fix for a real bug in both Intruder tables: the numbers came
+/// straight out of a [`Value`] and were interpolated as one, so `{:>6}` padded
+/// nothing at all (`Display for Value` ignores the formatter's width) and a
+/// string payload arrived with its JSON quotes still attached. Pulling the
+/// scalar out first is what makes the column line up AND the payload readable.
+fn num(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The payload cell: `fuzz run` reports a LIST of payloads (one per position),
+/// `fuzz show` the single stored string.
+fn payload_text(v: &Value) -> String {
+    match v {
+        Value::Array(items) => items.iter().map(num).collect::<Vec<_>>().join(" "),
+        other => num(other),
+    }
+}
+
+/// The ranked Intruder results table. `first` names the leading column because
+/// `fuzz show` lists stored result ids and `fuzz run` the payload index.
+fn fuzz_result_table(first: &'static str) -> Table {
+    Table::new(vec![
+        Column::right(first),
+        Column::right("status"),
+        Column::right("len"),
+        Column::right("ms"),
+        Column::right("anomaly"),
+        Column::left("payload").truncatable(),
+    ])
+}
+
+/// One result row. The anomaly score carries the gradient: this is the one
+/// listing whose whole purpose is that the outlier is seen before it is read.
+fn fuzz_result_row(
+    id: &Value,
+    status: &Value,
+    len: &Value,
+    ms: &Value,
+    anomaly: &Value,
+    payload: &Value,
+) -> Vec<Cell> {
+    let score = anomaly.as_f64().unwrap_or(0.0);
+    let status_cell = match status.as_i64().and_then(|c| u16::try_from(c).ok()) {
+        Some(code) => Cell::styled(code.to_string(), palette::status(code)),
+        None => Cell::styled("", palette::MUTED),
+    };
+    vec![
+        Cell::styled(num(id), palette::IDENT),
+        status_cell,
+        Cell::new(num(len)),
+        Cell::new(num(ms)),
+        Cell::styled(format!("{score:.3}"), palette::anomaly(score)),
+        Cell::new(payload_text(payload)),
+    ]
+}
+
 async fn cmd_fuzz(out: &Output, paths: &Paths, action: FuzzAction) -> Result<i32> {
     let session = paths.active_session();
     match action {
         FuzzAction::Run(args) => cmd_fuzz_run(out, paths, &session, args).await,
         FuzzAction::List { workspace } => {
             let v = crate::fuzz::fuzz_list(paths, &session, workspace.as_deref())?;
-            if out.json {
-                println!("{}", Envelope::ok(v).to_json_line());
-            } else {
+            out.emit(v.clone(), |r| {
                 let empty = Vec::new();
                 let rows = v["attacks"].as_array().unwrap_or(&empty);
-                if rows.is_empty() {
-                    println!("(no attacks)");
-                }
+                let mut t = Table::new(vec![
+                    Column::right("id"),
+                    Column::left("status"),
+                    Column::left("name").truncatable(),
+                    Column::right("flow"),
+                    Column::right("results"),
+                ]);
                 for a in rows {
-                    println!(
-                        "{:>4} [{}] {} (flow {}, {} results)",
-                        a["id"].as_i64().unwrap_or(0),
-                        a["status"].as_str().unwrap_or("-"),
-                        a["name"].as_str().unwrap_or("-"),
-                        a["base_flow_id"],
-                        a["results"].as_i64().unwrap_or(0),
-                    );
+                    let status = a["status"].as_str().unwrap_or("");
+                    t.row(vec![
+                        Cell::styled(a["id"].as_i64().unwrap_or(0).to_string(), palette::IDENT),
+                        Cell::styled(
+                            status,
+                            match status {
+                                "done" => palette::GOOD,
+                                "running" | "pending" => palette::WARN,
+                                _ => palette::MUTED,
+                            },
+                        ),
+                        Cell::new(a["name"].as_str().unwrap_or("")),
+                        Cell::new(num(&a["base_flow_id"])),
+                        Cell::new(a["results"].as_i64().unwrap_or(0).to_string()),
+                    ]);
                 }
-            }
+                listing(r, &t, "(no attacks)")
+            });
             Ok(0)
         }
         FuzzAction::Show {
@@ -2421,26 +2825,28 @@ async fn cmd_fuzz(out: &Output, paths: &Paths, action: FuzzAction) -> Result<i32
                 )
             })?;
             let v = crate::fuzz::fuzz_show(paths, &session, attack_id, sort, limit)?;
-            if out.json {
-                println!("{}", Envelope::ok(v).to_json_line());
-            } else {
+            out.emit(v.clone(), |r| {
                 let empty = Vec::new();
                 let rows = v["results"].as_array().unwrap_or(&empty);
-                if rows.is_empty() {
-                    println!("(no results)");
+                let mut t = fuzz_result_table("id");
+                for res in rows {
+                    t.row(fuzz_result_row(
+                        &res["id"],
+                        &res["status_code"],
+                        &res["resp_len"],
+                        &res["latency_ms"],
+                        &res["anomaly_score"],
+                        &res["payload"],
+                    ));
                 }
-                for r in rows {
-                    println!(
-                        "{:>4}  {:>3}  len {:>6}  {:>5}ms  anomaly {:.3}  {}",
-                        r["id"].as_i64().unwrap_or(0),
-                        r["status_code"],
-                        r["resp_len"],
-                        r["latency_ms"],
-                        r["anomaly_score"].as_f64().unwrap_or(0.0),
-                        r["payload"].as_str().unwrap_or(""),
-                    );
+                if !t.is_empty() {
+                    t.footer(format!(
+                        "{} results  ·  attack {attack_id}  ·  most anomalous first",
+                        t.len()
+                    ));
                 }
-            }
+                listing(r, &t, "(no results)")
+            });
             Ok(0)
         }
     }
@@ -2523,32 +2929,36 @@ async fn cmd_fuzz_run(
     sig.abort();
     let v = result?;
 
-    if out.json {
-        println!("{}", Envelope::ok(v).to_json_line());
-    } else {
-        println!(
-            "attack {} ({}): {} results, status {}",
+    out.emit(v.clone(), |r| {
+        let empty = Vec::new();
+        let mut t = fuzz_result_table("#");
+        for res in v["results"].as_array().unwrap_or(&empty) {
+            t.row(fuzz_result_row(
+                &res["index"],
+                &res["status"],
+                &res["resp_len"],
+                &res["latency_ms"],
+                &res["anomaly"],
+                &res["payloads"],
+            ));
+        }
+        let mut foot = format!(
+            "{} results  ·  attack {} ({})  ·  {}",
+            t.len(),
             v["attack_id"].as_i64().unwrap_or(0),
             v["mode"].as_str().unwrap_or("-"),
-            v["results"].as_array().map(|a| a.len()).unwrap_or(0),
             v["status"].as_str().unwrap_or("-"),
         );
         if let Some(b) = v["baseline"].as_object() {
-            println!("  baseline: status {} len {}", b["status"], b["resp_len"]);
+            foot.push_str(&format!(
+                "  ·  baseline {} / {} bytes",
+                num(b.get("status").unwrap_or(&Value::Null)),
+                num(b.get("resp_len").unwrap_or(&Value::Null)),
+            ));
         }
-        let empty = Vec::new();
-        for r in v["results"].as_array().unwrap_or(&empty) {
-            println!(
-                "  {:>4}  {:>3}  len {:>6}  {:>5}ms  anomaly {:.3}  {}",
-                r["index"].as_i64().unwrap_or(0),
-                r["status"],
-                r["resp_len"],
-                r["latency_ms"],
-                r["anomaly"].as_f64().unwrap_or(0.0),
-                r["payloads"],
-            );
-        }
-    }
+        t.footer(foot);
+        listing(r, &t, "(no results)")
+    });
     Ok(0)
 }
 
@@ -2572,35 +2982,117 @@ fn cmd_compare(out: &Output, paths: &Paths, args: CompareArgs) -> Result<i32> {
         )
     })?;
     let v = crate::compare::diff_flows(&a, &b, what);
-    if out.json {
-        println!("{}", Envelope::ok(v).to_json_line());
-    } else {
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    }
+    out.emit(v.clone(), |r| compare_report(r, &v));
     Ok(0)
+}
+
+/// The diff as rows instead of the pretty-printed JSON blob it used to be:
+/// `serde_json::to_string_pretty` is a machine format shown to a human, and it
+/// costs a piped consumer three lines and a pile of punctuation per header.
+fn compare_report(r: &Render, v: &Value) -> String {
+    let mut t = crate::render::kv_table();
+    let changed = v["status"]["changed"].as_bool().unwrap_or(false);
+    t.row(vec![
+        Cell::new("status"),
+        Cell::styled(
+            format!("{} -> {}", num(&v["status"]["a"]), num(&v["status"]["b"])),
+            if changed {
+                palette::WARN
+            } else {
+                palette::MUTED
+            },
+        ),
+        Cell::new(""),
+    ]);
+    for (mark, key, style) in [
+        ("header +", "added", palette::GOOD),
+        ("header -", "removed", palette::BAD),
+        ("header ~", "changed", palette::WARN),
+    ] {
+        for item in v["headers"][key].as_array().into_iter().flatten() {
+            let detail = if key == "changed" {
+                format!("{} -> {}", num(&item["a"]), num(&item["b"]))
+            } else {
+                num(&item["value"])
+            };
+            t.row(vec![
+                Cell::styled(mark, style),
+                Cell::new(num(&item["name"])),
+                Cell::new(detail),
+            ]);
+        }
+    }
+    if let Some(body) = v["body"].as_object() {
+        let identical = body["identical"].as_bool().unwrap_or(false);
+        t.row(vec![
+            Cell::new("body"),
+            Cell::styled(
+                if identical { "identical" } else { "differs" },
+                if identical {
+                    palette::MUTED
+                } else {
+                    palette::WARN
+                },
+            ),
+            Cell::new(format!(
+                "{} -> {} bytes",
+                num(&body["len_a"]),
+                num(&body["len_b"])
+            )),
+        ]);
+        for (mark, key) in [("body -", "only_in_a"), ("body +", "only_in_b")] {
+            for line in body[key].as_array().into_iter().flatten() {
+                t.row(vec![Cell::new(mark), Cell::new(num(line)), Cell::new("")]);
+            }
+        }
+        // A request token echoed back in the response is the finding this
+        // command exists to surface, so it is coloured like one.
+        for tok in body["reflected"].as_array().into_iter().flatten() {
+            t.row(vec![
+                Cell::styled("reflected", palette::BAD),
+                Cell::new(num(tok)),
+                Cell::new(""),
+            ]);
+        }
+    }
+    t.render(r)
 }
 
 // --- encode / decode --------------------------------------------------------
 
 fn cmd_encode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
     let v = crate::encode::encode(scheme, value)?;
-    if out.json {
-        println!("{}", Envelope::ok(v).to_json_line());
-    } else {
-        println!("{}", v["encoded"].as_str().unwrap_or(""));
-    }
+    out.emit(v.clone(), |_| {
+        v["encoded"].as_str().unwrap_or("").to_string()
+    });
     Ok(0)
 }
 
 fn cmd_decode(out: &Output, scheme: &str, value: &str) -> Result<i32> {
     let v = crate::encode::decode(scheme, value)?;
-    if out.json {
-        println!("{}", Envelope::ok(v).to_json_line());
-    } else if scheme.eq_ignore_ascii_case("jwt") {
-        println!("{}", serde_json::to_string_pretty(&v)?);
-    } else {
-        println!("{}", v["decoded"].as_str().unwrap_or(""));
-    }
+    let jwt = scheme.eq_ignore_ascii_case("jwt");
+    out.emit(v.clone(), |r| {
+        if !jwt {
+            return v["decoded"].as_str().unwrap_or("").to_string();
+        }
+        // A JWT is a claim set, not a document: one `claim  value` row each,
+        // instead of the re-indented JSON this used to print.
+        let mut t = crate::render::kv_pair();
+        t.row(vec![
+            Cell::new("alg"),
+            Cell::styled(num(&v["alg"]), palette::IDENT),
+        ]);
+        if let Some(claims) = v["claims"].as_object() {
+            for (k, val) in claims {
+                t.row(vec![Cell::new(format!("claim {k}")), Cell::new(num(val))]);
+            }
+        }
+        t.row(vec![
+            Cell::new("signature"),
+            Cell::styled("not verified", palette::WARN),
+        ]);
+        t.render(r)
+    });
     Ok(0)
 }
 
@@ -3339,6 +3831,201 @@ mod tests {
         drop(held);
         t.join().unwrap();
         assert_eq!(inside.load(Ordering::SeqCst), 1);
+    }
+
+    // --- rendering ---------------------------------------------------------
+    //
+    // The formatters are pure `(data, mode) -> String`, so both renderings are
+    // pinned here without a terminal, a subprocess or a snapshot file. What is
+    // being defended is the RULE: a pipe gets the data and nothing else.
+
+    #[tokio::test]
+    async fn flow_listing_renders_data_only_to_a_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let fid = populate(&paths, "default").await;
+        let store = open_store(&paths, "default").unwrap();
+        let rows = store.reader().list_flows(&FlowFilter::default()).unwrap();
+
+        let mut t = flow_table(&rows);
+        t.footer("1 flows  ·  workspace default");
+
+        let terse = t.render(&Render::terse());
+        assert_eq!(
+            terse,
+            format!("{fid}\th1\tGET\thttp://example.com/search?q=needle\t200")
+        );
+        assert!(!terse.contains("METHOD"), "header leaked into a pipe");
+        assert!(!terse.contains('·'), "footer leaked into a pipe");
+
+        let pretty = t.render(&Render::pretty(100).without_color());
+        let lines: Vec<&str> = pretty.lines().collect();
+        assert!(lines[0].contains("METHOD") && lines[0].contains("STATUS"));
+        assert!(lines[1].contains("http://example.com/search?q=needle"));
+        assert_eq!(
+            lines.last().unwrap().trim(),
+            "1 flows  ·  workspace default"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_listing_says_nothing_to_a_pipe() {
+        let t = flow_table(&[]);
+        assert_eq!(listing(&Render::terse(), &t, "(no flows)"), "");
+        assert_eq!(
+            listing(&Render::pretty(80).without_color(), &t, "(no flows)"),
+            "  (no flows)"
+        );
+    }
+
+    /// A long URL used to break the alignment of the whole listing, because the
+    /// widths were literals (`{:>6}`) rather than measurements. On a terminal it
+    /// is now the URL that gives ground; in a pipe nothing is lost at all.
+    #[test]
+    fn a_long_url_truncates_on_a_terminal_and_never_in_a_pipe() {
+        let long = format!("/v2/users/4711/permissions/{}", "e".repeat(120));
+        let rows = vec![burpwn_store::model::FlowRow {
+            id: 15,
+            workspace_id: 1,
+            ts_start: 0,
+            ts_end: None,
+            protocol: Protocol::H1,
+            scheme: "https".into(),
+            dst_ip: "10.0.0.1".into(),
+            dst_port: 443,
+            sni: None,
+            method: Some("GET".into()),
+            authority: Some("api.example.com".into()),
+            path: Some(long.clone()),
+            status: Some(403),
+            intercepted: false,
+        }];
+        let t = flow_table(&rows);
+        let pretty = t.render(&Render::pretty(80).without_color());
+        assert!(pretty.contains('…'));
+        for line in pretty.lines() {
+            assert!(line.chars().count() <= 80, "{line:?}");
+        }
+        // The id and the status — what the next command takes as arguments —
+        // survive the squeeze intact.
+        assert!(pretty.contains("15"));
+        assert!(pretty.contains("403"));
+        let terse = t.render(&Render::terse());
+        assert!(terse.ends_with(&format!("{long}\t403")));
+    }
+
+    #[test]
+    fn doctor_report_renders_both_modes() {
+        let pf = burpwn_sandbox::Preflight {
+            userns_enabled: true,
+            subuid_present: true,
+            bwrap_present: true,
+            nft_present: false,
+            ip_present: true,
+        };
+        let terse = doctor_report(&Render::terse(), &pf, false, None, true, false);
+        assert!(terse.contains("nftables\tNO\tnft"), "{terse}");
+        assert!(terse.contains("CA\tNO\t"), "{terse}");
+        // The verdict and the remediation are for a human: the exit code and
+        // the `--json` payload already carry them for everyone else.
+        assert!(!terse.contains("NOT ready"), "{terse}");
+
+        let pretty = doctor_report(
+            &Render::pretty(90).without_color(),
+            &pf,
+            false,
+            None,
+            true,
+            false,
+        );
+        assert!(pretty.contains("NOT ready — "), "{pretty}");
+        assert!(pretty.starts_with("  unprivileged userns  yes"), "{pretty}");
+    }
+
+    /// Regression: these values arrive as `serde_json::Value`s, and formatting
+    /// one directly means `{:>6}` pads nothing and a string payload prints with
+    /// its JSON quotes on.
+    #[test]
+    fn fuzz_rows_format_scalars_not_json_values() {
+        let row = fuzz_result_row(
+            &json!(3),
+            &json!(500),
+            &json!(1234),
+            &json!(42),
+            &json!(0.8712),
+            &json!(["' OR 1=1--"]),
+        );
+        let texts: Vec<&str> = row.iter().map(Cell::text).collect();
+        assert_eq!(texts, vec!["3", "500", "1234", "42", "0.871", "' OR 1=1--"]);
+
+        // A request that never got a response has no status and no length.
+        let row = fuzz_result_row(
+            &json!(4),
+            &Value::Null,
+            &Value::Null,
+            &json!(9),
+            &Value::Null,
+            &json!("x"),
+        );
+        let texts: Vec<&str> = row.iter().map(Cell::text).collect();
+        assert_eq!(texts, vec!["4", "", "", "9", "0.000", "x"]);
+
+        // …and the columns line up, which is the point of measuring them.
+        let mut t = fuzz_result_table("id");
+        t.row(fuzz_result_row(
+            &json!(1),
+            &json!(200),
+            &json!(9),
+            &json!(3),
+            &json!(0.1),
+            &json!("a"),
+        ));
+        t.row(fuzz_result_row(
+            &json!(2),
+            &json!(500),
+            &json!(123456),
+            &json!(1200),
+            &json!(0.99),
+            &json!("bb"),
+        ));
+        let pretty = t.render(&Render::pretty(100).without_color());
+        let cols: Vec<usize> = pretty
+            .lines()
+            .skip(1)
+            .map(|l| l.find("0.").expect("an anomaly score on every data row"))
+            .collect();
+        assert_eq!(cols[0], cols[1], "anomaly column is not aligned: {pretty}");
+    }
+
+    #[test]
+    fn compare_report_is_rows_not_pretty_printed_json() {
+        let v = json!({
+            "status": { "a": 200, "b": 403, "changed": true },
+            "headers": {
+                "added": [{ "name": "X-Trace", "value": "abc" }],
+                "removed": [],
+                "changed": [{ "name": "Content-Length", "a": "12", "b": "40" }],
+            },
+            "body": {
+                "identical": false,
+                "len_a": 12,
+                "len_b": 40,
+                "only_in_a": [],
+                "only_in_b": ["denied"],
+                "reflected": ["needle"],
+            },
+        });
+        let terse = compare_report(&Render::terse(), &v);
+        assert!(terse.contains("status\t200 -> 403"), "{terse}");
+        assert!(terse.contains("header +\tX-Trace\tabc"), "{terse}");
+        assert!(
+            terse.contains("header ~\tContent-Length\t12 -> 40"),
+            "{terse}"
+        );
+        assert!(terse.contains("reflected\tneedle"), "{terse}");
+        // No JSON punctuation survives into the human/pipe rendering.
+        assert!(!terse.contains('{'), "{terse}");
     }
 
     #[tokio::test]
