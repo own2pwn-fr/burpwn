@@ -277,10 +277,14 @@ so a name collision is an error you resolve with `--as`.
 
 ⚠️ **The bundle is raw by default**: it carries the stored auth tokens, the login
 commands and the `Authorization` / `Cookie` headers captured in the traffic, so
-the session replays identically. `--redact` drops the stored auth profiles and
-match/replace replacements, but it does **not** scrub credentials captured inside
-recorded requests and responses. Move a bundle the way you would move the
-credentials it contains.
+the session replays identically. `--redact` drops the stored credentials (auth
+tokens, login and `exec` command lines, match/replace replacements) **and** masks
+the credential-shaped values in the capture: `Authorization` /
+`Proxy-Authorization` / `Cookie` / `Set-Cookie` header values and
+`password` / `token` / `api_key`-style parameters in query strings, form bodies
+and JSON. It matches credential **shapes** — a secret under a name it cannot
+recognise, one baked into a URL path, or one in a binary body is still in the
+file. Move a bundle the way you would move the credentials it contains.
 
 ⚠️ **`export pcap` is a SYNTHESIS, not a capture.** burpwn stores reassembled
 HTTP messages, never packets, so the pcapng is fabricated around the bytes it

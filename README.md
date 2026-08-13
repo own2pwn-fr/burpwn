@@ -143,10 +143,15 @@ migrated on the way in, and one from a newer burpwn is refused rather than half-
 
 > ⚠️ **A bundle is a credential store.** By default it holds the session exactly as captured: the
 > stored auth tokens and login commands, and every `Authorization` / `Cookie` header recorded in the
-> traffic — that is what makes the session replayable. `--redact` drops the stored auth profiles and
-> match/replace replacements; it does **not** scrub credentials captured inside recorded requests and
-> responses. Bundles are written `0600`; move them the way you would move the credentials inside.
-> The CA private key is never included.
+> traffic — that is what makes the session replayable. `--redact` drops the stored credentials (auth
+> tokens, login and `exec` command lines, match/replace replacements, `exec` hook parameters) **and**
+> masks the credential-shaped values in the capture itself: the `Authorization`, `Proxy-Authorization`,
+> `Cookie` and `Set-Cookie` header values, and `password` / `token` / `api_key`-style parameters in
+> query strings, form bodies and JSON — in the blobs, the request paths and the search index alike.
+> It matches credential **shapes**, so a secret under a name it cannot recognise, one baked into a URL
+> path, or one inside a binary or compressed body is **still in the file**: read a redacted bundle
+> before you hand it over. Bundles are written `0600`; move them the way you would move the
+> credentials inside. The CA private key is never included.
 
 ## `export pcap`: a capture burpwn never took
 

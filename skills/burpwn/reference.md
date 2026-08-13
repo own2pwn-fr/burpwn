@@ -302,9 +302,15 @@ workspace and every subcommand takes the NAME, not an id.
   notes, attacks and rules. `burpwn session import` opens it on another machine.
   **The bundle is RAW by default**: it carries the stored auth tokens, the login commands (argv
   credentials included) and the Authorization / Cookie headers captured in the traffic, so that the
-  session replays identically. `--redact` drops the stored auth tokens, login commands and
-  match/replace replacements — it does **not** scrub credentials captured inside recorded requests
-  and responses. Treat a bundle like the credentials it contains.
+  session replays identically. `--redact` drops the stored credentials (auth tokens, login and
+  `exec` command lines, match/replace replacements, `exec` hook parameters) **and** masks the
+  credential-shaped values in the capture — Authorization / Proxy-Authorization / Cookie /
+  Set-Cookie header values, and `password` / `token` / `api_key`-style parameters in query strings,
+  form bodies and JSON — in the stored bodies, the request paths and the FTS index alike. It is a
+  **shape** matcher: a secret under a name it cannot recognise, one baked into a URL path, or one
+  inside a binary or compressed body is still in the file. A redacted bundle is also no longer
+  replayable (the auth profiles and `exec` hooks are gone). Treat a bundle like the credentials it
+  contains.
 - `burpwn export pcap [--session <NAME>] [--workspace <NAME|ID>] [--group <GROUP>] [-o <OUTPUT>]
   [--force] [--json]` — a **synthetic** pcapng (default `<session>.pcapng` in the current directory,
   never overwritten without `--force`). Always a file: a pcapng is binary, so unlike `export har`

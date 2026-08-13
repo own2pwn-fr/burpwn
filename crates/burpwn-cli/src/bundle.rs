@@ -30,14 +30,19 @@ pub const BUNDLE_EXT: &str = "burpwn";
 pub const RAW_WARNING: &str = "this bundle holds the session exactly as captured: stored auth \
      tokens and login commands (credentials and all), plus every Authorization / Cookie / \
      Set-Cookie header recorded in the traffic. Anyone who opens it can replay them — move it the \
-     way you would move the credentials themselves. `--redact` drops the stored auth profiles and \
-     match/replace replacements.";
+     way you would move the credentials themselves. `--redact` drops the stored credentials and \
+     masks the credential-shaped values in the capture.";
 
-/// The honest small print of `--redact`: it covers what burpwn stored, not what
-/// burpwn captured.
-pub const REDACTED_WARNING: &str = "--redact dropped the stored auth tokens, login commands and \
-     match/replace replacements. It does NOT scrub credentials captured inside recorded requests \
-     and responses (Authorization / Cookie headers, login bodies) — those are still in this file.";
+/// The honest small print of `--redact`: it masks credential SHAPES, in the
+/// stored credentials and in the captured traffic alike, and it cannot find a
+/// secret that does not look like one. Kept in step with
+/// [`burpwn_store::bundle::redact`], which is what actually does the work.
+pub const REDACTED_WARNING: &str = "--redact dropped the stored auth tokens, the login and exec \
+     command lines and the match/replace replacements, and masked the Authorization / \
+     Proxy-Authorization / Cookie / Set-Cookie headers and the password / token / api_key-style \
+     parameters in the captured requests and responses. It matches credential SHAPES: a secret \
+     under a name it cannot recognise, one baked into a URL path, or one inside a binary or \
+     compressed body is STILL in this file. Read the bundle before you hand it over.";
 
 /// An `export session` request, from either the CLI or the MCP tool.
 #[derive(Debug, Clone)]

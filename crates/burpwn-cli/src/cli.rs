@@ -927,8 +927,9 @@ pub enum ExportAction {
     /// By default the bundle is RAW — it carries the stored auth tokens, the
     /// login commands and the Authorization / Cookie headers captured in the
     /// traffic, so that the session replays identically. `--redact` drops the
-    /// stored credentials; it does NOT scrub the ones captured inside recorded
-    /// requests and responses.
+    /// stored credentials and masks the credential-shaped values in the
+    /// capture; it matches shapes, so a secret that does not look like one is
+    /// still in the file.
     Session {
         /// Session to export (defaults to the active session).
         #[arg(long)]
@@ -936,10 +937,12 @@ pub enum ExportAction {
         /// Output file (defaults to `<session>.burpwn` in the current directory).
         #[arg(short, long)]
         output: Option<String>,
-        /// Drop the stored auth tokens, login commands and match/replace
-        /// replacements. Credentials captured INSIDE recorded requests and
-        /// responses (Authorization / Cookie headers, login bodies) stay in the
-        /// bundle — see the command help.
+        /// Drop the stored auth tokens, login/exec commands and match/replace
+        /// replacements, and mask the Authorization / Proxy-Authorization /
+        /// Cookie / Set-Cookie headers and password / token / api_key-style
+        /// parameters in the captured traffic. Credential SHAPES only: a secret
+        /// under an unrecognised name, in a URL path or in a binary body stays
+        /// in the bundle — see the command help.
         #[arg(long)]
         redact: bool,
         /// Overwrite the output file if it already exists.

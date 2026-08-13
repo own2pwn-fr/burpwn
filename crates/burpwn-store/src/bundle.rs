@@ -28,9 +28,9 @@
 //! A bundle is the session AS CAPTURED: `auth_profiles.token`, the
 //! `auth_profiles.login_cmd` (which usually carries credentials in its argv),
 //! and every `Authorization` / `Cookie` header recorded in the blobs. [`redact`]
-//! covers the first two and the match/replace replacements; it deliberately does
-//! NOT touch captured traffic (see its doc comment for why). Callers are
-//! expected to say so out loud.
+//! removes the credentials burpwn stored AND masks the credential-shaped values
+//! in the traffic it captured — see its doc comment for the exact, deliberately
+//! narrow, scope. Callers are expected to say so out loud.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -44,6 +44,7 @@ use thiserror::Error;
 
 use crate::error::StoreError;
 use crate::schema::{self, SCHEMA_VERSION};
+use crate::scrub;
 
 /// Magic prefix every bundle starts with.
 pub const MAGIC: &[u8] = b"BURPWNBUNDLE";
@@ -188,17 +189,33 @@ pub fn export(db: &Path, out: &Path, opts: &ExportOptions<'_>) -> Result<BundleM
     let tmp = TempPath::beside(out, "export")?;
     snapshot(db, tmp.path())?;
 
-    let conn = Connection::open(tmp.path())?;
-    if opts.redact {
+    // The redacted snapshot is a SECOND copy, not the first one edited in place.
+    // Deleting and rewriting rows moves their old pages onto SQLite's freelist,
+    // where the bytes stay verbatim until something reuses them — so a redacted
+    // database still CONTAINS every secret it no longer returns, and zstd would
+    // faithfully carry them into the bundle. `VACUUM INTO` rebuilds the file from
+    // the live rows only, which is the one cheap way to be sure the plaintext is
+    // actually gone. `_scratch` holds the pre-vacuum copy alive (and armed for
+    // deletion) until the end of the function.
+    let (payload, _scratch) = if opts.redact {
+        let conn = Connection::open(tmp.path())?;
         redact(&conn)?;
-    }
+        let clean = TempPath::beside(out, "redacted")?;
+        conn.execute("VACUUM INTO ?1", [path_str(clean.path())?])?;
+        conn.close().map_err(|(_, e)| BundleError::from(e))?;
+        (clean, Some(tmp))
+    } else {
+        (tmp, None)
+    };
+
+    let conn = Connection::open(payload.path())?;
     let manifest = build_manifest(&conn, opts)?;
     write_manifest(&conn, &manifest)?;
     // Close explicitly so the rollback journal is gone before we compress the
     // file — otherwise the bundle could carry a half-applied transaction.
     conn.close().map_err(|(_, e)| BundleError::from(e))?;
 
-    compress(tmp.path(), out)?;
+    compress(payload.path(), out)?;
     Ok(manifest)
 }
 
@@ -284,21 +301,35 @@ pub fn stage(bundle: &Path, staging_dir: &Path) -> Result<StagedBundle> {
     })
 }
 
-/// Drop the credentials burpwn itself stored: the auth profiles' tokens and
-/// login commands (whose argv routinely carries a password), and every
-/// match/replace replacement (which is where an injected `Authorization` value
-/// lives).
+/// Strip the credentials out of a bundle-in-progress. Two halves, both applied
+/// to the COPY — the session on disk is never touched.
 ///
-/// ⚠️ It stops there. Credentials CAPTURED inside recorded traffic —
-/// `Authorization` / `Cookie` / `Set-Cookie` headers, login request bodies —
-/// stay in the bundle. Scrubbing those would mean rewriting content-addressed,
-/// deduplicated, compressed blobs (changing their SHA-256, so every reference
-/// and the dedup identity with it) and rebuilding the `flows_fts` rows that
-/// index the same text — a lot of moving parts to end up with a file that still
-/// leaks whatever a body happened to contain. The honest contract is the
-/// narrow one, stated plainly, rather than a broad one that quietly holds only
-/// some of the time.
+/// **What burpwn stored**, dropped whole: the auth profiles' tokens and login
+/// commands (whose argv routinely carries a password), the match/replace
+/// replacements (where an injected `Authorization` value lives), an `exec`
+/// hook's parameters, and the recorded `burpwn exec` command lines.
+///
+/// **What burpwn captured**, masked in place: every credential-shaped value in
+/// the recorded traffic — see [`crate::scrub`] for the exact rules. In short,
+/// the value of an `Authorization` / `Proxy-Authorization` / `Cookie` /
+/// `Set-Cookie` header, and of a `password`-, `token`- or `api_key`-named
+/// parameter in a query string, a form body or a JSON document.
+///
+/// ⚠️ **It is a shape matcher, not a secret detector.** A credential that does
+/// not look like one — an opaque value under a name nobody would guess, a token
+/// baked into a URL path, anything inside a binary or compressed body — is
+/// still in the bundle. `--redact` narrows what you are handing over; it does
+/// not certify the result. Anything that changes here must change the warning
+/// in `burpwn-cli`'s `bundle` module too, which is what the operator reads.
 pub fn redact(conn: &Connection) -> Result<()> {
+    redact_stored_credentials(conn)?;
+    redact_captured_traffic(conn)?;
+    Ok(())
+}
+
+/// The credentials burpwn holds in its own tables, as opposed to the ones it
+/// recorded off the wire.
+fn redact_stored_credentials(conn: &Connection) -> Result<()> {
     if table_exists(conn, "auth_profiles")? {
         conn.execute(
             "UPDATE auth_profiles SET token = NULL, login_cmd = ?1",
@@ -322,6 +353,198 @@ pub fn redact(conn: &Connection) -> Result<()> {
             [REDACTED],
         )?;
     }
+    // `execs.cmd` is the command line the operator ran under `burpwn exec` —
+    // `curl -u admin:hunter2 …` and friends. Same class of secret as
+    // `login_cmd`, so it goes the same way; the `exec_id` linking those flows
+    // together survives, so the provenance does not.
+    if table_exists(conn, "execs")? {
+        conn.execute("UPDATE execs SET cmd = ?1", [REDACTED])?;
+    }
+    Ok(())
+}
+
+/// Mask the credential-shaped values in everything the capture path wrote:
+/// blobs (request/response headers and bodies, raw chunks, websocket payloads),
+/// the request paths kept as columns, and the FTS index built from both.
+///
+/// Order matters. The blob pass can MERGE two blobs that only differed by the
+/// secret, so references have to be re-pointed before the losing rows go.
+fn redact_captured_traffic(conn: &Connection) -> Result<()> {
+    if table_exists(conn, "blobs")? {
+        scrub_blobs(conn)?;
+    }
+    scrub_text_column(conn, "requests", "path", "rowid")?;
+    // The FTS index holds a decoded COPY of the same header and body text, so a
+    // bundle whose blobs were scrubbed but whose index was not would hand the
+    // secret straight back to `burpwn search`. `flows_fts` is an ordinary
+    // (content-carrying) fts5 table, so an UPDATE re-tokenises the row in place
+    // — no rebuild, no dropped index, and `MATCH` keeps working on import.
+    scrub_text_column(conn, "flows_fts", "content", "rowid")?;
+    Ok(())
+}
+
+/// Scrub one TEXT column, row by row, writing back only what actually changed.
+fn scrub_text_column(conn: &Connection, table: &str, column: &str, key: &str) -> Result<()> {
+    if !table_exists(conn, table)? {
+        return Ok(());
+    }
+    // Collect first: rusqlite cannot run the UPDATEs while the SELECT statement
+    // is still walking the same connection.
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {key}, {column} FROM {table} WHERE {column} IS NOT NULL"
+        ))?;
+        let mapped = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    let mut update = conn.prepare(&format!(
+        "UPDATE {table} SET {column} = ?1 WHERE {key} = ?2"
+    ))?;
+    for (id, text) in rows {
+        let clean = scrub::scrub_text(&text);
+        if clean != text {
+            update.execute(rusqlite::params![clean, id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite the content-addressed blob store in place.
+///
+/// A blob's SHA-256 IS its deduplication identity ([`crate::blob::BlobStore`]
+/// looks a payload up by hash before inserting), so masking a header inside one
+/// invalidates its address. Two consequences, both handled here:
+///
+/// * two blobs that differed ONLY by the secret collapse onto one row — which is
+///   correct, that is what dedup means, but the references have to follow;
+/// * the surviving row's `sha256` must be recomputed, or a later write of the
+///   same bytes into the imported session would find a hash pointing at
+///   different content and silently reuse the wrong blob.
+///
+/// References live in four INTEGER columns (`requests`/`responses`
+/// headers/body) and one TEXT column (`ws_messages.payload_blob`, which stores
+/// the blob row id as text — easy to miss, hence the explicit cast below).
+/// Raw-chunk blobs are referenced by nothing at all (the writer stores them for
+/// their FTS text only), so they are simply scrubbed along with the rest.
+///
+/// The rewrite cannot hit the `sha256` UNIQUE constraint: every row is bucketed
+/// by the hash of its SCRUBBED bytes and only the lowest id per bucket survives,
+/// so no two survivors share a target hash — and a target hash cannot equal
+/// another survivor's UNSCRUBBED hash either, because scrubbing is idempotent
+/// ([`crate::scrub`]), which would put the two rows in the same bucket.
+fn scrub_blobs(conn: &Connection) -> Result<()> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM blobs ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        mapped.collect::<std::result::Result<_, _>>()?
+    };
+
+    // Post-scrub identity of every blob. A temp table rather than a HashMap:
+    // a session can hold gigabytes of blobs, and SQLite spills this to its own
+    // temp store instead of the process heap.
+    conn.execute_batch(
+        "CREATE TEMP TABLE blob_scrub (id INTEGER PRIMARY KEY, sha BLOB NOT NULL, changed INTEGER NOT NULL);
+         CREATE INDEX temp.idx_blob_scrub_sha ON blob_scrub(sha);",
+    )?;
+    {
+        let mut ins =
+            conn.prepare("INSERT INTO blob_scrub(id, sha, changed) VALUES (?1, ?2, ?3)")?;
+        for id in &ids {
+            let Some(raw) = crate::blob::get_blob(conn, *id)? else {
+                continue;
+            };
+            let clean = scrub::scrub_bytes(&raw);
+            let changed = clean.as_ref().is_some_and(|c| *c != raw);
+            let bytes = clean.as_deref().unwrap_or(&raw);
+            let sha: [u8; 32] = Sha256::digest(bytes).into();
+            ins.execute(rusqlite::params![id, &sha[..], i64::from(changed)])?;
+        }
+    }
+
+    // Losers of each bucket, and the row they fold into.
+    conn.execute_batch(
+        "CREATE TEMP TABLE blob_remap AS
+           SELECT s.id AS old, (SELECT MIN(id) FROM blob_scrub k WHERE k.sha = s.sha) AS new
+           FROM blob_scrub s
+           WHERE s.id <> (SELECT MIN(id) FROM blob_scrub k WHERE k.sha = s.sha);",
+    )?;
+    for (table, column) in [
+        ("requests", "headers_blob_id"),
+        ("requests", "body_blob_id"),
+        ("responses", "headers_blob_id"),
+        ("responses", "body_blob_id"),
+    ] {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET {column} = (SELECT new FROM blob_remap WHERE old = {column})
+                 WHERE {column} IN (SELECT old FROM blob_remap)"
+            ),
+            [],
+        )?;
+    }
+    if table_exists(conn, "ws_messages")? {
+        // `payload_blob` is TEXT holding the id, so both sides need the cast.
+        conn.execute(
+            "UPDATE ws_messages
+                SET payload_blob = CAST(
+                    (SELECT new FROM blob_remap WHERE old = CAST(payload_blob AS INTEGER)) AS TEXT)
+              WHERE CAST(payload_blob AS INTEGER) IN (SELECT old FROM blob_remap)",
+            [],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM blobs WHERE id IN (SELECT old FROM blob_remap)",
+        [],
+    )?;
+
+    // Second pass over the survivors that changed: re-read, re-scrub, write the
+    // masked bytes and their new address back. Re-scrubbing rather than keeping
+    // the first pass's output around bounds the memory to one blob at a time.
+    let changed: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM blob_scrub
+              WHERE changed = 1 AND id NOT IN (SELECT old FROM blob_remap)
+              ORDER BY id",
+        )?;
+        let mapped = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        mapped.collect::<std::result::Result<_, _>>()?
+    };
+    {
+        let mut upd = conn.prepare(
+            "UPDATE blobs SET sha256 = ?1, size = ?2, compressed = ?3, data = ?4 WHERE id = ?5",
+        )?;
+        for id in changed {
+            let Some(raw) = crate::blob::get_blob(conn, id)? else {
+                continue;
+            };
+            let Some(clean) = scrub::scrub_bytes(&raw) else {
+                continue;
+            };
+            let sha: [u8; 32] = Sha256::digest(&clean).into();
+            // Mirror `BlobStore::put`'s storage decision so a redacted row is
+            // indistinguishable from a freshly written one.
+            let (compressed, stored) = if clean.len() > crate::blob::COMPRESS_THRESHOLD {
+                (1, zstd::stream::encode_all(&clean[..], ZSTD_LEVEL)?)
+            } else {
+                (0, clean.clone())
+            };
+            upd.execute(rusqlite::params![
+                &sha[..],
+                clean.len() as i64,
+                compressed,
+                stored,
+                id
+            ])?;
+        }
+    }
+
+    conn.execute_batch("DROP TABLE blob_scrub; DROP TABLE blob_remap;")?;
     Ok(())
 }
 
@@ -781,7 +1004,7 @@ mod tests {
     /// `--redact` purges exactly what it claims to purge — and nothing more, so
     /// the honest scope stays pinned by a test rather than by a doc comment.
     #[tokio::test]
-    async fn redact_purges_stored_credentials_only() {
+    async fn redact_purges_the_credentials_burpwn_stored() {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("session.db");
         {
@@ -832,6 +1055,17 @@ mod tests {
             })
             .await
             .unwrap();
+            // The command line the operator ran under `burpwn exec` — same class
+            // of secret as an auth profile's login command.
+            w.insert_exec(crate::model::NewExecRecord {
+                exec_id: "exec-1".into(),
+                cmd: "curl -u admin:hunter2 https://example.com/".into(),
+                network_facing: true,
+                flow_count: 1,
+                created_at: 1018,
+            })
+            .await
+            .unwrap();
             let _ = flow_id;
         }
 
@@ -847,6 +1081,9 @@ mod tests {
         let profile = store.reader().auth_profiles().unwrap().remove(0);
         assert_eq!(profile.token.as_deref(), Some("s3cr3t"));
         assert!(profile.login_cmd.contains("hunter2"));
+        assert!(store.reader().exec_records().unwrap()[0]
+            .cmd
+            .contains("hunter2"));
         let hooks = store.reader().list_hooks().unwrap();
         assert!(
             matches!(&hooks[0].action, crate::model::HookAction::Exec { cmd, .. } if cmd.contains("hunter2"))
@@ -867,6 +1104,7 @@ mod tests {
         assert_eq!(profile.login_cmd, REDACTED);
         let rules = store.reader().list_match_replace().unwrap();
         assert_eq!(rules[0].replacement, REDACTED);
+        assert_eq!(store.reader().exec_records().unwrap()[0].cmd, REDACTED);
         // The hook's command (password and all) is gone. Its row survives with
         // unreadable parameters, which `list_hooks` refuses out loud — a
         // redacted bundle is for reading the CAPTURE, not for re-running the
@@ -878,8 +1116,8 @@ mod tests {
             .query_row("SELECT params FROM hooks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(raw_params, REDACTED);
-        // …and the capture itself is untouched: the Authorization header the
-        // proxy recorded is still in the blob. Documented, not accidental.
+        // …and the CAPTURE is masked too (see the traffic tests below for the
+        // detail): the Authorization header the proxy recorded is gone.
         let flows = store
             .reader()
             .list_flows(&crate::model::FlowFilter::default())
@@ -887,8 +1125,8 @@ mod tests {
         let detail = store.reader().get_flow(flows[0].id).unwrap().unwrap();
         let headers = &detail.request.as_ref().unwrap().headers;
         assert!(
-            String::from_utf8_lossy(headers).contains("s3cr3t"),
-            "--redact does not scrub captured traffic; if that changes, say so"
+            !String::from_utf8_lossy(headers).contains("s3cr3t"),
+            "the captured Authorization header must be masked"
         );
 
         // The source session is never modified by an export, redacted or not.
@@ -896,6 +1134,427 @@ mod tests {
         assert_eq!(
             store.reader().auth_profiles().unwrap()[0].token.as_deref(),
             Some("s3cr3t")
+        );
+    }
+
+    /// The SQLite database inside a bundle, as anyone running `zstd -d` on the
+    /// file would get it. Tests grep THIS rather than the query results: a row
+    /// SQLite no longer returns can still sit verbatim in a freelist page.
+    fn bundle_payload(bundle: &Path) -> Vec<u8> {
+        let raw = std::fs::read(bundle).unwrap();
+        zstd::stream::decode_all(&raw[HEADER_LEN..]).unwrap()
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    }
+
+    /// Record one flow with the given wire text, as the proxy would.
+    async fn capture(
+        store: &Store,
+        path: &str,
+        req_headers: &str,
+        req_body: &str,
+        resp_headers: &str,
+        resp_body: &str,
+    ) -> i64 {
+        let w = store.writer();
+        let flow_id = w
+            .flow_start(FlowStart {
+                workspace_id: schema::DEFAULT_WORKSPACE_ID,
+                ts_start: 2000,
+                exec_id: None,
+                client_addr: "127.0.0.1:51001".into(),
+                dst_ip: "93.184.216.34".into(),
+                dst_port: 443,
+                sni: Some("example.com".into()),
+                scheme: "https".into(),
+                protocol: Protocol::H1,
+                intercepted: false,
+            })
+            .await
+            .unwrap();
+        w.request(
+            flow_id,
+            RequestData {
+                method: "POST".into(),
+                authority: "example.com".into(),
+                path: path.into(),
+                http_version: "HTTP/1.1".into(),
+                headers: req_headers.as_bytes().to_vec(),
+                body: req_body.as_bytes().to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        w.response(
+            flow_id,
+            ResponseData {
+                status: 200,
+                http_version: "HTTP/1.1".into(),
+                headers: resp_headers.as_bytes().to_vec(),
+                body: resp_body.as_bytes().to_vec(),
+                timing_ms: Some(9),
+            },
+        )
+        .await
+        .unwrap();
+        w.flow_end(flow_id, 2010).await.unwrap();
+        flow_id
+    }
+
+    /// The scope `--redact` now claims over CAPTURED traffic: credential-bearing
+    /// headers and credential-named parameters are masked everywhere they were
+    /// stored — the blobs, the request path column and the FTS index — and the
+    /// plaintext is not merely unreachable but absent from the file.
+    ///
+    /// The negative half matters just as much: what the scrubber cannot see is
+    /// asserted to survive, so widening the claim breaks a test.
+    #[tokio::test]
+    async fn redact_masks_captured_credentials_everywhere_they_were_stored() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        let flow_id = {
+            let store = Store::open(&db).unwrap();
+            capture(
+                &store,
+                "/login?api_key=K3YAPIKEY&next=/home",
+                "Authorization: Bearer S3CR3TBEARER\r\n\
+                 Cookie: sid=C00KIEVALUE\r\n\
+                 User-Agent: burpwn/test\r\n",
+                "user=ada&password=HUNTER2PASS&remember=1",
+                "Set-Cookie: sid=N3WSETCOOKIE; HttpOnly\r\n\
+                 Content-Type: application/json\r\n",
+                r#"{"access_token":"T0KENACCESS","user":"ada","hint":"unlabelled-9f8a7b6c"}"#,
+            )
+            .await
+        };
+
+        let bundle = dir.path().join("clean.burpwn");
+        export(&db, &bundle, &opts("work", true)).unwrap();
+
+        // Nowhere in the bytes of the bundle — not in a live row, not in a page
+        // the redaction left on the freelist.
+        let payload = bundle_payload(&bundle);
+        for secret in [
+            "S3CR3TBEARER",
+            "C00KIEVALUE",
+            "K3YAPIKEY",
+            "HUNTER2PASS",
+            "N3WSETCOOKIE",
+            "T0KENACCESS",
+        ] {
+            assert!(
+                !contains(&payload, secret),
+                "{secret} is still in the bundle"
+            );
+        }
+
+        let dest = TempDir::new().unwrap();
+        let staged = stage(&bundle, dest.path()).unwrap();
+        let imported = dest.path().join("session.db");
+        staged.install(&imported).unwrap();
+        let store = Store::open(&imported).unwrap();
+        let detail = store.reader().get_flow(flow_id).unwrap().unwrap();
+        let req = detail.request.as_ref().unwrap();
+        let resp = detail.response.as_ref().unwrap();
+
+        // The capture is still a capture: names, structure and every non-secret
+        // value survive, so the flow is still worth reading.
+        let req_headers = String::from_utf8(req.headers.clone()).unwrap();
+        assert!(
+            req_headers.contains("User-Agent: burpwn/test\r\n"),
+            "{req_headers}"
+        );
+        assert!(req_headers.starts_with("Authorization: "), "{req_headers}");
+        assert_eq!(req_headers.lines().count(), 3);
+        assert!(req.path.starts_with("/login?api_key=") && req.path.ends_with("&next=/home"));
+        assert!(String::from_utf8_lossy(&req.body).contains("user=ada"));
+        assert!(String::from_utf8_lossy(&resp.headers).contains("Content-Type: application/json"));
+        let body = String::from_utf8(resp.body.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["user"], "ada",
+            "a redacted JSON body stays parseable"
+        );
+
+        // Search still works, and no longer finds the secrets.
+        assert_eq!(store.reader().search("ada").unwrap(), vec![flow_id]);
+        assert!(store.reader().search("S3CR3TBEARER").unwrap().is_empty());
+        assert!(store.reader().search("HUNTER2PASS").unwrap().is_empty());
+
+        // …and the documented limit, asserted rather than assumed: a secret that
+        // is not SHAPED like one — here an opaque value under a name the
+        // scrubber has no reason to distrust — is still in the bundle.
+        assert!(
+            body.contains("unlabelled-9f8a7b6c"),
+            "--redact masks credential shapes, not every secret; if that changes, say so"
+        );
+        assert_eq!(
+            store.reader().search("unlabelled-9f8a7b6c").unwrap(),
+            vec![flow_id]
+        );
+    }
+
+    /// Rewriting a blob changes its SHA-256, which IS its dedup identity — so
+    /// two messages that differed only by the token become the same blob. The
+    /// bundle has to survive that: one row, both flows still pointing at it, no
+    /// dangling reference, and a hash that still matches the bytes (or a later
+    /// write into the imported session would reuse the wrong blob).
+    #[tokio::test]
+    async fn redact_re_deduplicates_the_blobs_it_rewrites() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        let (a, b) = {
+            let store = Store::open(&db).unwrap();
+            let a = capture(
+                &store,
+                "/a",
+                "Authorization: Bearer AAAAAAAAAAAA\r\nAccept: */*\r\n",
+                "",
+                "Content-Type: text/plain\r\n",
+                "same body",
+            )
+            .await;
+            let b = capture(
+                &store,
+                "/b",
+                "Authorization: Bearer BBBBBBBBBBBB\r\nAccept: */*\r\n",
+                "",
+                "Content-Type: text/plain\r\n",
+                "same body",
+            )
+            .await;
+            (a, b)
+        };
+
+        let before = blob_ids(&db);
+        let bundle = dir.path().join("clean.burpwn");
+        export(&db, &bundle, &opts("work", true)).unwrap();
+        let dest = TempDir::new().unwrap();
+        let staged = stage(&bundle, dest.path()).unwrap();
+        let imported = dest.path().join("session.db");
+        staged.install(&imported).unwrap();
+
+        let conn = Connection::open(&imported).unwrap();
+        let after = blob_ids(&imported);
+        assert!(
+            after.len() < before.len(),
+            "the two header blobs differed only by the token, so they must fold into one"
+        );
+
+        // Both requests survive and now share the one surviving header blob.
+        let shared: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT headers_blob_id) FROM requests",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 1);
+
+        // No reference points at a row that is no longer there.
+        for (table, column) in [
+            ("requests", "headers_blob_id"),
+            ("requests", "body_blob_id"),
+            ("responses", "headers_blob_id"),
+            ("responses", "body_blob_id"),
+        ] {
+            let dangling: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                          WHERE {column} IS NOT NULL
+                            AND {column} NOT IN (SELECT id FROM blobs)"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "{table}.{column} points at a deleted blob");
+        }
+
+        // Every surviving row is still content-addressed by its own bytes.
+        for id in &after {
+            let bytes = crate::blob::get_blob(&conn, *id).unwrap().unwrap();
+            let sha: Vec<u8> = conn
+                .query_row("SELECT sha256 FROM blobs WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                sha,
+                Sha256::digest(&bytes).to_vec(),
+                "blob {id}'s hash no longer addresses its content"
+            );
+        }
+
+        // And the session still reads as a session.
+        let store = Store::open(&imported).unwrap();
+        for id in [a, b] {
+            let detail = store.reader().get_flow(id).unwrap().unwrap();
+            let headers = String::from_utf8(detail.request.unwrap().headers).unwrap();
+            assert!(headers.contains("Accept: */*"), "{headers}");
+            assert!(!headers.contains("AAAAAAAAAAAA") && !headers.contains("BBBBBBBBBBBB"));
+        }
+    }
+
+    /// `ws_messages.payload_blob` stores the blob id as TEXT, so it is invisible
+    /// to any remapping that only looks at INTEGER foreign keys. If this test
+    /// fails, websocket payloads in a redacted bundle silently resolve to the
+    /// wrong blob (or to nothing).
+    #[tokio::test]
+    async fn redact_follows_the_text_encoded_websocket_blob_reference() {
+        use crate::model::WsDirection;
+
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        let flow_id = {
+            let store = Store::open(&db).unwrap();
+            let flow_id = capture(&store, "/ws", "Upgrade: websocket\r\n", "", "", "").await;
+            let w = store.writer();
+            // Two frames that differ only by the token they carry: after masking
+            // they are the same bytes, so one of the two blob rows goes away and
+            // the surviving reference must be re-pointed.
+            for token in ["WSTOKENAAAA", "WSTOKENBBBB"] {
+                w.insert_ws_message(
+                    flow_id,
+                    WsDirection::C2s,
+                    Some(1),
+                    Some(true),
+                    format!(r#"{{"access_token":"{token}","op":"subscribe"}}"#).into_bytes(),
+                    2100,
+                )
+                .await
+                .unwrap();
+            }
+            flow_id
+        };
+
+        let bundle = dir.path().join("clean.burpwn");
+        export(&db, &bundle, &opts("work", true)).unwrap();
+        let payload = bundle_payload(&bundle);
+        assert!(!contains(&payload, "WSTOKENAAAA") && !contains(&payload, "WSTOKENBBBB"));
+
+        let dest = TempDir::new().unwrap();
+        let staged = stage(&bundle, dest.path()).unwrap();
+        let imported = dest.path().join("session.db");
+        staged.install(&imported).unwrap();
+
+        let conn = Connection::open(&imported).unwrap();
+        let distinct: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT payload_blob) FROM ws_messages",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            distinct, 1,
+            "the two frames must have folded onto one blob — otherwise this test never \
+             exercises the remap"
+        );
+
+        let store = Store::open(&imported).unwrap();
+        let msgs = store.reader().ws_messages_for_flow(flow_id).unwrap();
+        assert_eq!(msgs.len(), 2);
+        for m in &msgs {
+            let text = String::from_utf8(m.payload.clone()).unwrap();
+            assert!(
+                text.contains(r#""op":"subscribe""#),
+                "the frame must still resolve to its (masked) payload, got {text:?}"
+            );
+            assert!(!text.contains("WSTOKEN"));
+        }
+    }
+
+    /// Blob ids present in a session database.
+    fn blob_ids(db: &Path) -> Vec<i64> {
+        let conn = Connection::open(db).unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM blobs ORDER BY id").unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// A raw export is untouched: the whole point of the default is fidelity.
+    #[tokio::test]
+    async fn a_raw_export_keeps_every_captured_credential() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        let flow_id = {
+            let store = Store::open(&db).unwrap();
+            capture(
+                &store,
+                "/login?api_key=K3YAPIKEY",
+                "Authorization: Bearer S3CR3TBEARER\r\n",
+                "password=HUNTER2PASS",
+                "Set-Cookie: sid=N3WSETCOOKIE\r\n",
+                "{}",
+            )
+            .await
+        };
+
+        let bundle = dir.path().join("raw.burpwn");
+        export(&db, &bundle, &opts("work", false)).unwrap();
+        let payload = bundle_payload(&bundle);
+        for secret in ["S3CR3TBEARER", "K3YAPIKEY", "HUNTER2PASS", "N3WSETCOOKIE"] {
+            assert!(
+                contains(&payload, secret),
+                "the default export must be the session AS CAPTURED — {secret} went missing"
+            );
+        }
+
+        let dest = TempDir::new().unwrap();
+        let staged = stage(&bundle, dest.path()).unwrap();
+        let imported = dest.path().join("session.db");
+        staged.install(&imported).unwrap();
+        let store = Store::open(&imported).unwrap();
+        assert_eq!(
+            store.reader().search("S3CR3TBEARER").unwrap(),
+            vec![flow_id]
+        );
+    }
+
+    /// Deleting and rewriting rows does NOT erase them from the file: SQLite
+    /// puts the old pages on its freelist with the bytes intact, and zstd would
+    /// carry them into the bundle. Measured, not assumed — with the
+    /// post-redaction `VACUUM INTO` removed from [`export`], the assertion below
+    /// fails on this exact session (300 header blobs folding into one leaves 299
+    /// freed pages of plaintext tokens behind).
+    #[tokio::test]
+    async fn a_redacted_bundle_carries_no_freelist_residue() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("session.db");
+        {
+            let store = Store::open(&db).unwrap();
+            for i in 0..300 {
+                capture(
+                    &store,
+                    "/login",
+                    &format!("Authorization: Bearer S3CR3TBEARER{i:04}\r\nAccept: */*\r\n"),
+                    "",
+                    "Content-Type: text/plain\r\n",
+                    "ok",
+                )
+                .await;
+            }
+        }
+
+        let bundle = dir.path().join("clean.burpwn");
+        export(&db, &bundle, &opts("work", true)).unwrap();
+        assert!(
+            !contains(&bundle_payload(&bundle), "S3CR3TBEARER"),
+            "a freed page still holds a captured token verbatim"
+        );
+
+        let dest = TempDir::new().unwrap();
+        let staged = stage(&bundle, dest.path()).unwrap();
+        let imported = dest.path().join("session.db");
+        staged.install(&imported).unwrap();
+        assert!(
+            blob_ids(&imported).len() < 10,
+            "the 300 request-header blobs differed only by the token, so they must fold onto \
+             one — otherwise the test never frees a page and proves nothing"
         );
     }
 
