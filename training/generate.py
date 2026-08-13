@@ -7,8 +7,10 @@ name encoded here was verified against the real ``burpwn`` debug binary
 (``target/debug/burpwn``, **built from this checkout** — see below) and the MCP
 server's typed parameter structs / handlers
 (``crates/burpwn-mcp/src/{params,server,handlers}.rs``), most recently on
-2026-08-13 at version 0.3.4, by actually running the binary and capturing the
-``{ok,data,error}`` envelopes (see README.md "How accuracy was grounded").
+2026-08-14 at version 0.4.0, by actually running the binary and capturing the
+``{ok,data,error}`` envelopes — and, for the MCP shapes, by driving the real
+``burpwn mcp`` stdio server over JSON-RPC rather than reading the handlers alone
+(see README.md "How accuracy was grounded").
 
 The anti-drift guard is ``training/eval/surface.py --check``. It grounds on a
 binary built from the current tree and refuses to run against one whose
@@ -101,11 +103,25 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       header, claims, signature, verified:false} (signature NOT verified).
     * ``session stats`` → data {session, total_execs, total_flows, network_execs,
       network_zero_flow_execs, escaped_execs:[{exec_id,cmd}]}.
-    * ``session auth set`` → data {id, host}. ``session auth status`` → data
-      {profiles:[{id,host,login_cmd,header_template,token_set,token(masked|null),
-      rule_id}]}. ``session auth refresh`` → data {refreshed:[{host,rule_id,
-      token(masked)}]} (runs the login cmd through the sandbox, re-installs the
-      injection rule).
+    * ``session auth`` is a FAÇADE over the hook engine (0.4.0, schema v8): a
+      profile IS a ``pre-request``/``exec`` hook named ``auth:<host>`` whose
+      injection is a ``set-header``. ``hook list`` shows it; there is no
+      ``auth_profiles`` table and no ``AuthWatcher`` any more (the 401/403
+      trigger lives in ``HookEngine::observe_status``).
+      ``session auth set`` → data {id, hook_id, host} (same number twice: the
+      profile id IS the hook id — but note the MCP tool returns only {id,host},
+      see below). ``session auth status`` → data {profiles:[{id,hook_id,name,
+      enabled,host,login_cmd,header_template,ttl_ms,timeout_ms}]} — there is NO
+      ``token``, NO ``token_set`` and NO ``rule_id``.
+      ``session auth refresh`` does NOT run the login command; it asks the
+      daemon to DROP the value it cached, so the next in-scope request mints a
+      fresh one → data {profiles:[{host,hook_id,cleared:<bool>}], cleared:[ids]}.
+      With no daemon running nothing is cached, so it succeeds with
+      ``cleared:[]`` and every ``cleared:false``. No matching profile →
+      ``BW-INPUT-009``.
+      **The token is never persisted at all** — it lives only in the running
+      daemon's memory for the hook's TTL, which is also why ``--redact`` has
+      less to erase than it used to.
     * ``intercept scope <pat> [--path P] [--method M] | --clear`` → {type:"Ack"}.
     * ``init --check`` → data {checks:[{agent,verdict:"pass"|"fail"|"advisory",
       detail,rewritten}], ok:<bool>}; exit code 1 if any agent fails to rewrite.
@@ -171,8 +187,14 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       object {alg,header,claims,signature,verified:false}.
     * session_stats → {session,total_execs,total_flows,network_execs,
       network_zero_flow_execs,escaped_execs:[{exec_id,cmd}]}.
-    * session_auth_set → {id,host}; session_auth_status → {profiles:[...masked]};
-      session_auth_refresh → {refreshed:[{host,rule_id,token}]}.
+    * session_auth_set → {id,host} — **no ``hook_id``**, where the CLI's
+      ``session auth set`` data carries {id,hook_id,host}. Verified against the
+      live stdio server, not inferred.
+      session_auth_status → {profiles:[{id,hook_id,name,enabled,host,login_cmd,
+      header_template,ttl_ms,timeout_ms}]} (null-pruned; no token field exists
+      to mask any more); session_auth_refresh → {profiles:[{host,hook_id,
+      cleared}], cleared:[ids]} — the same data as the CLI, because the tool
+      shells out to ``burpwn --json session auth refresh`` for one code path.
     * any intercept tool with no daemon → error string starting "no burpwn proxy
       daemon answering ...".
     * 0.3.x groups (named flow collections). NOTE the MCP shapes differ from the
@@ -187,7 +209,7 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       flows:[flow rows],count} (null-pruned);
       group_rm → {group_id,name,deleted:true} (CLI: {group_id,name}).
       Missing group → error "no such group: <name>".
-    * 0.3.x hooks (pre-request / post-response actions):
+    * 0.3.x hooks (0.4.0 adds the ws/dns phases — see the phase table below):
       hook_add → {hook_id,name}; hook_list → {hooks:[...]} (null-pruned; NO
       count); hook_set_enabled → {id,enabled} (one tool for both directions,
       where the CLI has ``hook enable``/``hook disable``); hook_rm →
@@ -195,8 +217,11 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       exec:<obj|null>,before:{headers,url},after:{headers,url}}.
       A hook list row is {id,enabled,name,phase,scope:{host,method,path,status},
       action:{...},order,timeout_ms,ttl_ms,created_at}; ``action`` is an
-      internally tagged object, e.g. {"action":"add-header",name,value} or
-      {"action":"exec",cmd,extract,inject:{kind,name,value_template}}.
+      internally tagged object, e.g. {"action":"add-header",name,value},
+      {"action":"exec",cmd,extract,inject:{kind,name,value_template}},
+      {"action":"replace-payload",find,replace} or {"action":"set-answer",ip}
+      (``ip`` is a STRING, and the key is ``ip`` — not ``answer``, which is only
+      the flag/param name that sets it).
     * 0.3.x session_export → {path,bytes,flows,redacted} plus a ``warning``
       member ONLY when redacted is false. The CLI's ``export session`` data
       carries more (schema_version, session, and a longer warning) — another
@@ -224,8 +249,11 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
     group_new.{name,description?,workspace?(numeric id)},
     group_add.{name,flow_ids:[...]}, group_list.{workspace?}, group_show.{name},
     group_rm.{name}, hook_list takes NO arguments ({}),
-    hook_add.{name,action,phase?,host?,method?,path?,status?,header?,param?,cmd?,
-    extract?,inject_header?,inject_param?,order?,timeout_ms?,ttl_ms?},
+    hook_add.{name,action,phase?,host?,method?,path?,status?,header?,param?,
+    find?,replace?,answer?,cmd?,extract?,inject_header?,inject_param?,order?,
+    timeout_ms?,ttl_ms?} (``find``/``replace``/``answer`` are the 0.4.0
+    additions; the tool has 19 properties and takes no ``inject_if_absent``,
+    which is CLI-only),
     hook_set_enabled.{id,enabled}, hook_rm.{id}, hook_test.{id,flow_id}
     (note flow_id, where req_show/fuzz use ``id``/``flow``),
     session_export.{output?,redact?,force?}.
@@ -244,8 +272,38 @@ CRITICAL grounding facts (CLI and MCP envelopes DIFFER — do not conflate):
       list`` → {hooks:[...]}; ``hook show <id>`` → the hook object; ``hook
       enable|disable <id>`` → {id,enabled}; ``hook rm <id>`` → {removed:<id>};
       ``hook test <id> --flow <n>`` → the before/after report (no live traffic;
-      an ``exec`` hook's command DOES run). Actions: add-header, set-header,
-      remove-header, set-query-param, drop, exec.
+      an ``exec`` hook's command DOES run).
+
+  0.4.0 hook phases — which action means anything WHERE. ``hook add`` refuses a
+  pairing that could not work (``BW-INPUT-001``) instead of storing a row that
+  becomes a silent no-op on the hot path, so these are hard errors an agent can
+  provoke, not style advice:
+
+    * ``pre-request`` (default) / ``post-response`` — an HTTP message. Actions:
+      add-header, set-header, remove-header, drop, exec, and set-query-param
+      (``pre-request`` ONLY: it needs a request target).
+    * ``ws-c2s`` / ``ws-s2c`` — ONE complete WebSocket message on an open
+      socket, client→server / server→client. Actions: ``drop`` and
+      ``replace-payload`` (``--find``/``--replace``; literal, not a regex, and
+      binary-safe). Aliases accepted: ``ws-send``/``ws-client`` → ws-c2s,
+      ``ws-recv``/``ws-server`` → ws-s2c.
+    * ``dns-query`` (alias ``dns``) — one name before it is resolved. Actions:
+      ``drop`` and ``set-answer`` (``--answer <ip>``; only A/AAAA are answered,
+      anything else still goes upstream). Scope is reused, not renamed: on the
+      ws phases ``--host``/``--path`` match the UPGRADE request's host/target;
+      on ``dns-query`` ``--host`` is the queried NAME and ``--path`` the record
+      type as ``/A``, ``/AAAA``, ``/TXT``.
+    * ``exec`` is refused on ws-c2s/ws-s2c/dns-query on COST, not meaning: those
+      fire per message on a socket that may carry thousands, and one hook
+      command is one sandbox — it would serialize the proxy. The refusal says so
+      and points at ``pre-request`` ("a socket inherits what its upgrade request
+      carried").
+    * ``--method`` is refused on every non-HTTP phase ("a ws-c2s hook has no
+      method to match").
+    * ``hook test`` refuses a non-HTTP hook (``BW-INPUT-009``): it replays a hook
+      against a CAPTURED HTTP request/response and neither exists for those
+      phases. Note the flow is looked up FIRST, so a bad ``--flow`` still reports
+      ``BW-INPUT-002 no such flow`` before the phase is ever considered.
     * ``export session [-o F] [--redact] [--force]`` → data {path,bytes,flows,
       redacted,schema_version,session,warning}; refuses an existing file without
       ``--force``. ``session import <file> [--as NAME] [--use]`` → data
@@ -320,7 +378,10 @@ SHELL_TOOL_NAME = "Bash"
 # added the offensive surface: req_replay, fuzz/fuzz_list/fuzz_results, compare,
 # encode/decode, intercept_scope, session_stats and the session_auth_* trio;
 # 0.3.x added the five `group_*` tools, the five `hook_*` tools and
-# `session_export`).
+# `session_export`. 0.4.0 added NO tool: the WebSocket/DNS hook phases reach the
+# surface as three new `hook_add` PARAMETERS (find/replace/answer), and
+# `session auth` became a façade over the same `hook_*` machinery rather than a
+# sixth tool — still 42, verified by `tools/list` against the live stdio server).
 # Kept in exact sync with the real surface by `training/eval/surface.py --check`,
 # which grounds on a binary built from this checkout — see the note there about
 # the stale-binary false green that let 0.3.x land unverified.
@@ -414,6 +475,9 @@ KNOWN_CLI_FLAGS = {
     "--inject-header", "--inject-param", "--inject-if-absent", "--disabled",
     "--as", "--use", "--redact",          # session import / export session
     "--out", "--no-probe", "--quick",     # debug bundle / doctor
+    # 0.4.0: the WebSocket / DNS hook phases.
+    "--find", "--replace",                # hook add --action replace-payload
+    "--answer",                           # hook add --action set-answer
 }
 
 # Tools the engine commonly drives via `exec` (the sandboxed pentest tooling).
