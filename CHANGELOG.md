@@ -5,6 +5,21 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — the auth auto-refresh left a zombie behind on every 401
+The daemon spawns `burpwn session auth refresh` when it sees a 401/403 on a host that has an auth
+profile, detached with `setsid` so a slow login command can never block the proxy. It then dropped
+the child handle and never called `wait()`. `setsid` detaches the child's *session*, not its
+parentage: the daemon stays its parent, the kernel keeps the exit status around waiting to be
+collected, and the process table gains one `<defunct>` entry per refresh — for the whole life of
+the daemon. Against a target that expires tokens on a schedule, that is exactly one zombie per
+expiry, forever.
+
+The child is now owned by a task that does an **async** `wait()`, so the property the detachment
+buys is untouched: the daemon still never waits on a login command, a task parked on `SIGCHLD`
+does. Shutdown is not a race either way — if the runtime goes down first the task is dropped, the
+child is reparented to init, and init reaps it. The exit status stops being thrown away too: a
+refresh that fails now says so at `WARN` instead of vanishing.
+
 ### Fixed — a typo in a match/replace kind made a body rule, silently
 `burpwn match-replace add '*.api' heder '^Authorization:.*' 'Authorization: Bearer x'` used to
 succeed. `MatchKind::from_db` fell through to `Body` on anything it did not recognise, so the rule

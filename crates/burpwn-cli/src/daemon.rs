@@ -604,8 +604,11 @@ async fn auth_refresh_consumer(
                     scope = %profile.host,
                     "auth: observed 401/403 for a host with an auth profile; triggering refresh"
                 );
-                if let Err(e) = spawn_auth_refresh(&exe, &session, &profile.host) {
-                    tracing::warn!(error = %e, "auth: failed to spawn refresh");
+                match spawn_auth_refresh(&exe, &session, &profile.host) {
+                    // The reaper task owns the child from here; dropping its
+                    // handle neither cancels it nor kills the refresh.
+                    Ok(_reaper) => {}
+                    Err(e) => tracing::warn!(error = %e, "auth: failed to spawn refresh"),
                 }
             }
             Ok(None) => {} // no profile for this host: nothing to do.
@@ -614,12 +617,32 @@ async fn auth_refresh_consumer(
     }
 }
 
-/// Spawn a detached `burpwn --json session auth refresh --host <scope>` child.
+/// Spawn a detached `burpwn --json session auth refresh --host <scope>` child
+/// and hand it to a task that will `wait()` for it.
+///
 /// Detached (its own session) so a slow login command never blocks the daemon;
 /// stdio to /dev/null and fd 3 closed so it never pins the exec envelope pipe.
-fn spawn_auth_refresh(exe: &Path, session: &str, scope: &str) -> std::io::Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(exe);
+///
+/// `setsid` detaches the child's SESSION, not its PARENTAGE: the daemon remains
+/// its parent and still owes it a `wait()`. Nothing was making that call, so
+/// every 401/403-triggered refresh left a zombie in the process table until the
+/// daemon died — against a target that 401s on a schedule, one per refresh, for
+/// the whole life of the session. The reap therefore happens on its own tokio
+/// task doing an ASYNC `child.wait()`, which keeps exactly the property the
+/// detachment buys: the daemon never waits on the login command, a task parked
+/// on SIGCHLD does. Shutdown is not a race either way — if the runtime goes
+/// down first the task is simply dropped, the child (never `kill_on_drop`) is
+/// reparented to init, and init reaps it.
+///
+/// Returns the reaper's handle, which yields the child's pid once reaped.
+/// Dropping the handle does not cancel the task; the daemon drops it, tests
+/// await it.
+fn spawn_auth_refresh(
+    exe: &Path,
+    session: &str,
+    scope: &str,
+) -> std::io::Result<tokio::task::JoinHandle<Option<u32>>> {
+    let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--json")
         .arg("session")
         .arg("auth")
@@ -643,7 +666,18 @@ fn spawn_auth_refresh(exe: &Path, session: &str, scope: &str) -> std::io::Result
             Ok(())
         });
     }
-    cmd.spawn().map(|_child| ())
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    Ok(tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                tracing::debug!(?pid, "auth: refresh child finished")
+            }
+            Ok(status) => tracing::warn!(?pid, %status, "auth: refresh child failed"),
+            Err(e) => tracing::warn!(?pid, error = %e, "auth: could not reap refresh child"),
+        }
+        pid
+    }))
 }
 
 /// Write `{ "dns_port": <port> }` to `ports.json`.
@@ -1216,5 +1250,76 @@ mod tests {
         let mut admin = ControlClient::connect(&sock).await.unwrap();
         let _ = admin.shutdown().await;
         let _ = server.await;
+    }
+
+    /// Whether `pid` is currently a ZOMBIE child of this process. `/proc/<pid>/stat`
+    /// puts `state` and `ppid` right after the comm, which is parenthesised and can
+    /// itself contain spaces — so split after the LAST `)`.
+    fn is_zombie_child(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(rest) = stat.rsplit(')').next() else {
+            return false;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let ppid: u32 = fields.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        state == "Z" && ppid == std::process::id()
+    }
+
+    /// The auth auto-refresh used to `spawn()` and throw the handle away, so every
+    /// 401/403 left a zombie behind for the daemon's whole life. Spawning a batch
+    /// must leave the process table exactly as it found it.
+    ///
+    /// `/bin/true` stands in for the burpwn binary: it ignores the argv and exits
+    /// immediately, which is the shape that made the leak accumulate fastest.
+    #[tokio::test]
+    async fn auth_refresh_children_are_reaped_never_left_zombie() {
+        let exe = Path::new("/bin/true");
+        if !exe.exists() {
+            return; // non-FHS host; nothing meaningful to assert
+        }
+
+        // Negative control, so the assertion below cannot pass vacuously: a child
+        // nobody waits on IS a zombie, and stays one until reaped — the state is
+        // permanent, so polling for it cannot miss a window.
+        let mut orphan = std::process::Command::new(exe)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn control child");
+        let orphan_pid = orphan.id();
+        let mut seen_zombie = false;
+        for _ in 0..500 {
+            if is_zombie_child(orphan_pid) {
+                seen_zombie = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            seen_zombie,
+            "an unwaited child must show up as a zombie — otherwise this test proves nothing"
+        );
+        orphan.wait().expect("reap the control child");
+
+        let mut reapers = Vec::new();
+        for _ in 0..8 {
+            reapers.push(spawn_auth_refresh(exe, "default", "api.test").expect("spawn"));
+        }
+
+        for reaper in reapers {
+            // The task completing means `wait()` returned, i.e. the child is
+            // reaped by definition — no sleep, no scheduler dependence.
+            let pid = reaper
+                .await
+                .expect("reaper task must not panic")
+                .expect("a freshly spawned child has a pid");
+            assert!(
+                !is_zombie_child(pid),
+                "pid {pid} is still a zombie child of this process"
+            );
+        }
     }
 }
