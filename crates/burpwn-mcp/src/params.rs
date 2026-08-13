@@ -92,6 +92,53 @@ pub struct NoteAddParams {
     pub body: String,
 }
 
+/// `group_new` — create (or re-describe) a named collection of flows.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GroupNewParams {
+    /// Group name, unique within the workspace — the handle every other group
+    /// tool takes (e.g. `auth-flow`, `xss-fuzz-search-param`).
+    pub name: String,
+    /// What this collection means, in prose, e.g. "login form → POST /login →
+    /// redirect + Set-Cookie session". Omit to keep an existing description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Workspace id to create it in (defaults to the session's default
+    /// workspace, id 1).
+    #[serde(default)]
+    pub workspace: Option<i64>,
+}
+
+/// `group_add` — put flows into a group.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GroupAddParams {
+    /// Name of an existing group.
+    pub name: String,
+    /// Flow ids to add. Adding a flow twice is a no-op.
+    pub flow_ids: Vec<i64>,
+}
+
+/// `group_list` — list groups with their descriptions and sizes.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct GroupListParams {
+    /// Restrict to a workspace id (omit for every workspace).
+    #[serde(default)]
+    pub workspace: Option<i64>,
+}
+
+/// `group_show` — the flows in one group.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GroupShowParams {
+    /// Group name.
+    pub name: String,
+}
+
+/// `group_rm` — delete a group (the flows survive).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GroupRmParams {
+    /// Group name.
+    pub name: String,
+}
+
 /// `workspace_new` — create a workspace.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WorkspaceNewParams {
@@ -365,6 +412,30 @@ mod tests {
         .unwrap();
         assert_eq!(p.mode, "cluster-bomb");
         assert_eq!(p.positions, vec!["3:4"]);
+    }
+
+    #[test]
+    fn group_params_decode_with_and_without_optionals() {
+        let p: GroupNewParams = serde_json::from_str(r#"{"name":"auth-flow"}"#).unwrap();
+        assert_eq!(p.name, "auth-flow");
+        assert!(p.description.is_none() && p.workspace.is_none());
+        let p: GroupNewParams = serde_json::from_str(
+            r#"{"name":"auth-flow","description":"login -> POST /login","workspace":2}"#,
+        )
+        .unwrap();
+        assert_eq!(p.description.as_deref(), Some("login -> POST /login"));
+        assert_eq!(p.workspace, Some(2));
+
+        let p: GroupAddParams =
+            serde_json::from_str(r#"{"name":"auth-flow","flow_ids":[3,5,9]}"#).unwrap();
+        assert_eq!(p.flow_ids, vec![3, 5, 9]);
+
+        let p: GroupListParams = serde_json::from_str("{}").unwrap();
+        assert!(p.workspace.is_none());
+        let p: GroupShowParams = serde_json::from_str(r#"{"name":"g"}"#).unwrap();
+        assert_eq!(p.name, "g");
+        let p: GroupRmParams = serde_json::from_str(r#"{"name":"g"}"#).unwrap();
+        assert_eq!(p.name, "g");
     }
 
     #[test]

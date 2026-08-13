@@ -229,6 +229,142 @@ pub async fn note_add(
     Ok(json!({ "note_id": id }))
 }
 
+// --- groups (named collections of flows) -----------------------------------
+
+/// Resolve a group NAME to its row, or fail with the `GroupNotFound` code so the
+/// agent can branch on it instead of parsing prose.
+fn resolve_group(
+    reader: &burpwn_store::Reader,
+    name: &str,
+    workspace_id: Option<i64>,
+) -> Result<burpwn_store::model::Group> {
+    match reader.group_by_name(name, workspace_id)? {
+        Some(g) => Ok(g),
+        None => Err(burpwn_cli::coded!(
+            ErrorCode::GroupNotFound,
+            "no such group: {name}"
+        )),
+    }
+}
+
+/// `group_new` — create (or re-describe) a named collection of flows.
+pub async fn group_new(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::GroupNewParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let workspace_id = params
+        .workspace
+        .unwrap_or(burpwn_store::schema::DEFAULT_WORKSPACE_ID);
+    let existed = store
+        .reader()
+        .group_by_name(&params.name, Some(workspace_id))?
+        .is_some();
+    let id = store
+        .writer()
+        .create_group(
+            params.name.clone(),
+            params.description.clone(),
+            workspace_id,
+            now_ms(),
+        )
+        .await?;
+    Ok(json!({
+        "group_id": id,
+        "name": params.name,
+        "workspace_id": workspace_id,
+        "created": !existed,
+    }))
+}
+
+/// `group_add` — add flows to a group, refusing the whole call if any id is
+/// unknown (a half-populated group is worse than a clear error).
+pub async fn group_add(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::GroupAddParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let group = resolve_group(&reader, &params.name, None)?;
+    for id in &params.flow_ids {
+        if !reader.flow_exists(*id)? {
+            return Err(burpwn_cli::coded!(
+                ErrorCode::InputNoSuchFlow,
+                "no such flow: {id}"
+            ));
+        }
+    }
+    for id in &params.flow_ids {
+        store.writer().add_flow_to_group(*id, group.id).await?;
+    }
+    Ok(json!({
+        "group_id": group.id,
+        "name": group.name,
+        "added": params.flow_ids,
+        "flow_count": reader.group_flow_count(group.id)?,
+    }))
+}
+
+/// `group_list` — every group with its description and size.
+pub fn group_list(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::GroupListParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let groups = reader.list_groups(params.workspace)?;
+    let mut view = Vec::with_capacity(groups.len());
+    for g in &groups {
+        view.push(json!({
+            "id": g.id,
+            "name": g.name,
+            "description": g.description,
+            "workspace_id": g.workspace_id,
+            "created_at": g.created_at,
+            "flow_count": reader.group_flow_count(g.id)?,
+        }));
+    }
+    Ok(json!({ "groups": view, "count": groups.len() }))
+}
+
+/// `group_show` — the flows a group holds (same row shape as `req_list`).
+pub fn group_show(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::GroupShowParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let reader = store.reader();
+    let group = resolve_group(&reader, &params.name, None)?;
+    let flows = reader.flows_in_group(group.id)?;
+    Ok(json!({
+        "group": {
+            "id": group.id,
+            "name": group.name,
+            "description": group.description,
+            "workspace_id": group.workspace_id,
+            "created_at": group.created_at,
+        },
+        "flows": flows,
+        "count": flows.len(),
+    }))
+}
+
+/// `group_rm` — delete a group; the flows it held stay captured.
+pub async fn group_rm(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::GroupRmParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let group = resolve_group(&store.reader(), &params.name, None)?;
+    store.writer().delete_group(group.id).await?;
+    Ok(json!({ "group_id": group.id, "name": group.name, "deleted": true }))
+}
+
 /// `workspace_new` — create a workspace.
 pub async fn workspace_new(
     paths: &Paths,
@@ -961,6 +1097,107 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn group_tools_roundtrip_and_refuse_unknown_names() {
+        let (_d, paths, s) = temp_session().await;
+        let fid = seed_one_flow(&paths, &s).await;
+
+        // Adding to a group that does not exist is a clean, coded failure.
+        assert!(group_add(
+            &paths,
+            &s,
+            &crate::params::GroupAddParams {
+                name: "nope".into(),
+                flow_ids: vec![fid],
+            }
+        )
+        .await
+        .is_err());
+
+        let new = crate::params::GroupNewParams {
+            name: "auth-flow".into(),
+            description: Some("login form -> POST /login -> Set-Cookie".into()),
+            workspace: None,
+        };
+        let v = group_new(&paths, &s, &new).await.unwrap();
+        assert_eq!(v["created"], true);
+        // Idempotent: the second create returns the SAME group, not an error.
+        let again = group_new(&paths, &s, &new).await.unwrap();
+        assert_eq!(again["created"], false);
+        assert_eq!(again["group_id"], v["group_id"]);
+
+        // One bogus id fails the whole call and adds nothing.
+        assert!(group_add(
+            &paths,
+            &s,
+            &crate::params::GroupAddParams {
+                name: "auth-flow".into(),
+                flow_ids: vec![fid, 9999],
+            }
+        )
+        .await
+        .is_err());
+        let shown = group_show(
+            &paths,
+            &s,
+            &crate::params::GroupShowParams {
+                name: "auth-flow".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(shown["count"], 0);
+
+        group_add(
+            &paths,
+            &s,
+            &crate::params::GroupAddParams {
+                name: "auth-flow".into(),
+                flow_ids: vec![fid],
+            },
+        )
+        .await
+        .unwrap();
+        let shown = group_show(
+            &paths,
+            &s,
+            &crate::params::GroupShowParams {
+                name: "auth-flow".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(shown["count"], 1);
+        assert_eq!(shown["flows"][0]["id"], fid);
+        assert_eq!(
+            shown["group"]["description"],
+            "login form -> POST /login -> Set-Cookie"
+        );
+
+        let listed = group_list(&paths, &s, &crate::params::GroupListParams::default()).unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["groups"][0]["flow_count"], 1);
+
+        // Deleting the group leaves the flow itself captured.
+        group_rm(
+            &paths,
+            &s,
+            &crate::params::GroupRmParams {
+                name: "auth-flow".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(group_show(
+            &paths,
+            &s,
+            &crate::params::GroupShowParams {
+                name: "auth-flow".into()
+            }
+        )
+        .is_err());
+        let flows = req_list(&paths, &s, &crate::params::ReqListParams::default()).unwrap();
+        assert_eq!(flows["count"], 1);
     }
 
     #[tokio::test]

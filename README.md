@@ -15,9 +15,9 @@ executes inside a rootless Linux sandbox whose **entire** network (HTTP/HTTPS/DN
 through a built-in intercepting proxy. The agent can then go back through history, search and filter
 the decrypted request/response flows, replay and edit them (Repeater), fuzz them with a native
 Intruder, diff responses, encode/decode tokens, keep itself authenticated with a login macro, apply
-match/replace rules, block and rewrite traffic in flight, and organize flows into workspaces — all
-from a scriptable CLI or over MCP (31 tools). It is at once a Burp and a tshark, but driven by an
-agent.
+match/replace rules, block and rewrite traffic in flight, and organize flows into workspaces and
+named groups — all from a scriptable CLI or over MCP (36 tools). It is at once a Burp and a tshark,
+but driven by an agent.
 
 > **Status:** early development. See the milestones below.
 
@@ -72,6 +72,10 @@ burpwn session auth set --login 'curl -s https://target.example/login -d u=a' \
   --extract '"token":"([^"]+)"' --header 'Authorization: Bearer {}'  # login-macro refresh on 401/403
 burpwn intercept scope target.example --path /admin  # narrow blocking intercept
 burpwn intercept enable                        # blocking intercept (also via MCP await_intercept)
+burpwn group new auth-flow \
+  --description 'login form -> POST /login -> redirect + Set-Cookie'  # name a scenario
+burpwn group add auth-flow 3 5 9               # …and pin the flows that prove it
+burpwn group show auth-flow                    # replay it later; `export har --group auth-flow`
 burpwn session stats                           # capture-completeness: flags execs that captured nothing
 burpwn init --check                            # verify each agent hook really rewrites to `burpwn exec`
 ```

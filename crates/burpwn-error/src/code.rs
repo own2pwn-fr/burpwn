@@ -163,6 +163,8 @@ pub enum ErrorCode {
     WorkspaceNotFound,
     /// burpwn cannot determine where to put its data or config.
     SessionNoDataDir,
+    /// No flow group by that name exists.
+    GroupNotFound,
 
     // --- input (exit 75) ---------------------------------------------------
     /// A flag was given a value outside its allowed set.
@@ -226,9 +228,8 @@ impl ErrorCode {
                 ErrorClass::Store
             }
             TlsCaInit | TlsCaLoad | TlsCaMalformed | TlsLeafMint => ErrorClass::Tls,
-            SessionInvalidName | SessionNotFound | WorkspaceNotFound | SessionNoDataDir => {
-                ErrorClass::Session
-            }
+            SessionInvalidName | SessionNotFound | WorkspaceNotFound | SessionNoDataDir
+            | GroupNotFound => ErrorClass::Session,
             InputInvalidValue
             | InputNoSuchFlow
             | InputNoSuchAttack
@@ -279,6 +280,7 @@ impl ErrorCode {
             SessionNotFound => 2,
             WorkspaceNotFound => 3,
             SessionNoDataDir => 4,
+            GroupNotFound => 5,
 
             InputInvalidValue => 1,
             InputNoSuchFlow => 2,
@@ -346,6 +348,7 @@ impl ErrorCode {
             SessionNotFound => "no such session",
             WorkspaceNotFound => "no such workspace",
             SessionNoDataDir => "burpwn cannot determine where to store its data",
+            GroupNotFound => "no such flow group",
 
             InputInvalidValue => "a flag was given an unsupported value",
             InputNoSuchFlow => "no such flow",
@@ -461,6 +464,9 @@ impl ErrorCode {
             SessionNoDataDir => vec![
                 "set `$XDG_DATA_HOME` or `$HOME` to a writable directory",
             ],
+            GroupNotFound => vec![
+                "list them with `burpwn group list`, or create it with `burpwn group new <name>`",
+            ],
 
             InputInvalidValue => vec!["the accepted values are listed in the message above"],
             InputNoSuchFlow => vec!["list captured flows with `burpwn req list`"],
@@ -532,6 +538,7 @@ impl ErrorCode {
         ErrorCode::SessionNotFound,
         ErrorCode::WorkspaceNotFound,
         ErrorCode::SessionNoDataDir,
+        ErrorCode::GroupNotFound,
         ErrorCode::InputInvalidValue,
         ErrorCode::InputNoSuchFlow,
         ErrorCode::InputNoSuchAttack,
@@ -582,7 +589,7 @@ mod tests {
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(*code, back);
         }
-        assert_eq!(ErrorCode::ALL.len(), 42, "register new codes in ALL");
+        assert_eq!(ErrorCode::ALL.len(), 43, "register new codes in ALL");
     }
 
     #[test]

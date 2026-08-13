@@ -235,6 +235,71 @@ impl BurpwnServer {
             .and_then(ok_json)
     }
 
+    // --- groups (named collections of flows) ------------------------------
+
+    #[tool(
+        description = "Create a NAMED, described collection of flows (a 'group' — the equivalent of a Burp highlight). Use it the moment you understand something worth keeping: once you have worked out how the target authenticates, create group_new(name='auth-flow', description='login form -> POST /login -> redirect + Set-Cookie session') and add the flows that prove it; do the same to isolate one campaign (name='xss-fuzz-search-param'). The description is for your future self and for the report — say what the sequence MEANS, not that it exists. Idempotent: re-creating an existing name returns the same group and just updates its description."
+    )]
+    async fn group_new(
+        &self,
+        Parameters(params): Parameters<GroupNewParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::group_new(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Add captured flows to a group by its name, e.g. the three requests that make up a login sequence: group_add(name='auth-flow', flow_ids=[3,5,9]). Flow ids come from req_list/req_search/exec. Adding a flow twice is a no-op; an unknown flow id fails the whole call rather than half-filling the group."
+    )]
+    async fn group_add(
+        &self,
+        Parameters(params): Parameters<GroupAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::group_add(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "List the flow groups in the session with their description and flow count — the index of the scenarios recorded so far. Read it before re-deriving something (an auth sequence may already be captured under a name)."
+    )]
+    async fn group_list(
+        &self,
+        Parameters(params): Parameters<GroupListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::group_list(self.paths(), self.session(), &params)
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Show one group: its description plus every flow in it, in the same row shape as req_list. This is how you replay a documented scenario — read the group, then req_show/req_replay its flows in order."
+    )]
+    async fn group_show(
+        &self,
+        Parameters(params): Parameters<GroupShowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::group_show(self.paths(), self.session(), &params)
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Delete a flow group by name. Only the grouping is removed — the captured flows stay in the session and remain listable."
+    )]
+    async fn group_rm(
+        &self,
+        Parameters(params): Parameters<GroupRmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::group_rm(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
     #[tool(description = "Create a new workspace.")]
     async fn workspace_new(
         &self,
@@ -438,8 +503,10 @@ impl ServerHandler for BurpwnServer {
                  (intercept_enable, await_intercept long-poll, intercept_forward/drop). \
                  Offensive tooling: req_replay (Repeater), fuzz/fuzz_list/fuzz_results \
                  (Intruder), compare (structured flow diff + reflection check), and \
-                 encode/decode (base64/url/hex/jwt). Tools operate on the active \
-                 session unless the server was started with --session."
+                 encode/decode (base64/url/hex/jwt). Findings are kept as named \
+                 collections (group_new/group_add/group_list/group_show/group_rm), \
+                 tags and notes. Tools operate on the active session unless the \
+                 server was started with --session."
                     .into(),
             ),
             ..Default::default()

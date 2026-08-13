@@ -4,11 +4,14 @@
 //! # What it exposes
 //!
 //! Query (read the session SQLite via [`burpwn_store::Reader`], no daemon needed):
-//! `session_list`, `session_current`, `req_list`, `req_show`, `req_search`,
-//! `workspace_list`, `tag_list`, `match_replace_list`.
+//! `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
+//! `req_search`, `workspace_list`, `tag_list`, `group_list`, `group_show`,
+//! `match_replace_list`, `session_auth_status`.
 //!
 //! Mutation (write via the store): `match_replace_add`, `tag_add`, `note_add`,
-//! `workspace_new`.
+//! `workspace_new`, and the flow groups — `group_new`, `group_add`, `group_rm`
+//! — which pin a named, described subset of the capture (a reconstructed auth
+//! scenario, one fuzzing campaign) to a handle the agent can come back to.
 //!
 //! Offensive (Repeater / Intruder / utilities): `req_replay` (replay a stored
 //! flow with edits), `fuzz` / `fuzz_list` / `fuzz_results` (payload fuzzing,

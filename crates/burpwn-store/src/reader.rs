@@ -49,22 +49,36 @@ impl Reader {
     /// List flows matching `filter`, newest first.
     pub fn list_flows(&self, filter: &FlowFilter) -> Result<Vec<FlowRow>> {
         let conn = self.conn()?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        // `group_id` filters by membership, so it is an INNER join rather than a
+        // WHERE clause. `flow_groups` is keyed on (flow_id, group_id), so the
+        // join can never duplicate a flow row. Its placeholder sits in the FROM
+        // clause, i.e. BEFORE every WHERE placeholder — the params are bound
+        // positionally, so this one has to be pushed first.
+        let group_join = match filter.group_id {
+            Some(gid) => {
+                params.push(Box::new(gid));
+                " JOIN flow_groups fg ON fg.flow_id = f.id AND fg.group_id = ?"
+            }
+            None => "",
+        };
+
         // The extra blob joins back the request/response header blobs and the
         // response body blob so `header_contains` (substring over decoded headers)
         // and `min/max_resp_len` (response body size) can filter at the SQL layer.
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT f.id, f.workspace_id, f.ts_start, f.ts_end, f.protocol, f.scheme,
                     f.dst_ip, f.dst_port, f.sni, f.intercepted,
                     r.method, r.authority, r.path, resp.status
-             FROM flows f
+             FROM flows f{group_join}
              LEFT JOIN requests r ON r.flow_id = f.id
              LEFT JOIN responses resp ON resp.flow_id = f.id
              LEFT JOIN blobs reqh ON reqh.id = r.headers_blob_id
              LEFT JOIN blobs resph ON resph.id = resp.headers_blob_id
              LEFT JOIN blobs respb ON respb.id = resp.body_blob_id
-             WHERE 1=1",
+             WHERE 1=1"
         );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(ws) = filter.workspace_id {
             sql.push_str(" AND f.workspace_id = ?");
@@ -243,6 +257,16 @@ impl Reader {
             body: load_blob_or_empty(conn, bid)?,
             timing_ms,
         }))
+    }
+
+    /// Whether a flow id exists. Cheap existence check for callers validating
+    /// user input — unlike [`Reader::get_flow`] it decodes no blobs.
+    pub fn flow_exists(&self, id: i64) -> Result<bool> {
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM flows WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?;
+        Ok(n > 0)
     }
 
     /// Fetch a decoded blob by id.
@@ -471,27 +495,74 @@ impl Reader {
         let conn = self.conn()?;
         let (sql, ws) = match workspace_id {
             Some(_) => (
-                "SELECT id, name, workspace_id FROM groups WHERE workspace_id = ?1 ORDER BY name",
+                "SELECT id, name, description, workspace_id, created_at FROM groups
+                 WHERE workspace_id = ?1 ORDER BY name",
                 workspace_id,
             ),
             None => (
-                "SELECT id, name, workspace_id FROM groups ORDER BY name",
+                "SELECT id, name, description, workspace_id, created_at FROM groups ORDER BY name",
                 None,
             ),
         };
         let mut stmt = conn.prepare(sql)?;
-        let mapper = |r: &rusqlite::Row| {
-            Ok(Group {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                workspace_id: r.get(2)?,
-            })
-        };
         let rows = match ws {
-            Some(w) => stmt.query_map([w], mapper)?,
-            None => stmt.query_map([], mapper)?,
+            Some(w) => stmt.query_map([w], row_to_group)?,
+            None => stmt.query_map([], row_to_group)?,
         };
         collect(rows)
+    }
+
+    /// Look a group up by NAME — the handle the CLI and MCP tools take.
+    ///
+    /// The name is unique per workspace (schema v5), so `workspace_id = Some(..)`
+    /// is an exact lookup. With `None` the search spans every workspace and the
+    /// OLDEST (lowest-id) match wins, so a name reused in a second workspace
+    /// never silently retargets commands aimed at the original group; pass the
+    /// workspace to address that one.
+    pub fn group_by_name(&self, name: &str, workspace_id: Option<i64>) -> Result<Option<Group>> {
+        let conn = self.conn()?;
+        let row = match workspace_id {
+            Some(ws) => conn
+                .query_row(
+                    "SELECT id, name, description, workspace_id, created_at FROM groups
+                     WHERE name = ?1 AND workspace_id = ?2",
+                    rusqlite::params![name, ws],
+                    row_to_group,
+                )
+                .ok(),
+            None => conn
+                .query_row(
+                    "SELECT id, name, description, workspace_id, created_at FROM groups
+                     WHERE name = ?1 ORDER BY id LIMIT 1",
+                    [name],
+                    row_to_group,
+                )
+                .ok(),
+        };
+        Ok(row)
+    }
+
+    /// The flows that belong to a group, newest first (same row shape and
+    /// ordering as [`Reader::list_flows`], which is what renders them).
+    pub fn flows_in_group(&self, group_id: i64) -> Result<Vec<FlowRow>> {
+        self.list_flows(&FlowFilter {
+            group_id: Some(group_id),
+            // A group is a hand-picked collection, not a firehose; lift the
+            // default 100-row cap so `group show` never truncates one silently.
+            limit: Some(100_000),
+            ..Default::default()
+        })
+    }
+
+    /// How many flows a group holds (for listings that show a size without
+    /// fetching every row).
+    pub fn group_flow_count(&self, group_id: i64) -> Result<i64> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM flow_groups WHERE group_id = ?1",
+            [group_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// List notes on a flow, oldest first.
@@ -653,6 +724,18 @@ impl Reader {
         )
         .map_err(Into::into)
     }
+}
+
+/// Map a `groups` row (id, name, description, workspace_id, created_at) into a
+/// [`Group`].
+fn row_to_group(r: &rusqlite::Row) -> rusqlite::Result<Group> {
+    Ok(Group {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        workspace_id: r.get(3)?,
+        created_at: r.get(4)?,
+    })
 }
 
 /// Map an `auth_profiles` row into an [`AuthProfile`].

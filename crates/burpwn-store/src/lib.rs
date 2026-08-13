@@ -480,7 +480,12 @@ mod tests {
 
         // Group CRUD.
         let group_id = w
-            .create_group("auth-flows", schema::DEFAULT_WORKSPACE_ID)
+            .create_group(
+                "auth-flows",
+                Some("login form -> POST /login".into()),
+                schema::DEFAULT_WORKSPACE_ID,
+                42,
+            )
             .await
             .unwrap();
         let groups = reader
@@ -488,6 +493,11 @@ mod tests {
             .unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].id, group_id);
+        assert_eq!(
+            groups[0].description.as_deref(),
+            Some("login form -> POST /login")
+        );
+        assert_eq!(groups[0].created_at, 42);
 
         // Intercept queue.
         let intercept_id = w.enqueue_intercept(flow_id, 500).await.unwrap();
@@ -503,6 +513,173 @@ mod tests {
             .unwrap();
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].resolved_at, Some(600));
+    }
+
+    /// Flow groups end to end: membership, the `group_id` filter, and the
+    /// lifecycle guarantee that deleting a group never deletes captures.
+    #[tokio::test]
+    async fn group_membership_filters_flows_and_outlives_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        // Three flows; two of them make up the "auth" sequence.
+        let mut ids = Vec::new();
+        for (method, path) in [("GET", "/login"), ("GET", "/unrelated"), ("POST", "/login")] {
+            let id = w.flow_start(sample_flow()).await.unwrap();
+            w.request(
+                id,
+                RequestData {
+                    method: method.into(),
+                    authority: "example.com".into(),
+                    path: path.into(),
+                    http_version: "HTTP/1.1".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let (f_get, f_other, f_post) = (ids[0], ids[1], ids[2]);
+
+        let gid = w
+            .create_group(
+                "auth-flow",
+                Some("login form -> POST /login -> redirect + Set-Cookie".into()),
+                schema::DEFAULT_WORKSPACE_ID,
+                1000,
+            )
+            .await
+            .unwrap();
+        w.add_flow_to_group(f_get, gid).await.unwrap();
+        w.add_flow_to_group(f_post, gid).await.unwrap();
+        // Re-adding an existing member is a no-op, not a duplicate.
+        w.add_flow_to_group(f_get, gid).await.unwrap();
+        assert_eq!(reader.group_flow_count(gid).unwrap(), 2);
+
+        // `flows_in_group` returns exactly the members, newest first.
+        let members: Vec<i64> = reader
+            .flows_in_group(gid)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(members, vec![f_post, f_get]);
+        assert!(!members.contains(&f_other));
+
+        // The group filter COMPOSES with the other filters rather than
+        // replacing them (this is what `req list --group X --method POST` does).
+        let post_only = reader
+            .list_flows(&FlowFilter {
+                group_id: Some(gid),
+                method: Some("POST".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(post_only.len(), 1);
+        assert_eq!(post_only[0].id, f_post);
+
+        // An empty/unknown group filters everything out rather than erroring.
+        assert!(reader
+            .list_flows(&FlowFilter {
+                group_id: Some(9999),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+
+        // Name resolution.
+        let by_name = reader
+            .group_by_name("auth-flow", Some(schema::DEFAULT_WORKSPACE_ID))
+            .unwrap()
+            .expect("group by name");
+        assert_eq!(by_name.id, gid);
+        assert_eq!(by_name.created_at, 1000);
+        assert!(reader
+            .group_by_name("no-such-group", None)
+            .unwrap()
+            .is_none());
+        // Right name, wrong workspace: not found.
+        assert!(reader
+            .group_by_name("auth-flow", Some(4242))
+            .unwrap()
+            .is_none());
+
+        // Removing a member leaves the flow captured; removing a non-member is
+        // a silent no-op.
+        w.remove_flow_from_group(f_get, gid).await.unwrap();
+        w.remove_flow_from_group(f_get, gid).await.unwrap();
+        assert_eq!(reader.group_flow_count(gid).unwrap(), 1);
+        assert!(reader.flow_exists(f_get).unwrap());
+
+        // Deleting the group drops the grouping ONLY.
+        w.delete_group(gid).await.unwrap();
+        assert!(reader.group_by_name("auth-flow", None).unwrap().is_none());
+        assert_eq!(reader.group_flow_count(gid).unwrap(), 0);
+        assert_eq!(reader.list_flows(&FlowFilter::default()).unwrap().len(), 3);
+    }
+
+    /// `create_group` is a create-or-update keyed on (workspace, name), and a
+    /// membership can only reference a flow that exists.
+    #[tokio::test]
+    async fn create_group_is_idempotent_and_membership_is_referential() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+
+        let first = w
+            .create_group("xss-fuzz", Some("search param".into()), 1, 10)
+            .await
+            .unwrap();
+        // Same name, same workspace → same group, description untouched by a
+        // `None` and overwritten by a `Some`.
+        let again = w.create_group("xss-fuzz", None, 1, 999).await.unwrap();
+        assert_eq!(again, first);
+        assert_eq!(
+            reader
+                .group_by_name("xss-fuzz", Some(1))
+                .unwrap()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("search param")
+        );
+        let updated = w
+            .create_group("xss-fuzz", Some("now the sort param".into()), 1, 999)
+            .await
+            .unwrap();
+        assert_eq!(updated, first);
+        let g = reader.group_by_name("xss-fuzz", Some(1)).unwrap().unwrap();
+        assert_eq!(g.description.as_deref(), Some("now the sort param"));
+        // The original creation timestamp survives the update.
+        assert_eq!(g.created_at, 10);
+        assert_eq!(reader.list_groups(None).unwrap().len(), 1);
+
+        // The SAME name in another workspace is a DIFFERENT group.
+        let other_ws = w.create_workspace("recon", 0).await.unwrap();
+        let elsewhere = w
+            .create_group("xss-fuzz", None, other_ws, 20)
+            .await
+            .unwrap();
+        assert_ne!(elsewhere, first);
+        assert_eq!(reader.list_groups(None).unwrap().len(), 1 + 1);
+        assert_eq!(reader.list_groups(Some(other_ws)).unwrap().len(), 1);
+        // Unscoped resolution picks the OLDEST match, so the original group
+        // keeps answering to its name.
+        assert_eq!(
+            reader.group_by_name("xss-fuzz", None).unwrap().unwrap().id,
+            first
+        );
+
+        // A membership for a flow that does not exist is refused (FK), and the
+        // cheap existence check agrees.
+        assert!(!reader.flow_exists(9999).unwrap());
+        assert!(w.add_flow_to_group(9999, first).await.is_err());
+        assert_eq!(reader.group_flow_count(first).unwrap(), 0);
     }
 
     #[tokio::test]
