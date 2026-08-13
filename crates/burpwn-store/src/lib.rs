@@ -17,7 +17,8 @@
 //!   payload storage.
 //! - [`bundle`] packs a whole session into one portable file (`VACUUM INTO` +
 //!   manifest + zstd) and unpacks one back, so a session can travel to another
-//!   machine.
+//!   machine; [`scrub`] is the credential masking its `--redact` mode applies to
+//!   the captured traffic on the way out.
 //!
 //! # Example
 //!
@@ -48,6 +49,7 @@ pub mod error;
 pub mod model;
 pub mod reader;
 pub mod schema;
+pub mod scrub;
 pub mod writer;
 
 use std::path::Path;

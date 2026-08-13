@@ -5,6 +5,58 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — `export session --redact` now scrubs the CAPTURE, not just what burpwn stored
+`--redact` used to stop at burpwn's own tables: the auth profiles' tokens and login commands, the
+match/replace replacements, an `exec` hook's parameters. Every `Authorization`, `Cookie` and
+`Set-Cookie` header the proxy had *recorded*, and every login body it had captured, went into the
+bundle in the clear. That was documented, and a test asserted it, so nobody was being lied to — but
+"I redacted it" and "I redacted the half you weren't worried about" are not the same sentence in an
+operator's head, and the second one is the kind of thing you find out afterwards.
+
+The reason for stopping was that a blob's SHA-256 **is** its deduplication identity, so rewriting a
+body invalidates its address, and that `flows_fts` holds a decoded copy of the same text. Both are
+true. What re-reading the code changed is the weight of them: redaction has always run on a
+**throwaway `VACUUM INTO` copy**, never on the live session, so "this breaks dedup" means "this
+breaks dedup in a file we are about to compress and hand away". Restoring the invariant on that copy
+is bookkeeping, not surgery — every blob is re-bucketed by the hash of its *scrubbed* bytes, the
+lowest id per bucket survives, the references follow, and each surviving row's `sha256` is
+recomputed so a later write into the imported session cannot find a hash pointing at different
+content. References live in four INTEGER columns and one that is easy to miss:
+`ws_messages.payload_blob` stores the blob row id **as TEXT**, and a remap that only walked the
+foreign keys would have left websocket payloads resolving to nothing. `flows_fts` is an ordinary
+content-carrying fts5 table, so its rows are scrubbed with an `UPDATE` — no rebuild, no dropped
+index, `burpwn search` still works on import and no longer finds the token.
+
+One thing had to be measured rather than reasoned about: **deleting a row does not remove its bytes
+from the file.** SQLite parks the freed pages on its freelist with the content intact, and zstd
+compresses those just as faithfully as the live ones. On a session where 300 request-header blobs
+fold onto one, the first token is still literally in the database after redaction, even though no
+query returns it. So a redacted export now takes a second `VACUUM INTO` — the file that gets
+compressed is rebuilt from the surviving rows only. A test greps the decompressed bundle for the
+token rather than querying it, which is the only version of that assertion worth having.
+
+What `--redact` masks now: the value of an `Authorization`, `Proxy-Authorization`, `Cookie`,
+`Set-Cookie` or common `X-…-Token` / `X-Api-Key` header, and the value of a `password`-, `token`-,
+`api_key`-style parameter in a query string, a form body or a JSON document — in the stored bodies,
+in the `requests.path` column and in the search index alike. Plus, on the stored side, the
+`burpwn exec` command lines, which carry credentials in their argv exactly like the login commands
+already covered.
+
+What it does **not** mask, said plainly because the name invites the opposite assumption: it is a
+**shape** matcher, not a secret detector. A token echoed back under a field name nobody would guess,
+a session id baked into a URL path segment, a credential inside a binary or compressed body, an
+operator's notes and fuzzing payloads — all still in the file. That is a deliberate floor, not an
+oversight: a scrubber aggressive enough to catch an unlabelled secret (every long opaque run, which
+is what debug reports get) would shred the HTML, JSON and base64 that make a capture worth keeping.
+Tests pin both halves — the masked values are grepped for in the bundle bytes *and* in the imported
+session, and an unlabelled secret is asserted to survive — so widening or narrowing the claim breaks
+a test rather than a promise. The CLI warning, the `--json` envelope and the MCP reply now say all of
+this every time, redacted or not; `session_export` used to omit the warning when `redact=true`.
+
+The default is **untouched**: an export is still the session exactly as captured, because that is
+what makes it replayable. `--redact` is opt-in, and a redacted bundle is explicitly not a replayable
+one — the auth profiles and `exec` hooks are gone by design.
+
 ### Added — `export pcap`, and an honest answer to what a pcap of burpwn can even be
 `burpwn export pcap` has errored on purpose since 0.2.0. It now writes a **pcapng** that Wireshark,
 tshark and tcpdump open: `Follow HTTP stream` works, the HTTP dissector labels the exchanges, and

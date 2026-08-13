@@ -100,9 +100,11 @@ pub struct SessionExportParams {
     /// directory.
     #[serde(default)]
     pub output: Option<String>,
-    /// Drop the stored auth tokens, login commands and match/replace
-    /// replacements. Credentials captured inside recorded requests/responses
-    /// (Authorization / Cookie headers, login bodies) are NOT scrubbed.
+    /// Drop the stored auth tokens, login/exec commands and match/replace
+    /// replacements, and mask the Authorization / Proxy-Authorization / Cookie /
+    /// Set-Cookie headers and password / token / api_key-style parameters in the
+    /// captured traffic. Credential SHAPES only: a secret under an unrecognised
+    /// name, in a URL path or inside a binary body is NOT scrubbed.
     #[serde(default)]
     pub redact: bool,
     /// Overwrite the output file if it already exists.

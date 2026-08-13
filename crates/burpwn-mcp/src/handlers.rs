@@ -110,12 +110,10 @@ pub fn session_export(
         "flows": outcome.manifest.flow_count,
         "redacted": outcome.manifest.redacted,
     });
-    if !outcome.manifest.redacted {
-        view["warning"] = json!(
-            "raw bundle: stored auth tokens/login commands and captured \
-             Authorization/Cookie headers are inside"
-        );
-    }
+    // Always warn, redacted or not, and always with the CLI's own wording: an
+    // agent handing a bundle on has to know that `redact=true` masks credential
+    // SHAPES rather than certifying the file clean.
+    view["warning"] = json!(outcome.warning());
     Ok(view)
 }
 
@@ -1378,11 +1376,14 @@ mod tests {
         assert_eq!(v["flows"], 1);
         assert_eq!(v["redacted"], false);
         assert!(v["bytes"].as_u64().unwrap() > 0);
-        assert!(v["warning"].as_str().unwrap().contains("raw bundle"));
+        assert!(v["warning"]
+            .as_str()
+            .unwrap()
+            .contains("exactly as captured"));
         assert!(raw.is_file());
 
-        // Redacted: nothing to warn about beyond what the tool description says,
-        // so the field is absent rather than empty.
+        // Redacted still warns: `--redact` masks credential shapes, it does not
+        // certify the bundle clean, and the agent must be told which.
         let clean = dir.path().join("clean.burpwn");
         let v = session_export(
             &paths,
@@ -1395,7 +1396,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["redacted"], true);
-        assert!(v.get("warning").is_none());
+        assert!(v["warning"].as_str().unwrap().contains("credential SHAPES"));
 
         // Re-exporting over an existing file needs force.
         let err = session_export(
