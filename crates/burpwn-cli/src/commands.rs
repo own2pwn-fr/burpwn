@@ -2702,12 +2702,98 @@ fn cmd_export(out: &Output, paths: &Paths, action: ExportAction) -> Result<i32> 
             }
             Ok(0)
         }
-        ExportAction::Pcap { output } => {
-            let _ = output;
-            crate::fail!(
-                ErrorCode::InputInvalidValue,
-                "pcap export is not yet implemented (use `export har`)"
+        ExportAction::Pcap {
+            session: name,
+            workspace,
+            group,
+            output,
+            force,
+        } => {
+            let session = name.unwrap_or(session);
+            let store = open_store(paths, &session)?;
+            let workspace_id = match &workspace {
+                None => None,
+                Some(w) => Some(resolve_workspace_ref(&store, w)?),
+            };
+            let group_id = match &group {
+                None => None,
+                Some(name) => Some(resolve_group(&store, name, None)?.id),
+            };
+            let reader = store.reader();
+            let rows = reader.list_flows(&FlowFilter {
+                workspace_id,
+                group_id,
+                limit: Some(100_000),
+                ..Default::default()
+            })?;
+            let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            let export = crate::pcap::build_pcapng(&reader, &ids)?;
+            let s = &export.stats;
+
+            // A pcapng is binary: it cannot share stdout with the envelope (nor
+            // with a terse listing), so unlike `export har` there is no stdout
+            // form. The default name mirrors `export session`.
+            let path = PathBuf::from(output.unwrap_or_else(|| format!("{session}.pcapng")));
+            crate::bundle::guard_output_path(&path, "pcapng", force)?;
+            std::fs::write(&path, &export.bytes)
+                .with_context(|| format!("writing {}", path.display()))?;
+
+            out.emit(
+                json!({
+                    "path": path.display().to_string(),
+                    "bytes": export.bytes.len(),
+                    "format": "pcapng",
+                    "link_type": "LINKTYPE_RAW",
+                    "synthetic": true,
+                    "packets": s.packets,
+                    "connections": s.connections,
+                    "flows_rendered": s.flows_rendered,
+                    "exchanges": s.exchanges,
+                    "requests_without_response": s.requests_without_response,
+                    "ws_frames": s.ws_frames,
+                    "h2_as_http1": s.h2_as_http1,
+                    "synthetic_client_ports": s.synthetic_client_ports,
+                    "synthetic_addresses": s.synthetic_addresses,
+                    "skipped": s.skipped,
+                    "skipped_total": s.skipped_total,
+                }),
+                |_| {
+                    format!(
+                        "wrote {} ({} packets, {} connections, {} flows, {} bytes)",
+                        path.display(),
+                        s.packets,
+                        s.connections,
+                        s.flows_rendered,
+                        export.bytes.len(),
+                    )
+                },
             );
+            // What the file is, and what it is missing, go on stderr — like the
+            // raw-bundle warning on `export session`. stdout keeps the single
+            // "wrote …" line it shares with `export har`, so a pipe still gets
+            // one record; but a caveat this large must not be silent either, and
+            // an operator who exports a session that was a third DNS has to
+            // learn it here rather than from a puzzling packet count.
+            if !out.is_json() {
+                eprintln!(
+                    "⚠ synthetic capture: the request/response bytes are real, the handshakes, \
+                     sequence numbers and segmentation are generated"
+                );
+                if let Some(sk) = s.skipped_summary() {
+                    eprintln!(
+                        "⚠ {} flows left out (no stored bytes to render): {sk}",
+                        s.skipped_total
+                    );
+                }
+                if s.h2_as_http1 > 0 {
+                    eprintln!(
+                        "⚠ {} HTTP/2 flows re-encoded as HTTP/1.1 (the HPACK framing was never \
+                         stored)",
+                        s.h2_as_http1
+                    );
+                }
+            }
+            Ok(0)
         }
     }
 }
@@ -3584,6 +3670,109 @@ mod tests {
         assert_eq!(entries[0]["response"]["status"], 200);
         // queryString parsed.
         assert_eq!(entries[0]["request"]["queryString"][0]["name"], "q");
+    }
+
+    /// `export pcap` through the command tree: the filters it shares with
+    /// `export har`, and the two refusals a binary output must not skip.
+    /// The pcapng bytes themselves are validated in `pcap.rs`.
+    #[tokio::test]
+    async fn pcap_export_honours_the_filters_and_guards_its_output_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let fid = populate(&paths, "default").await;
+        let out = Output::new(false);
+
+        let pcap = |name: &str, workspace: Option<String>, group: Option<String>, force: bool| {
+            cmd_export(
+                &out,
+                &paths,
+                ExportAction::Pcap {
+                    session: None,
+                    workspace,
+                    group,
+                    output: Some(dir.path().join(name).to_string_lossy().into_owned()),
+                    force,
+                },
+            )
+        };
+
+        assert_eq!(pcap("all.pcapng", None, None, false).unwrap(), 0);
+        let all = std::fs::read(dir.path().join("all.pcapng")).unwrap();
+        assert_eq!(&all[0..4], &[0x0a, 0x0d, 0x0d, 0x0a], "pcapng block type");
+
+        // A group that holds the one flow exports the same bytes; an empty
+        // workspace exports a valid file with nothing in it. Both are smaller
+        // than nothing only if the filter did nothing, so compare against
+        // "packets present" rather than a byte count.
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::New {
+                name: "scenario".into(),
+                description: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+        cmd_group(
+            &out,
+            &paths,
+            GroupAction::Add {
+                name: "scenario".into(),
+                flow_id: vec![fid],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pcap("group.pcapng", None, Some("scenario".into()), false).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(dir.path().join("group.pcapng")).unwrap(), all);
+
+        cmd_workspace(
+            &out,
+            &paths,
+            WorkspaceAction::New {
+                name: "empty".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pcap("ws.pcapng", Some("empty".into()), None, false).unwrap(),
+            0
+        );
+        let ws = std::fs::read(dir.path().join("ws.pcapng")).unwrap();
+        assert!(ws.len() < all.len(), "the workspace filter did nothing");
+
+        // An unknown filter is an error, never a silently empty capture.
+        let err = pcap("x.pcapng", Some("nope".into()), None, false).unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::WorkspaceNotFound
+        );
+        let err = pcap("x.pcapng", None, Some("nope".into()), false).unwrap_err();
+        assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::GroupNotFound);
+
+        // Overwriting needs --force…
+        let err = pcap("all.pcapng", None, None, false).unwrap_err();
+        assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::InputFileExists);
+        assert_eq!(pcap("all.pcapng", None, None, true).unwrap(), 0);
+
+        // …and an existing symlink at the target is refused outright, force or
+        // not: writing through it would redirect the capture onto whatever an
+        // attacker pointed it at.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("link.pcapng")).unwrap();
+        for force in [false, true] {
+            let err = pcap("link.pcapng", None, None, force).unwrap_err();
+            assert_eq!(crate::diag::diagnose(&err).code, ErrorCode::InputUnsafePath);
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
     }
 
     #[tokio::test]

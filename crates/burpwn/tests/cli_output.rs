@@ -116,6 +116,73 @@ fn piped_output_is_data_only() {
     assert!(!text.contains('\u{1b}'), "{text}");
 }
 
+/// `export pcap` writes a BINARY file, so unlike `export har` it can never fall
+/// back to stdout — the envelope has to stay alone on it. This is the case that
+/// would break the MCP layer loudest if the pcapng ever leaked onto fd 1.
+#[test]
+fn export_pcap_keeps_stdout_clean_and_puts_the_capture_in_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    assert!(burpwn(home, &["session", "new"]).status.success());
+    let out_path = home.join("cap.pcapng");
+    let out = burpwn(
+        home,
+        &["--json", "export", "pcap", "-o", out_path.to_str().unwrap()],
+    );
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "the pcapng leaked onto stdout: {text:?}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["ok"], serde_json::json!(true));
+    assert_eq!(v["data"]["format"], serde_json::json!("pcapng"));
+    // The reply says outright that the capture is manufactured.
+    assert_eq!(v["data"]["synthetic"], serde_json::json!(true));
+    assert_eq!(v["data"]["packets"], serde_json::json!(0));
+
+    // Under --json even the "this is synthetic" caveat stays off both streams as
+    // prose: it is a field of the envelope, not a line an agent has to parse.
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The file really is a pcapng section header, and it is on disk rather than
+    // on the wire to the caller.
+    let bytes = std::fs::read(&out_path).unwrap();
+    assert_eq!(&bytes[0..4], &[0x0a, 0x0d, 0x0d, 0x0a], "pcapng block type");
+    assert_eq!(&bytes[8..12], &[0x4d, 0x3c, 0x2b, 0x1a], "byte-order magic");
+
+    // Without --json the caveat IS shown — on stderr, so stdout keeps the one
+    // "wrote …" line a pipe can read, exactly like `export session`.
+    let human = burpwn(
+        home,
+        &[
+            "export",
+            "pcap",
+            "--force",
+            "-o",
+            out_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(stdout(&human).lines().count(), 1, "{}", stdout(&human));
+    assert!(stdout(&human).starts_with("wrote "), "{}", stdout(&human));
+    let err = String::from_utf8_lossy(&human.stderr);
+    assert!(err.contains("synthetic capture"), "{err}");
+
+    // A second run must not clobber it silently.
+    let out = burpwn(
+        home,
+        &["--json", "export", "pcap", "-o", out_path.to_str().unwrap()],
+    );
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["ok"], serde_json::json!(false));
+    assert_eq!(v["diagnostic"]["code"], serde_json::json!("BW-INPUT-012"));
+}
+
 /// The error block on stderr is documented in the README and asserted verbatim
 /// by `burpwn-error`; without a terminal it must stay exactly that text.
 #[test]

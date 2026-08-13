@@ -19,7 +19,8 @@
 //!   match-replace add|list|rm|enable|disable
 //!   workspace new|list|use
 //!   tag add <flow> <name> | note add <flow> <text>
-//!   export har [--workspace] [-o file] | session [-o file] [--redact] | pcap
+//!   export har [--workspace] [-o file] | session [-o file] [--redact]
+//!          | pcap [-o file] [--workspace] [--group] [--session] [--force]
 //!   fuzz run --flow <id> … | list | show <attack_id>   Intruder
 //!   compare <flow_a> <flow_b> [--what headers|body|all]
 //!   encode <scheme> <value> | decode <scheme> <value>
@@ -61,6 +62,7 @@ pub mod hooks;
 pub mod initcheck;
 pub mod mcpreg;
 pub mod paths;
+pub mod pcap;
 pub mod render;
 pub mod replay;
 pub mod skill;

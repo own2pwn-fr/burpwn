@@ -87,6 +87,7 @@ burpwn group new auth-flow \
   --description 'login form -> POST /login -> redirect + Set-Cookie'  # name a scenario
 burpwn group add auth-flow 3 5 9               # …and pin the flows that prove it
 burpwn group show auth-flow                    # replay it later; `export har --group auth-flow`
+burpwn export pcap -o engagement-1.pcapng      # a SYNTHETIC pcapng for Wireshark (see below)
 burpwn export session -o engagement-1.burpwn   # the whole session in one file (raw: see below)
 burpwn session import engagement-1.burpwn --as from-colleague  # …and open it on another machine
 burpwn session stats                           # capture-completeness: flags execs that captured nothing
@@ -146,6 +147,35 @@ migrated on the way in, and one from a newer burpwn is refused rather than half-
 > match/replace replacements; it does **not** scrub credentials captured inside recorded requests and
 > responses. Bundles are written `0600`; move them the way you would move the credentials inside.
 > The CA private key is never included.
+
+## `export pcap`: a capture burpwn never took
+
+`burpwn export har` hands the session to a browser or to Burp. `burpwn export pcap` hands it to
+**Wireshark** — `Follow HTTP stream` works, the websocket dissector lights up after the `101`, and
+`tshark -z` will do statistics on it.
+
+It has to be said plainly: burpwn stores *reassembled HTTP messages*, never packets. There is no
+handshake, no sequence number and no MTU anywhere in the store. So the export **synthesizes a
+plausible wire trace around the bytes it really has** — and the format is **pcapng** precisely
+because a classic pcap has nowhere to admit that. Its 24-byte header holds a magic, a version, a
+link type and a snaplen; the file would simply claim to be a capture. pcapng has options, so the
+section header, the interface description and every fabricated `SYN` carry a comment saying what
+was generated, and `if_tsresol` declares **millisecond** resolution — exactly what the store has,
+instead of padding three zeroes onto every timestamp to fit pcap's microsecond field.
+
+- **Real**: request and response bytes, websocket payloads and opcodes, endpoints, timestamps.
+- **Invented**: handshakes and teardowns, all sequence/ack numbers, segmentation at a conventional
+  1460-byte MSS, and the ordering inside one millisecond.
+- **Rewritten**: stored bodies are decoded, so `Content-Length` is recomputed and
+  `Content-Encoding` / `Transfer-Encoding` are dropped — otherwise the stream mis-frames and
+  nothing dissects at all.
+- **Left out, and counted in the output**: DNS, raw-TCP and TLS-passthrough flows. burpwn has their
+  metadata, not their bytes, and a pcap full of invented DNS queries would be worse than no pcap.
+  HTTP/2 *is* exported, re-encoded as HTTP/1.1 and counted, since the HPACK framing was never
+  stored.
+
+The link type is `LINKTYPE_RAW` rather than Ethernet, on the same principle: there was no link
+layer, so the file does not invent two MAC addresses for a hop that never existed.
 
 ## Output: aligned for you, terse for whatever reads it next
 

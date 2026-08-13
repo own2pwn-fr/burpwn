@@ -946,10 +946,39 @@ pub enum ExportAction {
         #[arg(long)]
         force: bool,
     },
-    /// Export a pcap (not yet implemented — errors clearly).
+    /// Export a SYNTHETIC pcapng that Wireshark / tshark can open.
+    ///
+    /// burpwn stores reassembled HTTP messages, never packets, so this
+    /// fabricates a plausible wire trace carrying the bytes it really has:
+    /// `Follow HTTP stream` works, and so does the websocket dissector.
+    ///
+    /// REAL: request and response bytes, websocket payloads, endpoints, and the
+    /// millisecond timestamps. INVENTED: the TCP handshakes and teardowns, every
+    /// sequence number, the segmentation (a conventional 1460-byte MSS), and the
+    /// ordering inside one millisecond. `Content-Length` is rewritten to match
+    /// the DECODED body and `Content-Encoding` / `Transfer-Encoding` are dropped,
+    /// because the stored bodies are already gunzipped and de-chunked.
+    ///
+    /// EXCLUDED, and counted in the output rather than faked: DNS, raw-TCP and
+    /// TLS-passthrough flows (burpwn keeps their metadata, not their bytes), and
+    /// flows with no request recorded. HTTP/2 flows ARE exported, re-encoded as
+    /// HTTP/1.1 and counted, since the HPACK framing was never stored.
     Pcap {
-        /// Output file.
+        /// Session to export (defaults to the active session).
+        #[arg(long)]
+        session: Option<String>,
+        /// Restrict to a workspace, by NAME or id.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Restrict to the flows in a group, by NAME. Mutually exclusive with
+        /// `--workspace` (the group already lives in a workspace).
+        #[arg(long, conflicts_with = "workspace")]
+        group: Option<String>,
+        /// Output file (defaults to `<session>.pcapng` in the current directory).
         #[arg(short, long)]
         output: Option<String>,
+        /// Overwrite the output file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 }

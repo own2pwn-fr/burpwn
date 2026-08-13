@@ -304,7 +304,37 @@ workspace and every subcommand takes the NAME, not an id.
   session replays identically. `--redact` drops the stored auth tokens, login commands and
   match/replace replacements — it does **not** scrub credentials captured inside recorded requests
   and responses. Treat a bundle like the credentials it contains.
-- `burpwn export pcap` — not yet implemented (errors clearly).
+- `burpwn export pcap [--session <NAME>] [--workspace <NAME|ID>] [--group <GROUP>] [-o <OUTPUT>]
+  [--force] [--json]` — a **synthetic** pcapng (default `<session>.pcapng` in the current directory,
+  never overwritten without `--force`). Always a file: a pcapng is binary, so unlike `export har`
+  there is no stdout form. `--group` is exclusive with `--workspace`.
+
+  burpwn stores reassembled HTTP messages, never packets, so the file is *fabricated* around the
+  bytes it really has. It opens in Wireshark / tshark / tcpdump, `Follow HTTP stream` works, and the
+  websocket dissector lights up after the `101`.
+  - **Real**: request and response bytes, websocket payloads and opcodes, client/server addresses
+    and ports, and the millisecond timestamps of the request and the response.
+  - **Invented**: the TCP handshake and teardown, every sequence/ack number, window sizes, IP ids
+    and TTLs, the segmentation (a conventional 1460-byte MSS; 1440 over IPv6), and the ordering of
+    packets inside one millisecond. The section header, the interface description and every
+    synthetic `SYN` carry a pcapng comment saying so — that is why the output is pcapng and not
+    classic pcap, which has nowhere to record that a file is not a capture.
+  - **Rewritten**: stored bodies are decoded (gunzipped, de-chunked), so `Content-Length` is
+    recomputed and `Content-Encoding` / `Transfer-Encoding` are dropped. Without this the stream is
+    mis-framed and nothing dissects.
+  - **Excluded and counted, never faked**: `dns`, `rawtcp` and `tls-passthru` flows (burpwn keeps
+    their metadata, not their bytes) and flows with no request recorded. stdout stays the single
+    `wrote …` line; the caveats and the per-reason counts go to **stderr** (like the raw-bundle
+    warning on `export session`), and to `data.skipped` / `data.skipped_total` under `--json`.
+  - **HTTP/2 is re-encoded as HTTP/1.1** (the HPACK framing was never stored), counted in
+    `data.h2_as_http1`, and each affected frame carries a comment.
+  - Endpoints the store never recorded are filled from the RFC 5737 documentation ranges
+    (`192.0.2.0/24`, `198.51.100.0/24`) so a placeholder cannot be mistaken for a real host;
+    `data.synthetic_addresses` counts them.
+
+  There is deliberately **no `export_pcap` MCP tool**, for the same reason `export har` has none: the
+  artefact is a binary file for a human's Wireshark, not something an agent can read. Archival that
+  an agent *can* act on is `session_export`.
 
 ## mcp (stdio server)
 `burpwn mcp [--session <n>]` — start the MCP server over stdio. It does not print
