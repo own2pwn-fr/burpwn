@@ -12,9 +12,8 @@ use crate::blob::get_blob;
 use crate::error::Result;
 use crate::model::{
     Attack, AttackResult, AuthProfile, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow,
-    Group, Hook, HookAction, HookPhase, HookScope, Intercept, InterceptState, MatchKind,
-    MatchReplaceRule, Note, Protocol, RequestData, ResponseData, Tag, Workspace, WsDirection,
-    WsMessage,
+    Group, Hook, HookAction, HookPhase, HookScope, MatchKind, MatchReplaceRule, Note, Protocol,
+    RequestData, ResponseData, Tag, Workspace, WsDirection, WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -24,6 +23,11 @@ type RequestRow = (String, String, String, String, Option<i64>, Option<i64>);
 /// Raw column tuple for a `responses` row: (status, http_version, headers_blob_id,
 /// body_blob_id, timing_ms).
 type ResponseRow = (i64, String, Option<i64>, Option<i64>, Option<i64>);
+
+/// Raw column tuple for a `match_replace_rules` row: (id, enabled, scope,
+/// match_kind, pattern, replacement, on_request). The kind stays a `String` here
+/// because decoding it is fallible and must not abort the whole listing.
+type MatchReplaceRow = (i64, bool, String, String, String, String, bool);
 
 /// Read-only view over the session store.
 #[derive(Clone)]
@@ -684,6 +688,17 @@ impl Reader {
     }
 
     /// List all match/replace rules.
+    ///
+    /// A row whose `match_kind` this build cannot decode is SKIPPED with a WARN
+    /// naming its id, not coerced onto a default and not fatal to the listing.
+    /// Same posture as the hook refresher keeping its previous snapshot: a
+    /// single bad row must neither silently rewrite the wrong part of a message
+    /// nor make every other rule disappear from the proxy.
+    ///
+    /// The WARN names the id on purpose: it is what a skipped rule leaves the
+    /// operator to act on, and `match-replace rm <id>` still removes it (the CLI
+    /// logs at `info` by default, so the line shows up under a `match-replace
+    /// list` that came back one rule short).
     pub fn list_match_replace(&self) -> Result<Vec<MatchReplaceRule>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -691,56 +706,41 @@ impl Reader {
              FROM match_replace_rules ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
-            let kind: String = r.get(3)?;
-            Ok(MatchReplaceRule {
-                id: r.get(0)?,
-                enabled: r.get::<_, i64>(1)? != 0,
-                scope: r.get(2)?,
-                match_kind: MatchKind::from_db(&kind),
-                pattern: r.get(4)?,
-                replacement: r.get(5)?,
-                on_request: r.get::<_, i64>(6)? != 0,
-            })
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)? != 0,
+            ))
         })?;
-        collect(rows)
-    }
-
-    /// List intercepts, optionally filtered by state. Newest first.
-    pub fn list_intercepts(&self, state: Option<InterceptState>) -> Result<Vec<Intercept>> {
-        let conn = self.conn()?;
-        let mapper = |r: &rusqlite::Row| {
-            let s: String = r.get(2)?;
-            Ok(Intercept {
-                id: r.get(0)?,
-                flow_id: r.get(1)?,
-                state: InterceptState::from_db(&s),
-                created_at: r.get(3)?,
-                resolved_at: r.get(4)?,
-            })
-        };
-        match state {
-            Some(st) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, flow_id, state, created_at, resolved_at FROM intercepts
-                     WHERE state = ?1 ORDER BY id DESC",
-                )?;
-                let rows = stmt.query_map([st.as_str()], mapper)?;
-                collect(rows)
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, flow_id, state, created_at, resolved_at FROM intercepts
-                     ORDER BY id DESC",
-                )?;
-                let rows = stmt.query_map([], mapper)?;
-                collect(rows)
-            }
+        let raw: Vec<MatchReplaceRow> = collect(rows)?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (id, enabled, scope, kind, pattern, replacement, on_request) in raw {
+            let match_kind = match MatchKind::from_db(&kind) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        rule_id = id,
+                        error = %e,
+                        "skipping match/replace rule with an undecodable match_kind"
+                    );
+                    continue;
+                }
+            };
+            out.push(MatchReplaceRule {
+                id,
+                enabled,
+                scope,
+                match_kind,
+                pattern,
+                replacement,
+                on_request,
+            });
         }
-    }
-
-    /// Pending intercept queue (convenience over [`list_intercepts`]).
-    pub fn pending_intercepts(&self) -> Result<Vec<Intercept>> {
-        self.list_intercepts(Some(InterceptState::Pending))
+        Ok(out)
     }
 
     // ---- session-auth profiles (schema v4) ----

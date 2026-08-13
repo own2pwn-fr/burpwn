@@ -1974,12 +1974,19 @@ async fn cmd_match_replace(out: &Output, paths: &Paths, action: MatchReplaceActi
                     "--on must be request|response, got {other:?}"
                 ),
             };
+            let Some(match_kind) = MatchKind::parse(&kind) else {
+                crate::fail!(
+                    ErrorCode::InputInvalidValue,
+                    "kind must be {}, got {kind:?}",
+                    MatchKind::VALID.join("|")
+                )
+            };
             let id = store
                 .writer()
                 .add_match_replace(NewMatchReplaceRule {
                     enabled: true,
                     scope,
-                    match_kind: MatchKind::from_db(&kind),
+                    match_kind,
                     pattern,
                     replacement,
                     on_request,
@@ -4243,5 +4250,46 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].match_kind, MatchKind::Header);
         assert!(rules[0].on_request);
+    }
+
+    /// A typo'd kind used to sail through as a BODY rule. It must be refused at
+    /// the point of entry, with the accepted spellings in the message, and leave
+    /// nothing behind in the store.
+    #[tokio::test]
+    async fn match_replace_add_rejects_an_unknown_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let out = Output::new(false);
+
+        let err = cmd_match_replace(
+            &out,
+            &paths,
+            MatchReplaceAction::Add {
+                scope: "*.example.com".into(),
+                kind: "heder".into(),
+                pattern: "^X:.*".into(),
+                replacement: "X: y".into(),
+                on: "request".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::InputInvalidValue
+        );
+        let msg = err.to_string();
+        for v in MatchKind::VALID {
+            assert!(msg.contains(v), "{msg} should list {v}");
+        }
+        assert!(msg.contains("heder"), "{msg}");
+
+        let store = open_store(&paths, "default").unwrap();
+        assert!(
+            store.reader().list_match_replace().unwrap().is_empty(),
+            "a refused kind must not leave a rule behind"
+        );
     }
 }

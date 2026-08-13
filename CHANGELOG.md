@@ -72,6 +72,89 @@ shells out to `tcpdump` where the machine has it and skips where it does not.
 There is deliberately **no `export_pcap` MCP tool**, for the same reason `export har` has none: the
 artefact is a binary file for a human's Wireshark, and an agent cannot read it. Archival an agent
 *can* act on remains `session_export`.
+### Fixed — `exec --json` could write its envelope into an unrelated open file
+`write_json_envelope` decided where the `--json` exec envelope goes by asking `fcntl(3, F_GETFD)
+>= 0` — *"is descriptor 3 open right now?"* — and, on that answer alone, wrote the envelope there.
+
+That is not the question the fd-3 convention asks. What makes descriptor 3 the envelope channel is
+that the CALLER wired one (`burpwn exec --json … 3>envelope.json`, or the pipe the MCP `run_exec`
+dup2s into place before exec). Descriptor 3 is also simply the first slot the kernel hands out
+after stdio, so in any process that has opened files of its own it is routinely something else
+entirely — and burpwn would write a JSON line straight into it. Since SQLite writes with `pwrite`,
+its descriptors sit at offset 0, so the envelope landed exactly on page 1: the file stopped being
+a database. That is not hypothetical — it is what made two workspace tests look flaky under load.
+Any embedder linking `burpwn-cli`, or any caller that keeps a descriptor of its own around, was
+exposed to the same thing.
+
+burpwn now records **once, as the first thing `main` does**, whether fd 3 was *inherited*, and only
+then treats it as the envelope channel. Nothing else can be mistaken for it later, because the
+answer is taken before this process owns a single descriptor. Unprobed — a test binary, an
+embedder — means "not ours", and the envelope goes to stderr, exactly as it already did when fd 3
+was closed. The documented `3>envelope.json` and the MCP pipe are unaffected: both are inherited.
+
+### Fixed — the auth auto-refresh left a zombie behind on every 401
+The daemon spawns `burpwn session auth refresh` when it sees a 401/403 on a host that has an auth
+profile, detached with `setsid` so a slow login command can never block the proxy. It then dropped
+the child handle and never called `wait()`. `setsid` detaches the child's *session*, not its
+parentage: the daemon stays its parent, the kernel keeps the exit status around waiting to be
+collected, and the process table gains one `<defunct>` entry per refresh — for the whole life of
+the daemon. Against a target that expires tokens on a schedule, that is exactly one zombie per
+expiry, forever.
+
+The child is now owned by a task that does an **async** `wait()`, so the property the detachment
+buys is untouched: the daemon still never waits on a login command, a task parked on `SIGCHLD`
+does. Shutdown is not a race either way — if the runtime goes down first the task is dropped, the
+child is reparented to init, and init reaps it. The exit status stops being thrown away too: a
+refresh that fails now says so at `WARN` instead of vanishing.
+
+### Fixed — a typo in a match/replace kind made a body rule, silently
+`burpwn match-replace add '*.api' heder '^Authorization:.*' 'Authorization: Bearer x'` used to
+succeed. `MatchKind::from_db` fell through to `Body` on anything it did not recognise, so the rule
+went in — enabled, listed, applied — rewriting *bodies* while the operator believed they had a
+header rule. The pattern then never matched anything, and the thing you debug longest is the
+rewrite that quietly does nothing.
+
+The kind is now parsed, not guessed. `header|body|url|host` and nothing else, at the point of
+entry — the CLI and the MCP `match_replace_add` both refuse an unknown value with `BW-INPUT-001`
+and the accepted set in the message, so the correction is in the error. This is the contract
+`HookPhase` already had and said so in its doc comment, which named `MatchKind::from_db` as the
+counter-example it was deliberately not copying; the two agree now.
+
+On the READ side a stored row is not user input, and refusing to open the store over one is the
+wrong trade. A rule whose kind this build cannot decode is **skipped, with a WARN naming its id**,
+and every other rule still loads — the same posture the hook refresher takes when it keeps its
+previous snapshot rather than applying a half-decoded policy. What it will not do is come back as
+a body rule.
+
+`Protocol::from_db` keeps its fallback on purpose: it classifies traffic burpwn *observed*, where
+an unknown wire protocol really is best-effort, not a value someone typed.
+
+### Removed — the `intercepts` table, which nothing ever wrote (schema v7)
+The schema carried an `intercepts` table since v1, and the store exposed `enqueue_intercept`,
+`resolve_intercept`, `list_intercepts` and `pending_intercepts` against it. No production caller
+ever touched any of them: the proxy handler parks on a oneshot inside `InterceptController` and
+unblocks the instant an operator forwards, edits or drops it. Interception is a **synchronous
+decision taken in flight** — nothing about it outlives the flow it belongs to.
+
+So the table was a promise the code never kept. Reading the schema, an intercept history looks
+persisted; it never was, and the CLI, the MCP surface and the export bundle all read it exactly
+zero times. Nothing wanted it either: an audit trail of "which flows were held" is already
+`flows.intercepted`, and replay works off `flows`/`requests`, not off a decision queue. An empty
+table sitting in the schema is not neutral — it is where the next feature gets written against a
+queue nobody fills.
+
+Schema **v7** drops it. Old files are migrated in place on open; a session bundle exported before
+v7 still imports, because staging runs the same migration on the unpacked copy before it is moved
+into place.
+
+### Fixed — `flows.intercepted` said "interception was armed", not "this flow was held"
+The column was written from `InterceptController::is_enabled()` — the GLOBAL toggle. With a scope
+filter set (`intercept scope --host api.target`), every flow captured while interception was on
+was flagged as intercepted, including the ones the filter waved straight through untouched. The
+one column that is supposed to answer "was this request held?" answered a different question.
+
+It is now written from the actual park decision, enabled **and** in scope, evaluated immediately
+before the intercept call — the same condition `intercept()` itself tests.
 
 ### Changed — the MCP `compare` tool stops handing over a whole page of diff
 `compare` returns the body diff as two lists of lines, one per side. Two HTML pages that differ

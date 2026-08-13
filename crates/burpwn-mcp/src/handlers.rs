@@ -277,10 +277,18 @@ pub async fn match_replace_add(
     params: &crate::params::MatchReplaceAddParams,
 ) -> Result<Value> {
     let store = open_store(paths, session)?;
+    let match_kind = MatchKind::parse(&params.kind).ok_or_else(|| {
+        burpwn_cli::coded!(
+            ErrorCode::InputInvalidValue,
+            "kind must be {}, got {:?}",
+            MatchKind::VALID.join("|"),
+            params.kind
+        )
+    })?;
     let rule = NewMatchReplaceRule {
         enabled: true,
         scope: params.scope.clone(),
-        match_kind: MatchKind::from_db(&params.kind),
+        match_kind,
         pattern: params.pattern.clone(),
         replacement: params.replacement.clone(),
         on_request: params.on_request,

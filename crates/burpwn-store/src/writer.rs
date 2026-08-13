@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::blob::BlobStore;
 use crate::error::{Result, StoreError};
 use crate::model::{
-    FlowStart, InterceptState, NewAttack, NewAttackResult, NewAuthProfile, NewExecRecord, NewHook,
+    FlowStart, NewAttack, NewAttackResult, NewAuthProfile, NewExecRecord, NewHook,
     NewMatchReplaceRule, RequestData, ResponseData, WsDirection,
 };
 
@@ -229,15 +229,6 @@ pub enum WriteOp {
         /// Optional completion ack.
         reply: Option<AckReply>,
     },
-    /// Enqueue a flow into the intercept queue (state=pending); replies with id.
-    EnqueueIntercept {
-        /// Target flow.
-        flow_id: i64,
-        /// Creation timestamp.
-        created_at: i64,
-        /// Reply with the intercept id.
-        reply: IdReply,
-    },
     /// Attribute every not-yet-attributed flow created at/after `since_ts` to an
     /// exec + workspace; replies with the ids it stamped (ascending).
     AttributeFlows {
@@ -249,17 +240,6 @@ pub enum WriteOp {
         workspace_id: i64,
         /// Reply with the ids stamped.
         reply: IdsReply,
-    },
-    /// Resolve an intercept (set its terminal state + resolved_at).
-    ResolveIntercept {
-        /// Intercept id.
-        id: i64,
-        /// Terminal state.
-        state: InterceptState,
-        /// Resolution timestamp.
-        resolved_at: i64,
-        /// Optional completion ack.
-        reply: Option<AckReply>,
     },
     /// Record a structured websocket frame (payload stored in the blob store);
     /// replies with the new message id.
@@ -565,36 +545,6 @@ impl WriteHandle {
         let (reply, rx) = oneshot::channel();
         self.send(WriteOp::AddMatchReplace { rule, reply }).await?;
         recv_id(rx).await
-    }
-
-    /// Enqueue an intercept, awaiting its id.
-    pub async fn enqueue_intercept(&self, flow_id: i64, created_at: i64) -> Result<i64> {
-        let (reply, rx) = oneshot::channel();
-        self.send(WriteOp::EnqueueIntercept {
-            flow_id,
-            created_at,
-            reply,
-        })
-        .await?;
-        recv_id(rx).await
-    }
-
-    /// Resolve an intercept, awaiting ack.
-    pub async fn resolve_intercept(
-        &self,
-        id: i64,
-        state: InterceptState,
-        resolved_at: i64,
-    ) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.send(WriteOp::ResolveIntercept {
-            id,
-            state,
-            resolved_at,
-            reply: Some(reply),
-        })
-        .await?;
-        recv_ack(rx).await
     }
 
     /// Attribute every not-yet-attributed flow created at/after `since_ts` to the
@@ -968,13 +918,6 @@ fn handle_op(conn: &Connection, op: WriteOp) {
                 .map(|_| ())
                 .map_err(Into::into),
         ),
-        WriteOp::EnqueueIntercept {
-            flow_id,
-            created_at,
-            reply,
-        } => {
-            let _ = reply.send(do_enqueue_intercept(conn, flow_id, created_at));
-        }
         WriteOp::AttributeFlows {
             since_ts,
             exec_id,
@@ -983,20 +926,6 @@ fn handle_op(conn: &Connection, op: WriteOp) {
         } => {
             let _ = reply.send(do_attribute_flows(conn, since_ts, &exec_id, workspace_id));
         }
-        WriteOp::ResolveIntercept {
-            id,
-            state,
-            resolved_at,
-            reply,
-        } => ack(
-            reply,
-            conn.execute(
-                "UPDATE intercepts SET state = ?1, resolved_at = ?2 WHERE id = ?3",
-                rusqlite::params![state.as_str(), resolved_at, id],
-            )
-            .map(|_| ())
-            .map_err(Into::into),
-        ),
         WriteOp::InsertWsMessage {
             flow_id,
             direction,
@@ -1402,14 +1331,6 @@ fn do_insert_exec(conn: &Connection, r: &NewExecRecord) -> Result<i64> {
         |row| row.get(0),
     )?;
     Ok(id)
-}
-
-fn do_enqueue_intercept(conn: &Connection, flow_id: i64, created_at: i64) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO intercepts(flow_id, state, created_at) VALUES (?1, 'pending', ?2)",
-        rusqlite::params![flow_id, created_at],
-    )?;
-    Ok(conn.last_insert_rowid())
 }
 
 /// Stamp `exec_id` + `workspace_id` onto every flow whose `ts_start >= since_ts`

@@ -183,7 +183,7 @@ cannot use them (WSL). `--quick` skips the live probe.
 - `--workspace <id>` — attribute captured flows to a workspace.
 - `--timeout <secs>` — wall-clock timeout for the command.
 - `--session <n>` — session to run under (defaults to the active session).
-- With `--json`, the `{exit_code, exec_id, captured_request_ids}` envelope is written to **fd 3**, keeping the command's own stdout clean.
+- With `--json`, the `{exit_code, exec_id, captured_request_ids}` envelope is written to **fd 3**, keeping the command's own stdout clean. fd 3 must be *inherited* (`3>file`, or a pipe wired by the caller); if burpwn did not start with one, the envelope goes to stderr instead.
 
 ## req
 - `burpwn req list [OPTIONS] [--json]`
@@ -216,7 +216,8 @@ cannot use them (WSL). `--quick` skips the live probe.
 ## match-replace
 - `burpwn match-replace add <SCOPE> <KIND> <PATTERN> <REPLACEMENT> [--on <ON>] [--json]`
   - `<SCOPE>` — scope expression (e.g. host glob; empty string = all).
-  - `<KIND>` — what to match: `header`, `body`, `url`, `host`.
+  - `<KIND>` — what to match: `header`, `body`, `url`, `host`. Anything else is
+    refused with `BW-INPUT-001` (a typo is never silently treated as `body`).
   - `<PATTERN>` / `<REPLACEMENT>` — match pattern and replacement string.
   - `--on <ON>` — apply to `request` (default) or `response`.
 - `burpwn match-replace list [--json]`
