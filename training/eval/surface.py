@@ -17,13 +17,22 @@ loudly on any drift.
 Sources, in priority order:
 
   CLI subcommands + flags
-    1. The real binary, if found (``$BURPWN_BIN`` / ``burpwn`` on PATH /
-       ``target/release/burpwn`` / ``target/debug/burpwn``): recursively invoke
+    1. A binary **built from this checkout** — ``$BURPWN_BIN`` (explicit override),
+       ``target/debug/burpwn`` or ``target/release/burpwn``: recursively invoke
        ``burpwn [<path...>] --help`` and parse the ``Commands:`` / ``Options:``
        sections. Hidden commands (e.g. ``mcp``, ``proxy``) never appear in
        ``--help`` and so are correctly excluded from the user-facing surface.
-    2. Fallback: static regex parse of ``crates/burpwn-cli/src/cli.rs`` (the clap
-       derive structs/enums).
+    2. Explicit opt-out only (``--source static``): regex parse of
+       ``crates/burpwn-cli/src/cli.rs`` (the clap derive structs/enums).
+
+  **The binary is never taken from ``$PATH``, and its ``--version`` must equal the
+  workspace version in ``Cargo.toml``.** This is not paranoia: an installed
+  ``~/.local/bin/burpwn`` left over at 0.2.0 once shadowed a 0.3.4 checkout, so
+  ``--check`` compared a stale surface against an equally stale hand-maintained
+  set and reported ``OK`` — the two agreed only because both were wrong. Seven
+  subcommands and eighteen flags shipped unverified behind that false green.
+  A missing or version-mismatched binary is now a **loud failure**: the guard
+  refuses to validate against anything other than the current tree.
 
   MCP tool names + params
     Always parsed statically from ``crates/burpwn-mcp/src/{server,params}.rs``
@@ -47,7 +56,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from typing import Any
@@ -56,6 +64,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TRAINING_DIR = os.path.dirname(HERE)
 REPO_ROOT = os.path.dirname(TRAINING_DIR)
 
+CARGO_TOML = os.path.join(REPO_ROOT, "Cargo.toml")
 CLI_RS = os.path.join(REPO_ROOT, "crates", "burpwn-cli", "src", "cli.rs")
 MCP_SERVER_RS = os.path.join(REPO_ROOT, "crates", "burpwn-mcp", "src", "server.rs")
 MCP_PARAMS_RS = os.path.join(REPO_ROOT, "crates", "burpwn-mcp", "src", "params.rs")
@@ -69,22 +78,83 @@ META_SUBCOMMANDS = {"help"}
 
 
 # --------------------------------------------------------------------------- #
-# Binary discovery.
+# Binary discovery — repo-built only, version-gated.
 # --------------------------------------------------------------------------- #
 
-def find_binary() -> str | None:
-    """Locate a usable ``burpwn`` binary, or ``None``."""
+class StaleSurfaceError(RuntimeError):
+    """No binary built from this checkout could be used to ground the surface."""
+
+
+# Where a binary built from *this* checkout lands. `$PATH` is deliberately not
+# searched: an installed burpwn from another (older) checkout answers `--help`
+# just fine and silently grounds the guard on a surface that no longer exists.
+_BINARY_CANDIDATES = ("target/debug/burpwn", "target/release/burpwn")
+
+
+def workspace_version() -> str:
+    """The ``[workspace.package] version`` declared in the root ``Cargo.toml``."""
+    with open(CARGO_TOML, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    m = re.search(r"^\[workspace\.package\](.*?)^\[", src, re.S | re.M)
+    section = m.group(1) if m else src
+    vm = re.search(r'^\s*version\s*=\s*"([^"]+)"', section, re.M)
+    if not vm:
+        raise StaleSurfaceError(
+            f"could not read [workspace.package] version from {CARGO_TOML}")
+    return vm.group(1)
+
+
+def binary_version(binary: str) -> str | None:
+    """``burpwn --version`` → the bare version string, or ``None``."""
+    try:
+        proc = subprocess.run([binary, "--version"], capture_output=True,
+                              text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (proc.stdout or proc.stderr or "").strip()
+    m = re.search(r"(\d+\.\d+\.\d+(?:[-+][\w.]+)?)", out)
+    return m.group(1) if m else None
+
+
+def find_binary() -> str:
+    """Locate a ``burpwn`` binary built from *this* checkout, at *this* version.
+
+    Raises ``StaleSurfaceError`` — never falls back to something else — if no
+    candidate exists or every candidate reports a different version than
+    ``Cargo.toml``. Validating a hand-maintained set against a stale binary is
+    exactly the failure this guard exists to prevent, so it must not be silent.
+    """
+    want = workspace_version()
+    tried: list[str] = []
+
     env = os.environ.get("BURPWN_BIN")
-    if env and os.path.isfile(env) and os.access(env, os.X_OK):
-        return env
-    onpath = shutil.which("burpwn")
-    if onpath:
-        return onpath
-    for rel in ("target/release/burpwn", "target/debug/burpwn"):
-        cand = os.path.join(REPO_ROOT, rel)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
+    candidates: list[str] = []
+    if env:
+        candidates.append(env)
+    candidates += [os.path.join(REPO_ROOT, rel) for rel in _BINARY_CANDIDATES]
+
+    for cand in candidates:
+        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+            tried.append(f"{cand} (absent)")
+            continue
+        got = binary_version(cand)
+        if got is None:
+            tried.append(f"{cand} (no parseable --version)")
+            continue
+        if got != want:
+            tried.append(f"{cand} (version {got}, want {want})")
+            continue
+        return cand
+
+    detail = "\n".join(f"    - {t}" for t in tried) or "    - (no candidates)"
+    raise StaleSurfaceError(
+        f"no burpwn binary built from this checkout (Cargo.toml version {want}).\n"
+        f"  candidates tried:\n{detail}\n"
+        f"  build one:  cargo build\n"
+        f"  or point at one explicitly:  BURPWN_BIN=/path/to/burpwn\n"
+        f"  ($PATH is intentionally not searched — an installed binary from an\n"
+        f"   older checkout would ground this guard on a surface that is gone.)"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -184,8 +254,15 @@ def cli_surface_from_binary(binary: str) -> dict[str, Any] | None:
     if not subcommands:
         return None
     flags.update(CLAP_BUILTIN_FLAGS)
+    # The version is part of the provenance on purpose: it is the one field that
+    # would have made the 0.2.0-binary false green visible at a glance. The path
+    # is relativized when it sits inside the repo so the committed surface.json
+    # snapshot does not bake in one machine's absolute paths.
+    shown = binary
+    if os.path.commonpath([os.path.abspath(binary), REPO_ROOT]) == REPO_ROOT:
+        shown = os.path.relpath(binary, REPO_ROOT)
     return {
-        "provenance": f"binary:{binary}",
+        "provenance": f"binary:{shown} ({binary_version(binary)})",
         "subcommands": sorted(subcommands),
         "flags": sorted(flags),
     }
@@ -383,18 +460,23 @@ def mcp_surface_from_source() -> dict[str, Any]:
 def derive_surface(source: str = "auto") -> dict[str, Any]:
     """Derive the full surface snapshot.
 
-    ``source`` selects the CLI provenance: ``"binary"`` (require the binary),
-    ``"static"`` (force cli.rs), or ``"auto"`` (binary if available, else cli.rs).
+    ``source`` selects the CLI provenance:
+
+    * ``"auto"`` / ``"binary"`` — require a binary built from this checkout whose
+      ``--version`` matches ``Cargo.toml``. There is **no silent fallback**: if
+      there is none, ``StaleSurfaceError`` propagates. Grounding the anti-drift
+      guard on anything but the current tree is how the drift got in.
+    * ``"static"`` — explicitly parse ``cli.rs`` instead (escape hatch for
+      environments that cannot build, e.g. a docs-only CI job).
     """
-    cli: dict[str, Any] | None = None
-    if source in ("auto", "binary"):
-        binary = find_binary()
-        if binary:
-            cli = cli_surface_from_binary(binary)
-        if source == "binary" and cli is None:
-            raise RuntimeError("no usable burpwn binary found for --source binary")
-    if cli is None:
+    if source == "static":
         cli = cli_surface_from_source()
+    else:
+        binary = find_binary()  # raises StaleSurfaceError
+        cli = cli_surface_from_binary(binary)
+        if cli is None:
+            raise StaleSurfaceError(
+                f"{binary} did not produce a parseable `--help` tree")
     mcp = mcp_surface_from_source()
     return {"cli": cli, "mcp": mcp}
 
@@ -495,15 +577,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--json", action="store_true",
                     help="print the derived surface as JSON to stdout")
     ap.add_argument("--source", choices=["auto", "binary", "static"], default="auto",
-                    help="CLI surface provenance (default: auto = binary else cli.rs)")
+                    help="CLI surface provenance (default: auto = a binary built "
+                         "from this checkout, matching Cargo.toml's version; "
+                         "'static' explicitly parses cli.rs instead)")
     ap.add_argument("--no-write", action="store_true",
                     help="do not (re)write surface.json in the default mode")
     args = ap.parse_args(argv)
 
-    if args.check:
-        return check_drift(args.source)
-
-    surf = derive_surface(args.source)
+    try:
+        if args.check:
+            return check_drift(args.source)
+        surf = derive_surface(args.source)
+    except StaleSurfaceError as exc:
+        print(f"REFUSING to derive the surface: {exc}", file=sys.stderr)
+        return 2
     if args.json:
         json.dump(surf, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")

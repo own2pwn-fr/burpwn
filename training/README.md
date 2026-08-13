@@ -51,12 +51,12 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-**1,500** deduplicated examples by default (`534 cli`, `307 mcp`, `659 shell`), of
+**1,518** deduplicated examples by default (`541 cli`, `317 mcp`, `660 shell`), of
 which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
-(split 1,425 train / 75 validation). The split is a deterministic,
+(split 1,442 train / 76 validation). The split is a deterministic,
 **style-stratified** 95/5 split (all three styles appear in each split). The
 default emitted set is balanced to ~50% multi-turn by deterministically
-subsampling single-turn records; the **full corpus is 3,325 examples**
+subsampling single-turn records; the **full corpus is 3,345 examples**
 (`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
@@ -178,21 +178,49 @@ turns, each driving tool rounds) follow the same grammar as `shell`.
 }
 ```
 
-The 31 MCP tools are: `session_list`, `session_current`, `session_stats`,
-`session_auth_set`, `session_auth_refresh`, `session_auth_status`, `req_list`,
-`req_show`, `req_search`, `req_replay`, `workspace_list`, `workspace_new`,
-`tag_list`, `tag_add`, `note_add`, `match_replace_list`, `match_replace_add`,
-`intercept_enable`, `intercept_disable`, `intercept_list`, `await_intercept`,
-`intercept_forward`, `intercept_scope`, `intercept_drop`, `exec`, `fuzz`,
-`fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`. All 31 appear as
-real tool calls.
+The 42 MCP tools are: `session_list`, `session_current`, `session_stats`,
+`session_export`, `session_auth_set`, `session_auth_refresh`,
+`session_auth_status`, `req_list`, `req_show`, `req_search`, `req_replay`,
+`workspace_list`, `workspace_new`, `tag_list`, `tag_add`, `note_add`,
+`match_replace_list`, `match_replace_add`, `hook_add`, `hook_list`,
+`hook_set_enabled`, `hook_rm`, `hook_test`, `group_new`, `group_add`,
+`group_list`, `group_show`, `group_rm`, `intercept_enable`,
+`intercept_disable`, `intercept_list`, `await_intercept`, `intercept_forward`,
+`intercept_scope`, `intercept_drop`, `exec`, `fuzz`, `fuzz_list`,
+`fuzz_results`, `compare`, `encode`, `decode`.
+
+All 42 appear as real tool calls in the *families* (the generator's full,
+pre-subsample output). The emitted `dataset.jsonl` is a deterministic
+subsample of that — the multi-turn balancer drops single-turn records to hit
+`--multiturn-frac` — so a given run's file need not exercise every tool. Raise
+`--target` / lower `--multiturn-frac` if you need broader per-tool coverage in
+the emitted split. (This count is only as trustworthy as `eval/surface.py
+--check`; see "Grounding / accuracy" below.)
 
 ## Grounding / accuracy
 
 Every command name, flag, JSON envelope and MCP tool name was verified against
-the **real binary** (`target/debug/burpwn`) and the MCP server source
-(`crates/burpwn-mcp/src/{params,server,handlers}.rs`) on 2026-06-13 by *running
-the binary* and capturing the actual envelopes. Notable grounded facts encoded:
+the **real binary** (`target/debug/burpwn`, built from the checkout) and the MCP
+server source (`crates/burpwn-mcp/src/{params,server,handlers}.rs`), most
+recently on 2026-08-13 at version 0.3.4, by *running the binary* and capturing
+the actual envelopes.
+
+The guard that keeps this true is `eval/surface.py --check`, and it is worth
+saying what it now does, because it previously did not. It derives the surface
+from a binary built from **this** checkout — `target/debug`, `target/release`
+or an explicit `$BURPWN_BIN` — and asserts that binary's `--version` equals the
+workspace version in `Cargo.toml`. `$PATH` is deliberately not searched. Until
+2026-08-13 it was searching `$PATH` and finding an installed 0.2.0 binary, so
+it compared a stale surface against equally stale hand-maintained sets, found
+them consistent, and printed `OK` — seven subcommands and eighteen flags of
+0.3.x shipped unverified behind that false green. A missing or mismatched
+binary is now a loud failure (exit 2) rather than a silent fallback:
+
+```sh
+cargo build && python eval/surface.py --check
+```
+
+Notable grounded facts encoded:
 
 * **CLI and MCP envelopes differ** (the dataset keeps them distinct):
   CLI `--json` wraps everything in `{ok,data,error}`; `req list`/`match-replace
@@ -215,7 +243,38 @@ the binary* and capturing the actual envelopes. Notable grounded facts encoded:
   non-existent flow → a sqlite FOREIGN KEY error.
 * MCP arg names that differ from CLI positionals (`note_add.body`,
   `intercept_forward.set_headers:[{name,value}]`, `match_replace_add.on_request`,
-  `exec.argv`, `await_intercept.timeout_secs`).
+  `exec.argv`, `await_intercept.timeout_secs`, `hook_test.flow_id` where
+  `req_show` takes `id` and `fuzz` takes `flow`).
+* **`prune_nulls` on MCP listings** (0.3.x): `req_list`, `workspace_list`,
+  `tag_list`, `match_replace_list`, `hook_list`, `group_show`, `fuzz_list`,
+  `fuzz_results` and `session_auth_status` **remove** null members rather than
+  emitting them. It is deliberately *not* applied to `req_show`, `group_list`
+  or `compare`, which still return literal nulls — so `group_list` shows
+  `description:null` while `group_show` omits the member. Consumers should test
+  membership, not `is None`.
+* **`req_show` with `raw:true` replaces** the decoded `headers`/`body` with
+  `raw_request`/`raw_response` instead of emitting both (it used to ship every
+  body twice). The decoded metadata — `method`/`path`/`http_version`,
+  `status`/`timing_ms` — stays.
+* **`fuzz_results` drops the per-row `attack_id`** (it repeated the caller's own
+  argument on every one of potentially hundreds of rows).
+* **`group new` is create-or-update** (`created` flips to `false`), so an agent
+  can call it unconditionally before each `group add`; **`session import` always
+  creates a new session** — it never merges and never overwrites, and `--as`
+  renames on the way in.
+* **`--redact` has a narrow scope**, and the dataset says so rather than
+  implying the bundle becomes safe to hand over: it drops the stored auth
+  profiles' `token`/`login_cmd` and match/replace `replacement` values, and does
+  **not** scrub credentials captured inside recorded requests and responses.
+* **A hook's `add-header` synthesises a header that is absent**, which
+  match/replace structurally cannot do (it only substitutes into what is already
+  there) — the distinction that decides which of the two to reach for.
+* **The MCP `compare` body diff is capped** at 200 lines per side; `max_lines`
+  changes the ceiling (absent or `0` = the default, a **negative** value lifts
+  it). A side that was cut is declared in
+  `body.truncated:{only_in_a:{shown,total},...}`, and the object is absent when
+  nothing was cut — so its presence is the signal that there is more. The
+  `burpwn compare` **CLI is uncapped**. `headers.*` is never capped.
 
 ## Coverage
 
@@ -239,6 +298,23 @@ flags and phrasings, then deduplicated):
 * **Live interception**: enable → await → forward/drop, body/header tamper.
 * **Match/replace**: auth-header injection, scoped response rewrites, host/url.
 * **Tag/note/export (HAR)**, CLI-vs-MCP guidance.
+* **Groups** (named flow collections): reconstructing an auth scenario under a
+  name + description, isolating a fuzzing campaign, `req list --group`,
+  `export har --group`; that `group new` is idempotent (create-or-update) so it
+  can be called unconditionally before an `add`; and that `rm-flow`/`rm` destroy
+  only the label, never the captures. Both CLI and MCP, where the shapes of
+  `group_add`/`group_list`/`group_rm` genuinely differ from the CLI's.
+* **Session bundle**: `export session` / `session import`, that import **always**
+  creates a new session (`--as` to rename, `--use` to switch), and an honest
+  treatment of `--redact`'s limited scope — it drops stored tokens/login commands
+  and match/replace replacements, not the credentials captured in the traffic.
+* **Hooks**: `hook add/list/test/enable/disable/rm`, the `add-header`
+  vs. match/replace distinction (synthesise an absent header vs. rewrite an
+  existing one), `hook test` as a dry-run against a captured flow, and the `exec`
+  hook that re-mints an expiring token and injects it before the request leaves
+  (with `--ttl` caching and the fail-open `--timeout` behaviour).
+* **Capped `compare` diffs**: noticing `body.truncated` and re-asking with a
+  negative `max_lines`, so a truncated diff is never mistaken for the whole one.
 * **`Bash` tool-call (style `shell`)**: single-turn recon (`exec` a tool, read
   stdout, point at the capture) and **multi-turn engagements** — session → recon →
   `req list` → `req show` → tag/note/export — plus multi-turn vuln workflows
@@ -260,7 +336,7 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (1,500 records, ~50% multi-turn)
+python generate.py                     # writes dataset.jsonl + splits (1,518 records, ~50% multi-turn)
 python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,325 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)

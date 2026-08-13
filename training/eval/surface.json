@@ -1,19 +1,28 @@
 {
   "cli": {
     "flags": [
+      "--action",
       "--agent",
       "--all",
+      "--as",
       "--check",
       "--clear",
+      "--cmd",
       "--concurrency",
       "--delay",
+      "--description",
+      "--disabled",
       "--extract",
       "--flow",
       "--force",
       "--global",
+      "--group",
       "--header",
       "--help",
       "--host",
+      "--inject-header",
+      "--inject-if-absent",
+      "--inject-param",
       "--json",
       "--limit",
       "--list",
@@ -22,18 +31,25 @@
       "--method",
       "--mode",
       "--name",
+      "--no-probe",
       "--offset",
       "--on",
+      "--order",
+      "--out",
       "--output",
+      "--param",
       "--path",
       "--payload",
       "--payloads",
+      "--phase",
       "--port",
       "--position",
       "--print",
       "--project",
       "--protocol",
+      "--quick",
       "--raw",
+      "--redact",
       "--request",
       "--session",
       "--set-body",
@@ -41,6 +57,8 @@
       "--sort",
       "--status",
       "--timeout",
+      "--ttl",
+      "--use",
       "--version",
       "--what",
       "--workspace",
@@ -49,13 +67,15 @@
       "-h",
       "-o"
     ],
-    "provenance": "source:crates/burpwn-cli/src/cli.rs",
+    "provenance": "binary:target/debug/burpwn (0.3.4)",
     "subcommands": [
       "add",
       "auth",
       "await",
+      "bundle",
       "ca",
       "compare",
+      "debug",
       "decode",
       "disable",
       "doctor",
@@ -66,7 +86,10 @@
       "export",
       "forward",
       "fuzz",
+      "group",
       "har",
+      "hook",
+      "import",
       "init",
       "install",
       "intercept",
@@ -81,6 +104,7 @@
       "replay",
       "req",
       "rm",
+      "rm-flow",
       "run",
       "scope",
       "search",
@@ -91,6 +115,7 @@
       "stats",
       "status",
       "tag",
+      "test",
       "uninstall",
       "use",
       "workspace"
@@ -104,7 +129,8 @@
       "compare": [
         "flow_a",
         "flow_b",
-        "what"
+        "what",
+        "max_lines"
       ],
       "encode": [
         "scheme",
@@ -132,6 +158,53 @@
         "attack_id",
         "sort",
         "limit"
+      ],
+      "group_add": [
+        "name",
+        "flow_ids"
+      ],
+      "group_list": [
+        "workspace"
+      ],
+      "group_new": [
+        "name",
+        "description",
+        "workspace"
+      ],
+      "group_rm": [
+        "name"
+      ],
+      "group_show": [
+        "name"
+      ],
+      "hook_add": [
+        "name",
+        "action",
+        "phase",
+        "host",
+        "method",
+        "path",
+        "status",
+        "header",
+        "param",
+        "cmd",
+        "extract",
+        "inject_header",
+        "inject_param",
+        "order",
+        "timeout_ms",
+        "ttl_ms"
+      ],
+      "hook_rm": [
+        "id"
+      ],
+      "hook_set_enabled": [
+        "id",
+        "enabled"
+      ],
+      "hook_test": [
+        "id",
+        "flow_id"
       ],
       "intercept_drop": [
         "id"
@@ -192,6 +265,11 @@
         "header",
         "host"
       ],
+      "session_export": [
+        "output",
+        "redact",
+        "force"
+      ],
       "tag_add": [
         "flow_id",
         "name",
@@ -206,6 +284,7 @@
       "session_list",
       "session_current",
       "session_stats",
+      "session_export",
       "session_auth_set",
       "session_auth_refresh",
       "session_auth_status",
@@ -218,6 +297,16 @@
       "match_replace_add",
       "tag_add",
       "note_add",
+      "hook_add",
+      "hook_list",
+      "hook_set_enabled",
+      "hook_rm",
+      "hook_test",
+      "group_new",
+      "group_add",
+      "group_list",
+      "group_show",
+      "group_rm",
       "workspace_new",
       "intercept_enable",
       "intercept_disable",
