@@ -131,7 +131,22 @@ pub fn req_list(
         host_contains: params.host.clone(),
         status: params.status,
         method: params.method.clone(),
-        protocol: params.protocol.as_deref().map(Protocol::from_db),
+        protocol: params
+            .protocol
+            .as_deref()
+            .map(|raw| {
+                // `Protocol::from_db`'s RawTcp fallback is right for a label the
+                // proxy wrote and wrong for one an agent passed: `h3` used to
+                // come back as "no such traffic", not as a rejected filter.
+                Protocol::parse(raw).ok_or_else(|| {
+                    burpwn_cli::coded!(
+                        ErrorCode::InputInvalidValue,
+                        "protocol must be {}, got {raw:?}",
+                        Protocol::VALID.join("|")
+                    )
+                })
+            })
+            .transpose()?,
         port: params.port,
         limit: params.limit,
         offset: params.offset,

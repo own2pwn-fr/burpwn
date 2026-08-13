@@ -5,6 +5,17 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — `--protocol` answered a question nobody asked
+`Protocol::from_db` maps an unknown value to `RawTcp`, which is the right reading of a label a
+newer burpwn wrote into the store and the wrong reading of a value a human typed. The `--protocol`
+filter — on the CLI and over MCP — went through it, so `burpwn req list --protocol h3` quietly
+filtered for raw TCP and came back empty: indistinguishable from "no such traffic was captured",
+when the truth was "burpwn does not speak that protocol".
+
+The two operator-facing call sites now reject an unrecognised value with `BW-INPUT-001` and name
+the accepted spellings. The stored-classification path keeps its fallback, deliberately and with
+the reason written down: an older burpwn must still list a flow a newer one labelled.
+
 ### Changed — `export session --redact` now scrubs the CAPTURE, not just what burpwn stored
 `--redact` used to stop at burpwn's own tables: the auth profiles' tokens and login commands, the
 match/replace replacements, an `exec` hook's parameters. Every `Authorization`, `Cookie` and

@@ -1557,6 +1557,27 @@ fn open_store(paths: &Paths, session: &str) -> Result<Store> {
     Store::open(&db).with_context(|| format!("opening session store {}", db.display()))
 }
 
+/// Turn an operator-supplied `--protocol` into a filter, rejecting anything we
+/// do not recognise.
+///
+/// This used to go through `Protocol::from_db`, whose unknown-value fallback is
+/// `RawTcp`. That fallback is right for a label the proxy wrote and wrong for a
+/// value a human typed: `--protocol h3` answered a question nobody asked and
+/// looked like "no such traffic was captured".
+fn parse_protocol_filter(raw: Option<&str>) -> Result<Option<Protocol>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match Protocol::parse(raw) {
+        Some(p) => Ok(Some(p)),
+        None => crate::fail!(
+            ErrorCode::InputInvalidValue,
+            "--protocol must be {}, got {raw:?}",
+            Protocol::VALID.join("|")
+        ),
+    }
+}
+
 fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Result<i32> {
     let store = open_store(paths, session)?;
     // Resolve the --workspace NAME (if any) to an id. An unknown name is an
@@ -1585,7 +1606,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
         host_contains: args.host,
         status: args.status,
         method: args.method,
-        protocol: args.protocol.as_deref().map(Protocol::from_db),
+        protocol: parse_protocol_filter(args.protocol.as_deref())?,
         port: args.port,
         limit: args.limit,
         offset: args.offset,
@@ -3407,6 +3428,34 @@ mod tests {
         let v = serde_json::to_value(&rows).unwrap();
         assert_eq!(v[0]["method"], "GET");
         assert_eq!(v[0]["status"], 200);
+    }
+
+    /// `--protocol h3` used to be silently rewritten to `rawtcp`, so the listing
+    /// came back empty and read as "nothing like that was captured" instead of
+    /// "burpwn does not know that protocol". The known spellings must still be
+    /// accepted, and the message must name them.
+    #[test]
+    fn an_unknown_protocol_filter_is_refused_rather_than_answered() {
+        assert_eq!(parse_protocol_filter(None).unwrap(), None);
+        assert_eq!(
+            parse_protocol_filter(Some("h2")).unwrap(),
+            Some(Protocol::H2)
+        );
+        assert_eq!(
+            parse_protocol_filter(Some("tls-passthru")).unwrap(),
+            Some(Protocol::TlsPassthru)
+        );
+
+        let err = parse_protocol_filter(Some("h3")).unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::InputInvalidValue
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("h3"), "{msg} should quote what was typed");
+        for v in Protocol::VALID {
+            assert!(msg.contains(v), "{msg} should list {v}");
+        }
     }
 
     #[tokio::test]

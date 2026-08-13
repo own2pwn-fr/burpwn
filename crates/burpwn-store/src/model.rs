@@ -34,16 +34,35 @@ impl Protocol {
         }
     }
 
-    /// Parse from the DB string; unknown values map to `RawTcp` to stay lossy-safe.
-    pub fn from_db(s: &str) -> Protocol {
+    /// The accepted spellings, in the order they are shown to a user.
+    pub const VALID: [&'static str; 6] = ["h1", "h2", "ws", "dns", "tls-passthru", "rawtcp"];
+
+    /// Parse a user-supplied protocol. `None` means "not one of [`Protocol::VALID`]".
+    ///
+    /// Callers taking a value from an operator — the `--protocol` filter on the
+    /// CLI and over MCP — must surface that `None` as an error. `--protocol h3`
+    /// used to fall through to `RawTcp`, so the listing silently answered a
+    /// different question than the one that was asked.
+    pub fn parse(s: &str) -> Option<Protocol> {
         match s {
-            "h1" => Protocol::H1,
-            "h2" => Protocol::H2,
-            "ws" => Protocol::Ws,
-            "dns" => Protocol::Dns,
-            "tls-passthru" => Protocol::TlsPassthru,
-            _ => Protocol::RawTcp,
+            "h1" => Some(Protocol::H1),
+            "h2" => Some(Protocol::H2),
+            "ws" => Some(Protocol::Ws),
+            "dns" => Some(Protocol::Dns),
+            "tls-passthru" => Some(Protocol::TlsPassthru),
+            "rawtcp" => Some(Protocol::RawTcp),
+            _ => None,
         }
+    }
+
+    /// Parse a value the proxy itself wrote when it classified a connection.
+    ///
+    /// Unlike [`MatchKind::from_db`] the fallback here is deliberate and stays:
+    /// this is not operator input but our own classification of observed
+    /// traffic, and `RawTcp` — "bytes we did not recognise" — is precisely the
+    /// right answer for a label a newer burpwn wrote and this one does not know.
+    pub fn from_db(s: &str) -> Protocol {
+        Protocol::parse(s).unwrap_or(Protocol::RawTcp)
     }
 }
 
@@ -957,6 +976,36 @@ mod tests {
         for v in MatchKind::VALID {
             assert!(msg.contains(v), "{msg} should list {v}");
         }
+    }
+
+    // `Protocol` carries the same fallback `MatchKind` just lost, but only one of
+    // its two callers should have it: classifying a label the proxy wrote is not
+    // the same act as accepting a value a human typed.
+    #[test]
+    fn unknown_protocol_is_rejected_on_the_input_path_and_absorbed_on_the_db_path() {
+        for p in [
+            Protocol::H1,
+            Protocol::H2,
+            Protocol::Ws,
+            Protocol::Dns,
+            Protocol::TlsPassthru,
+            Protocol::RawTcp,
+        ] {
+            assert_eq!(Protocol::parse(p.as_str()), Some(p));
+            assert_eq!(Protocol::from_db(p.as_str()), p);
+            assert!(Protocol::VALID.contains(&p.as_str()));
+        }
+        // Operator input: a typo, a protocol we do not speak, and a spelling
+        // that differs only in case must all be refusable by the caller.
+        assert_eq!(Protocol::parse("h3"), None);
+        assert_eq!(Protocol::parse("raw-tcp"), None);
+        assert_eq!(Protocol::parse("H1"), None);
+        assert_eq!(Protocol::parse(""), None);
+        // Stored classification: a label written by a newer burpwn must not make
+        // an older one fail to list the flow. "bytes we did not recognise" is
+        // the honest reading of a protocol name we do not know.
+        assert_eq!(Protocol::from_db("h3"), Protocol::RawTcp);
+        assert_eq!(Protocol::from_db(""), Protocol::RawTcp);
     }
 }
 
