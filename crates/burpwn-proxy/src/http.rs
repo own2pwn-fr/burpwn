@@ -31,7 +31,7 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper::header::{HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Version};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use sha2::Digest;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -163,6 +163,11 @@ where
         async move { Ok::<_, Infallible>(handle(req, ctx).await) }
     });
     hyper::server::conn::http1::Builder::new()
+        // `header_read_timeout` schedules its deadline against hyper's own timer, which the H1
+        // builder does not install by default (unlike H2, which is driven by TokioExecutor and
+        // never hits this). Without `.timer(..)` the very first downstream H1 connection panics
+        // ("timeout `header_read_timeout` set, but no timer set") instead of bounding slowloris.
+        .timer(TokioTimer::new())
         // Bound slowloris-style header dribbling on the served (downstream) side.
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(io, service)
@@ -1606,6 +1611,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Regression for "burpwn: upstream error" telling nobody anything: an origin
     // that never answers must produce a 502 body naming the target AND the
@@ -1909,5 +1915,66 @@ mod tests {
             HeaderValue::from_static("websocket"),
         );
         assert!(is_websocket_upgrade(&h));
+    }
+
+    // Bug (CRITICAL) regression: `header_read_timeout` schedules its deadline
+    // against hyper's own timer, and the H1 builder does not install one by
+    // default. Without `.timer(..)`, hyper panics on the FIRST served
+    // connection ("timeout `header_read_timeout` set, but no timer set") —
+    // every cleartext HTTP/1.1 downstream connection captured zero flows and
+    // reset the client, while H2 (a separate builder that never sets this
+    // option) stayed unaffected, which is why it went unnoticed. This test
+    // drives the exact `http1::Builder` chain `serve_h1` uses — timer,
+    // header_read_timeout, serve_connection, with_upgrades — over an in-memory
+    // duplex pair and asserts a real request/response round-trip completes
+    // instead of the connection task panicking.
+    #[tokio::test]
+    async fn h1_builder_with_header_read_timeout_does_not_panic() {
+        let (client, server) = tokio::io::duplex(4096);
+
+        let conn = tokio::spawn(async move {
+            let io = TokioIo::new(server);
+            let service = service_fn(|_req: Request<Incoming>| async move {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT)
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+        });
+
+        let mut client = client;
+        client
+            .write_all(
+                b"GET / HTTP/1.1
+Host: example.invalid
+Connection: close
+
+",
+            )
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+            .await
+            .expect("serve_connection must answer, not hang")
+            .unwrap();
+        assert!(
+            resp.starts_with(b"HTTP/1.1 200"),
+            "expected a 200 response, got: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // `join` (not `await` on the spawned future) surfaces a panic inside
+        // the connection task as an `Err` here instead of aborting the test
+        // process — this is what actually pins the regression: the fixed
+        // code returns `Ok(())` on `Connection: close`, the broken code
+        // panics before ever reaching the client's read.
+        conn.await
+            .expect("serve_connection task must not panic")
+            .expect("connection must close cleanly");
     }
 }
