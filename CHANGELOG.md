@@ -3,7 +3,7 @@
 All notable changes to burpwn are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.0] - 2026-09-30
 
 ### Added — a network scope: the sandbox only reaches what the engagement authorises (schema v9)
 burpwn captured everything and restricted nothing. An agent pointed at `target.com` could follow a
@@ -91,6 +91,15 @@ current rules are kept, so `scope clear` with no argument drops every global rul
 leaves a daemon log line for a trace. The scope bounds a cooperating agent's blast radius — a
 redirect it should not follow, a scanner phoning home, a typo'd host — and that is the threat it is
 built for. A boundary against the agent itself has to sit outside burpwn.
+
+### Fixed — every cleartext HTTP/1.1 connection through the proxy captured nothing
+`serve_h1` set hyper's `header_read_timeout` without installing the timer hyper schedules it on, and
+hyper 1.10 panics on that combination instead of ignoring it. The first downstream HTTP/1.1
+connection hit `timeout \`header_read_timeout\` set, but no timer set` in its task: the client saw a
+reset and `exec` came back with an empty `captured_request_ids`. 0.4.0 and 0.3.4 both shipped with it.
+It went unnoticed because HTTP/2 never sets that timeout, so every `https://` target kept working
+while every `http://` one silently produced no evidence. The Tokio timer is now installed on the
+builder, from the `hyper-util` already in the tree.
 
 ### Fixed — an agent was told to report a bug when it had typo'd an argument
 Three MCP tools — `hook_test`, `session_auth_refresh` and `exec` — answer by shelling out to the
