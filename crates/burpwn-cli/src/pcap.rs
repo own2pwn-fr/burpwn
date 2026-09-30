@@ -855,11 +855,11 @@ impl Checksum {
                 return;
             }
         }
-        let mut chunks = bytes.chunks_exact(2);
-        for c in &mut chunks {
-            self.sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        for &pair in pairs {
+            self.sum += u16::from_be_bytes(pair) as u32;
         }
-        if let [last] = chunks.remainder() {
+        if let [last] = rest {
             self.odd = Some(*last);
         }
     }
