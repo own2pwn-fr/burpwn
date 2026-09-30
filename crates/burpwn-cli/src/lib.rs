@@ -65,6 +65,7 @@ pub mod paths;
 pub mod pcap;
 pub mod render;
 pub mod replay;
+pub mod scope;
 pub mod skill;
 pub mod wrap_hook;
 

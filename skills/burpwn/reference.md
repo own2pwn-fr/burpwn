@@ -118,6 +118,8 @@ produce it — the JSON envelope disambiguates.
 | `BW-INPUT-011` | no such parked intercept |
 | `BW-INPUT-012` | the output file already exists |
 | `BW-INPUT-013` | no such hook |
+| `BW-INPUT-014` | no such scope rule |
+| `BW-INPUT-015` | invalid scope pattern |
 
 **AGENT** — exit code `76`
 
@@ -132,6 +134,7 @@ produce it — the JSON envelope disambiguates.
 | code | meaning |
 |---|---|
 | `BW-NETWORK-001` | the replay request failed |
+| `BW-NETWORK-003` | the destination is outside the network scope |
 
 **INTERNAL** — exit code `78`
 
@@ -193,7 +196,11 @@ cannot use them (WSL). `--quick` skips the live probe.
   - `--port <PORT>` — exact destination port.
   - `--workspace <WORKSPACE>` — restrict to a workspace id.
   - `--group <GROUP>` — restrict to the flows in a group, by NAME (see `burpwn group list`).
+  - `--blocked` — only the flows the network scope refused (see `## scope`).
   - `--limit <LIMIT>` / `--offset <OFFSET>` — pagination.
+  - A scope-refused flow shows `blocked` in the status column (whatever its
+    synthetic 403); `--json` rows carry the reason in `blocked` (`null` for a
+    flow that was not refused), and `req show` prints it.
 - `burpwn req show <ID> [--raw] [--json]` — show one flow (`--raw` = verbatim bytes).
 - `burpwn req search <QUERY> [--json]` — full-text search flow bodies.
 - `burpwn req replay <ID> [OPTIONS] [--json]` — Repeater.
@@ -211,6 +218,9 @@ cannot use them (WSL). `--quick` skips the live probe.
   - `--set-body <SET_BODY>` — replace the body.
   - `--method <METHOD>` — replace the method.
 - `burpwn intercept drop <ID> [--json]`
+- `burpwn intercept scope [<PATTERN>] [--path <PATH>] [--method <METHOD>] [--clear] [--json]` —
+  narrows which flows PARK; it never blocks anything. Not the network scope
+  (`## scope`), which decides which destinations traffic may reach at all.
 
 ## match-replace
 - `burpwn match-replace add <SCOPE> <KIND> <PATTERN> <REPLACEMENT> [--on <ON>] [--json]`
@@ -319,6 +329,140 @@ the loser is forwarded un-hooked at once. Repeater (`req replay`) and Intruder (
 apply the **declarative** hooks only; they have no sandbox, and 500 fuzz requests
 must not be 500 commands.
 
+## scope
+The NETWORK scope: which destinations sandboxed traffic may reach. An allowlist
+and a denylist, enforced by the proxy BEFORE any upstream contact — a refused
+destination gets no packet at all, not a DNS query, not a SYN. `req replay` and
+`fuzz` are held to it too. Not `intercept scope` (that one only picks which flows
+park, and never blocks anything).
+- `burpwn scope allow <PATTERN>... [--workspace <NAME>] [--json]`
+- `burpwn scope deny <PATTERN>... [--workspace <NAME>] [--json]`
+  - Without `--workspace` the rule is GLOBAL (applies to every workspace). With
+    `--workspace <NAME>` it applies to that workspace only; the workspace is
+    created if missing, so a scope can be staged before the first `exec`.
+  - Every pattern is validated first: one invalid pattern stores none of them
+    (`BW-INPUT-015`). Patterns are stored normalized, and re-adding an identical
+    rule returns its existing id with `created: false` (idempotent).
+  - JSON: `{"rules": [{id, kind, pattern, scope, workspace_id, created}]}`, where
+    `scope` is `global` or the workspace name.
+- `burpwn scope list [--workspace <NAME>] [--json]` — every rule (global and per
+  workspace); with `--workspace`, the EFFECTIVE set of that workspace (the global
+  rules plus its own). JSON: `{"workspace", "rules": [{id, kind, pattern, scope,
+  workspace_id, created_at}]}`.
+- `burpwn scope rm <ID>... [--json]` — every id must exist, or nothing is removed
+  (`BW-INPUT-014`). JSON: `{"removed": [ids]}`.
+- `burpwn scope clear [--workspace <NAME> | --all] [--kind allow|deny] [--json]` —
+  the GLOBAL rules by default, one workspace's OWN rules with `--workspace` (not
+  the global ones it inherits), every rule with `--all`; `--kind` narrows it.
+  Clearing every allow rule lifts the allowlist. JSON: `{"removed": n, "target":
+  "global"|"workspace"|"all", "workspace", "kind"}`.
+- `burpwn scope test <TARGET> [--workspace <NAME>] [--json]` — evaluate one target
+  (`host`, `host:port`, `ip`, `ip:port`, `[v6]:port`) for a workspace (default
+  `default`) and print the verdict and the deciding rule. Pure evaluation: nothing
+  is resolved or sent. A host is evaluated as a connection burpwn resolved that
+  name for; its address is unknown, so IP/CIDR allow rules cannot justify it
+  (`note` says so; test the address for those — live, the name passes when its
+  address matches such a rule), and it also gets the verdict of a DNS query for
+  it (`dns`).
+  Without a port, only rules without a port constraint apply. JSON: `{target,
+  workspace, kind: "host"|"ip", port, verdict: "allowed"|"blocked", allowed,
+  reason, rule: {id, kind, pattern, scope}|null, dns: {verdict, allowed, reason,
+  rule}|null, note}`.
+
+Patterns (case-insensitive, trailing dot stripped):
+- `toto.fr` — exactly that host.
+- `*.toto.fr` — the apex `toto.fr` AND every subdomain at any depth. A strict
+  label-suffix match: never `nottoto.fr`, never `toto.fr.evil.com`. `*` is only
+  accepted as the whole leftmost label, and a bare `*` is refused (use
+  `scope clear`).
+- `10.0.0.5`, `2001:db8::1` — one address; `10.0.0.0/8`, `2001:db8::/32` — a
+  CIDR (host bits are cleared on the way in).
+- Optional `:port` on any of them: `toto.fr:8443`, `*.toto.fr:443`,
+  `10.0.0.0/8:22`. IPv6 with a port needs brackets: `[2001:db8::1]:443`,
+  `[2001:db8::/32]:443`. No port = any port.
+
+Evaluation, for a flow in workspace W (rules considered = global ∪ W's own; other
+workspaces' rules are ignored):
+1. any DENY rule matching any identity of the flow blocks it — **deny always wins**;
+2. else, if at least one ALLOW rule is considered, the flow must be allowed, or
+   it is blocked (`not in allowlist: ...`) — **one allow rule turns the scope into
+   an allowlist**: everything else is blocked;
+3. else it is allowed.
+
+A connection is allowed when its DESTINATION is justified — the destination IP
+matches an allow IP/CIDR rule, or a name the DNS shim saw resolve to that IP (in
+this workspace), or the name burpwn itself resolved (explicit proxy, replay),
+matches an allow host rule — AND every name it declares (HTTP `Host` /
+`:authority`, an absolute request target, TLS SNI; userinfo before `@` is
+ignored) is acceptable, AND the matching rule's port holds. A declared name is
+acceptable when it matches an allow host rule, or when the destination is
+allowed by an IP/CIDR rule and the name is BOUND to that address (the DNS shim
+saw it resolve there, or burpwn resolved it itself). So an IP-only allowlist
+(`allow 10.0.0.0/8`) passes `https://intranet.corp` when that name resolved into
+`10/8`, and `Host: evil.com` sent to an allowed (shared-CDN) IP that `evil.com`
+never resolved to is refused: the upstream socket goes where the IP says, never
+where the header says. The name→IP cache is
+in-memory, per workspace, for the daemon's lifetime (65536 entries, oldest
+evicted, up to 32 names per IP); record TTLs are ignored, so a name keeps
+justifying an address it once resolved to.
+
+A DNS query is checked against HOST rules only, in its ASCII (punycode) form: a
+matching port-less deny rule, or host allow rules none of which matches (their
+port ignored), answers `REFUSED` without forwarding. With host rules in force, a
+query without exactly one question or with a label outside `[A-Za-z0-9-_]` is
+refused too. An allowlist with no host rule (IP/CIDR only) lets every name
+resolve; the connection check then decides on the IP.
+
+What a blocked flow looks like:
+- **Cleartext HTTP / h2c / WebSocket upgrade, and HTTP inside MITM** — a synthetic
+  `403` with body `burpwn: blocked by scope (<reason>)` and a
+  `burpwn-error: BW-NETWORK-003` header. Checked on arrival and again on what
+  will actually leave, after match/replace, hooks and intercept edits.
+- **TLS** — decided on the ClientHello's SNI, before MITM or passthrough: the
+  client gets a fatal `access_denied` alert and the socket is closed. Recorded
+  as `tls-passthru` (nothing was decrypted), reason prefixed
+  `TLS refused before handshake (no MITM, no upstream): `.
+- **Raw TCP** — closed without dialing (identities: destination IP + DNS-cache
+  names).
+- **DNS** — `REFUSED`.
+- **`req replay` / `fuzz`** — fail with `BW-NETWORK-003` and send nothing. The
+  check uses the replayed flow's workspace; `fuzz` re-checks every rendered
+  request (a payload can sit in `Host`), and a blocked base target aborts before
+  the first request.
+
+Blocked flows ARE recorded (unlike a hook `drop`), with the reason in `blocked`:
+HTTP with its request and the synthetic 403, TLS as a `tls-passthru` flow with
+the SNI, raw TCP as a `rawtcp` flow, DNS as the `REFUSED` query. Find them with
+`req list --blocked`.
+
+Caveats:
+- Rules live in the session. A running daemon picks up changes within ~2 s
+  (open connections included, from their next check); a daemon refuses to START
+  if a stored rule does not parse (`BW-INPUT-015`, fix with `scope rm <id>`), and
+  a rule that stops parsing at runtime keeps the previous set (WARN).
+  `export session` carries the rules.
+- Traffic is evaluated for the workspace of its `exec`. A hook `exec` command
+  runs under workspace `default` whatever flow triggered it, and is held to the
+  global rules plus `default`'s — it is not exempt, so allow its login endpoint.
+- `req replay` may resolve the flow's host on the host machine to confirm it
+  still points at the recorded address, and only for a name the scope would let
+  resolve. A flow blocked before burpwn resolved it (explicit proxy, recorded
+  `0.0.0.0`) cannot be replayed or fuzzed (`BW-INPUT-009`, "no destination address").
+- Deny-only mode cannot stop a client that resolves on its own (DoH, hard-coded
+  IP) and opens raw TCP with no Host/SNI: only the IP (and names the DNS shim
+  saw) can be judged. Use an allowlist for a hard boundary.
+- A deny rule matches a name learned from the DNS cache only for a connection
+  that declares NO name (raw TCP, SNI-less TLS); declared names and the IP are
+  always checked.
+- A port-qualified deny (`evil.com:8443`) does not refuse DNS for the name; the
+  connection check enforces the port.
+- ECH hides the real inner name on passthrough: only the outer SNI is judged.
+- A CNAME from an allowed name makes its target's addresses reachable — by
+  design, the whole chain is learned as bound to those addresses.
+- A 403 whose body starts `burpwn: blocked by scope`, an `access_denied` alert
+  or a `REFUSED` answer is burpwn, not a target defense: read `scope test` /
+  `scope list` before drawing conclusions.
+
 ## session auth (login macro)
 A named `pre-request` `exec` hook, with the flags an authenticated engagement
 actually has. `session auth set` writes the hook `auth:<HOST>` (`auth:*` when
@@ -343,7 +487,7 @@ unscoped); `hook list` / `hook show` / `hook test` / `hook rm` all work on it.
 ## workspace
 - `burpwn workspace new <NAME> [--json]`
 - `burpwn workspace list [--json]`
-- `burpwn workspace use <NAME> [--json]` — informational only: records the choice in config. To actually scope, pass `--workspace` on `exec`/`req`.
+- `burpwn workspace use <NAME> [--json]` — informational only: resolves the name to its id and prints it; nothing is persisted. Pass `--workspace` explicitly on `exec`/`req`/`scope` to use a workspace (`scope` rules default to GLOBAL, `scope test` to `default`).
 
 ## tag / note
 - `burpwn tag add <FLOW_ID> <NAME> [--json]`
@@ -414,13 +558,14 @@ workspace and every subcommand takes the NAME, not an id.
 ## mcp (stdio server)
 `burpwn mcp [--session <n>]` — start the MCP server over stdio. It does not print
 `--help`; running it starts the server (it exits when the stdio connection
-closes). Exposes 42 tools: `session_list`, `session_current`, `session_stats`,
+closes). Exposes 48 tools: `session_list`, `session_current`, `session_stats`,
 `session_export`, `session_auth_set`, `session_auth_refresh`,
 `session_auth_status`, `req_list`,
 `req_show`, `req_search`, `req_replay`, `workspace_list`, `workspace_new`,
 `tag_list`, `tag_add`, `note_add`, `group_new`, `group_add`, `group_list`,
 `group_show`, `group_rm`, `match_replace_list`, `match_replace_add`,
 `hook_add`, `hook_list`, `hook_set_enabled`, `hook_rm`, `hook_test`,
+`scope_allow`, `scope_deny`, `scope_list`, `scope_rm`, `scope_clear`, `scope_test`,
 `intercept_enable`, `intercept_disable`, `intercept_list`, `intercept_scope`,
 `await_intercept`, `intercept_forward`, `intercept_drop`, `exec`, `fuzz`,
 `fuzz_list`, `fuzz_results`, `compare`, `encode`, `decode`.

@@ -38,6 +38,7 @@
 //!     scheme: "https".into(),
 //!     protocol: Protocol::H1,
 //!     intercepted: false,
+//!     blocked: None,
 //! }).await?;
 //! let detail = store.reader().get_flow(flow_id)?;
 //! # Ok(()) }
@@ -185,6 +186,7 @@ mod tests {
             scheme: "https".into(),
             protocol: Protocol::H1,
             intercepted: false,
+            blocked: None,
         }
     }
 
@@ -691,6 +693,7 @@ mod tests {
             scheme: "http".into(),
             protocol: Protocol::H1,
             intercepted: false,
+            blocked: None,
         };
 
         // Pre-window, NULL exec: must NOT be stamped (ts < since).
@@ -800,6 +803,121 @@ mod tests {
             !rules.iter().any(|r| r.match_kind == MatchKind::Body),
             "an undecodable kind must never surface as a body rule"
         );
+    }
+
+    #[tokio::test]
+    async fn scope_rules_add_list_rm_clear_and_dedupe() {
+        use crate::model::{NewScopeRule, ScopeClearTarget, ScopeKind};
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let reader = store.reader();
+        let ws = w.create_workspace("target", 1).await.unwrap();
+        let rule = |workspace_id: Option<i64>, kind, pattern: &str| NewScopeRule {
+            workspace_id,
+            kind,
+            pattern: pattern.into(),
+        };
+
+        let (g1, created) = w
+            .add_scope_rule(rule(None, ScopeKind::Allow, "*.toto.fr"))
+            .await
+            .unwrap();
+        assert!(created);
+        // A global duplicate: NULL workspace must still dedupe (UNIQUE would not).
+        let (again, created) = w
+            .add_scope_rule(rule(None, ScopeKind::Allow, "*.toto.fr"))
+            .await
+            .unwrap();
+        assert_eq!((again, created), (g1, false));
+        // Same pattern, other kind / other scope: distinct rows.
+        let (g2, _) = w
+            .add_scope_rule(rule(None, ScopeKind::Deny, "*.toto.fr"))
+            .await
+            .unwrap();
+        let (w1, created) = w
+            .add_scope_rule(rule(Some(ws), ScopeKind::Allow, "*.toto.fr"))
+            .await
+            .unwrap();
+        assert!(created);
+        let (w1b, created) = w
+            .add_scope_rule(rule(Some(ws), ScopeKind::Allow, "*.toto.fr"))
+            .await
+            .unwrap();
+        assert_eq!((w1b, created), (w1, false));
+        let (w2, _) = w
+            .add_scope_rule(rule(Some(ws), ScopeKind::Deny, "10.0.0.0/8"))
+            .await
+            .unwrap();
+
+        let all = reader.list_scope_rules().unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![g1, g2, w1, w2]
+        );
+        assert_eq!(all[0].workspace, None);
+        assert_eq!(all[2].workspace.as_deref(), Some("target"));
+        assert_eq!(all[3].kind, ScopeKind::Deny);
+
+        // rm: known id true, unknown id false.
+        assert!(w.delete_scope_rule(g2).await.unwrap());
+        assert!(!w.delete_scope_rule(g2).await.unwrap());
+
+        // clear --kind deny on the workspace takes only w2.
+        let n = w
+            .clear_scope_rules(ScopeClearTarget::Workspace(ws), Some(ScopeKind::Deny))
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // clear (global) leaves the workspace rule.
+        let n = w
+            .clear_scope_rules(ScopeClearTarget::Global, None)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let left = reader.list_scope_rules().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, w1);
+        // --all empties the table.
+        w.add_scope_rule(rule(None, ScopeKind::Deny, "evil.com"))
+            .await
+            .unwrap();
+        let n = w
+            .clear_scope_rules(ScopeClearTarget::All, None)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(reader.list_scope_rules().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_flows_roundtrip_and_filter() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let ok = w.flow_start(sample_flow()).await.unwrap();
+        let mut f = sample_flow();
+        f.blocked = Some("not in allowlist".into());
+        let bad = w.flow_start(f).await.unwrap();
+
+        let reader = store.reader();
+        let all = reader.list_flows(&FlowFilter::default()).unwrap();
+        assert_eq!(all.len(), 2);
+        let only = reader
+            .list_flows(&FlowFilter {
+                blocked_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].id, bad);
+        assert_eq!(only[0].blocked.as_deref(), Some("not in allowlist"));
+        let detail = reader.get_flow(ok).unwrap().unwrap();
+        assert_eq!(detail.flow.blocked, None);
+        assert_eq!(detail.client_addr, "127.0.0.1:51000");
+        let detail = reader.get_flow(bad).unwrap().unwrap();
+        assert_eq!(detail.flow.blocked.as_deref(), Some("not in allowlist"));
     }
 
     #[tokio::test]
@@ -938,6 +1056,7 @@ mod tests {
                     scheme: "http".into(),
                     protocol: Protocol::H1,
                     intercepted: false,
+                    blocked: None,
                 };
                 f.ts_start = i as i64;
                 w.flow_start(f).await.unwrap()

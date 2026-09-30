@@ -19,6 +19,11 @@
 //! (add a header that is not there, and run a command whose output is injected,
 //! e.g. a token mint).
 //!
+//! Network scope: `scope_allow` / `scope_deny` / `scope_list` / `scope_rm` /
+//! `scope_clear` / `scope_test` manage the allowlist / denylist of destinations
+//! the proxy (and `req_replay` / `fuzz`) enforce before any upstream contact —
+//! thin wrappers over `burpwn_cli::scope`, the code `burpwn scope` runs.
+//!
 //! Archival: `session_export` packs the whole session into one portable
 //! `.burpwn` bundle. There is deliberately NO import tool — loading a file that
 //! arrived from somewhere else is an operator decision (`burpwn session import`),

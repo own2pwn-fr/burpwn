@@ -52,6 +52,7 @@ where
             scheme: "tcp".into(),
             protocol: Protocol::RawTcp,
             intercepted: false,
+            blocked: None,
         })
         .await
         .map_err(to_io)?;

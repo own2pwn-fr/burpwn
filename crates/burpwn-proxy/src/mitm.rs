@@ -150,6 +150,11 @@ where
     }
 }
 
+/// A plaintext TLS fatal alert record, `access_denied` (49): what a client is
+/// told when the network scope refuses its connection before any handshake.
+/// Legal before the ServerHello for every TLS version.
+pub(crate) const ACCESS_DENIED_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 49];
+
 /// Render a rustls [`rustls::ProtocolVersion`] as a friendly string (`TLSv1.3`),
 /// falling back to the debug form for anything unrecognized.
 fn tls_version_str(v: rustls::ProtocolVersion) -> String {
@@ -165,7 +170,7 @@ fn tls_version_str(v: rustls::ProtocolVersion) -> String {
 /// Read the full ClientHello record. `prefix` is the already-peeked bytes (TLS
 /// record header is 5 bytes: type(1) version(2) length(2)). We read until we
 /// have the whole record, capping at a sane bound.
-async fn read_client_hello<S: AsyncRead + Unpin>(
+pub(crate) async fn read_client_hello<S: AsyncRead + Unpin>(
     stream: &mut S,
     mut prefix: Vec<u8>,
 ) -> std::io::Result<Vec<u8>> {

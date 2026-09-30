@@ -5,6 +5,69 @@ All notable changes to burpwn are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — a network scope: the sandbox only reaches what the engagement authorises (schema v9)
+burpwn captured everything and restricted nothing. An agent pointed at `target.com` could follow a
+redirect to a third party, let a scanner phone home, or fuzz a production host one typo away, and
+the only guard was the agent's own discipline. For an authorised test that is the wrong way round:
+the boundary of the engagement belongs in the tool that carries the traffic, not in a prompt.
+
+`burpwn scope` is an allowlist and a denylist of destinations, global or per workspace:
+
+```sh
+burpwn scope allow '*.target.com' 203.0.113.0/24      # nothing else is reachable
+burpwn scope deny admin.target.com 169.254.169.254    # deny always wins
+burpwn scope allow staging.target.com --workspace staging
+burpwn scope test api.target.com:443                  # verdict + deciding rule, sends nothing
+burpwn req list --blocked                             # what was refused, and why
+```
+
+A pattern is a host, `*.host` (the apex and every subdomain), an IP or a CIDR, each with an
+optional port. `*.target.com` is a label-suffix test, not the substring test the match/replace glob
+does: it never matches `nottarget.com` or `target.com.evil.com`. A bare `*` is refused rather than
+read as "everything". The rules a flow is held to are the global ones plus its workspace's own; a
+deny rule always wins, and the first allow rule turns the scope into an allowlist.
+
+It is enforced **before any upstream contact** — the invariant is that an out-of-scope destination
+receives no packet at all, not even a DNS query or a SYN. So each protocol is refused at the first
+point burpwn knows enough to decide, and never later: cleartext HTTP is answered locally with a
+`403` (`burpwn: blocked by scope (<reason>)`, `burpwn-error: BW-NETWORK-003`) before the upstream
+socket is dialed, and again on what will actually leave after match/replace, hooks and intercept
+edits; TLS is decided on the ClientHello's SNI before MITM or passthrough and gets an
+`access_denied` alert; raw TCP is closed; DNS is answered `REFUSED`. An explicit-proxy name the
+scope refuses is not even looked up.
+
+The allow check trusts the destination, not the declarations. The upstream socket goes where the
+IP says whatever the `Host` header claims, so a connection must be *justified* — its IP matches an
+allow IP/CIDR rule, or a name that resolved to it matches an allow host rule — and every name it
+declares (Host, SNI, an absolute request target) must be acceptable as well: it matches an allow
+host rule, or the address is allowed by an IP/CIDR rule and the name is *bound* to it (it resolved
+there through the DNS shim, or burpwn resolved it itself). So an IP-only allowlist lets
+`https://intranet.corp` through when that name really resolves into the allowed range, while
+`Host: evil.com` sent to an allowed shared-CDN address evil.com never resolved to is refused.
+Name-to-IP links come from the DNS shim, which now remembers every A/AAAA answer it relays per
+workspace (in memory, 65536 entries; TTLs ignored, because a client keeps using an address long
+after its TTL). A denied name learned that way only counts against a connection that declares no
+name of its own, so a denied tracker sharing a CDN address does not take allowed sites down with
+it. DNS questions are compared in their ASCII (punycode) form; with host rules in force a query
+without exactly one question, or with a label outside `[A-Za-z0-9-_]`, is refused. A port-qualified
+deny (`evil.com:8443`) does not refuse the name, only that port.
+
+Repeater and Intruder are held to the same rules: `req replay` and `fuzz` check the replayed flow's
+workspace before sending, fail with `BW-NETWORK-003` and send nothing, and `fuzz` re-checks every
+rendered request since a payload can sit in the `Host` header. Hook `exec` commands are not exempt
+— they run under workspace `default` and follow its scope.
+
+A refused flow is recorded, unlike a hook `drop`: `flows.blocked` (new column, schema v9, next to
+the new `scope_rules` table) holds the reason, `req list` prints `blocked` in the status column and
+`--blocked` filters on it, `req show` prints the reason. That is what lets an agent tell "out of
+scope" from "the target defended itself" instead of reporting the 403 as a finding. Rule changes
+reach a running daemon within two seconds; a daemon refuses to start on a stored rule it cannot
+parse rather than run unscoped. Three codes: `BW-INPUT-014` (no such scope rule), `BW-INPUT-015`
+(invalid scope pattern), `BW-NETWORK-003` (destination outside the network scope). Six MCP tools
+wrap it — `scope_allow`, `scope_deny`, `scope_list`, `scope_rm`, `scope_clear`, `scope_test` — and
+`req_list` takes `blocked`: **48 tools** now. `intercept scope` is unrelated and unchanged; its help
+now says it never blocks traffic.
+
 ### Fixed — an agent was told to report a bug when it had typo'd an argument
 Three MCP tools — `hook_test`, `session_auth_refresh` and `exec` — answer by shelling out to the
 burpwn binary and reading its `--json` envelope. Every failure of that child came back wrapped as
