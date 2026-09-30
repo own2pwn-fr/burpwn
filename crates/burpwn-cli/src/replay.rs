@@ -264,7 +264,10 @@ pub async fn replay_flow(
     apply_hooks(&hooks, &detail, &mut req)?;
     // The network scope of the flow's workspace, BEFORE anything is dialed: a
     // target the proxy would refuse is not reachable through the Repeater
-    // either. Checked on the final request (after edits and hooks).
+    // either. Checked on the final request (after edits and hooks). A replay
+    // sends exactly one request, so this verdict IS the enforcement — there is
+    // no later request for a rule change to catch, and the returned scope (what
+    // `fuzz` re-checks each rendered request with) has no use here.
     let addr = dst_addr(&detail)?;
     let host = replay_host(&detail, &req);
     crate::scope::check_replay(store, detail.flow.workspace_id, id, &host, addr).await?;

@@ -63,7 +63,7 @@ use burpwn_tls::{
 pub use crate::classify::{Class, PrefixedStream};
 pub use crate::fuzz::{
     run_attack, AttackMode, AttackReport, BaselineStats, FuzzConfig, FuzzResult, HttpReplaySender,
-    Position, RequestSender, SentResponse, Template,
+    LiveReplayScope, Position, RequestSender, SentResponse, Template,
 };
 pub use crate::hooks::{HookEngine, HookOutcome, HookRunner, MatchCtx, HOOK_EXEC_ID_PREFIX};
 pub use crate::http::{HttpContext, Upstream};

@@ -581,7 +581,7 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
 /// two seconds is imperceptible to an operator (and to an agent that just called
 /// `hook_add` and is about to send a request) while costing one small indexed
 /// SELECT per interval — off the request path entirely.
-const HOOK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const HOOK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Keep the proxy's hook engine in sync with the store.
 ///
@@ -609,11 +609,13 @@ async fn hook_refresher(engine: burpwn_proxy::HookEngine, reader: burpwn_store::
     }
 }
 
-/// Keep the proxy's scope engine in sync with the store (same cadence and same
-/// failure policy as [`hook_refresher`]: a table that cannot be read, or a rule
-/// that no longer parses, keeps the previous rule set and logs a WARN — never a
-/// partial set, never an empty one). `last` is what was loaded at startup.
-async fn scope_refresher(
+/// Keep a scope engine in sync with the store (same cadence and same failure
+/// policy as [`hook_refresher`]: a table that cannot be read, or a rule that no
+/// longer parses, keeps the previous rule set and logs a WARN — never a partial
+/// set, never an empty one). `last` is what the caller already loaded into the
+/// engine. Runs for the daemon's lifetime on the proxy's engine, and for one
+/// attack's lifetime on the engine `crate::scope::live_replay_scope` builds.
+pub(crate) async fn scope_refresher(
     engine: burpwn_proxy::ScopeEngine,
     reader: burpwn_store::Reader,
     mut last: Vec<burpwn_store::model::ScopeRule>,

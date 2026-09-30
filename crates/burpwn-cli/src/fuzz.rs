@@ -166,9 +166,13 @@ pub async fn fuzz_run(
 
     // The network scope of the flow's workspace, checked BEFORE the first
     // request: a blocked target aborts the attack with nothing sent (and no
-    // attack row). Each rendered request is re-checked by the sender, since a
-    // payload can sit in the `Host` header.
-    let scope = crate::scope::check_replay(
+    // attack row). Each rendered request is then re-checked by the sender, both
+    // because a payload can sit in the `Host` header and because the rules can
+    // change while the attack runs — `_scope_refresh` keeps the sender's engine
+    // in sync with the store until it is dropped at the end of this function,
+    // so a `burpwn scope deny` typed mid-run stops the rest of the attack
+    // within one refresh interval instead of at the end of it.
+    let (scope, _scope_refresh) = crate::scope::live_replay_scope(
         &store,
         detail.flow.workspace_id,
         detail.flow.id,

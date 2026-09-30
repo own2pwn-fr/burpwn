@@ -5,7 +5,9 @@
 //! Rules live in the session store (`scope_rules`); the proxy daemon re-reads
 //! them every two seconds and enforces them before any upstream contact (see
 //! `burpwn_proxy::scope` for the matching and evaluation semantics). The same
-//! rules hold `req replay` and `fuzz` through [`check_replay`].
+//! rules hold `req replay` through [`check_replay`], and `fuzz` — which sends
+//! for minutes, long enough for the rules to change under it — through
+//! [`live_replay_scope`], on the same two-second cadence as the proxy.
 //!
 //! Not to be confused with `intercept scope`, which only selects the flows the
 //! interceptor parks and never blocks anything.
@@ -18,8 +20,10 @@ use serde_json::{json, Value};
 
 use burpwn_error::ErrorCode;
 use burpwn_proxy::scope::{
-    ConnCheck, HostPattern, Identity, Pattern, ReplayScope, RuleRef, RuleSet, Target, Verdict,
+    ConnCheck, HostPattern, Identity, Pattern, ReplayScope, RuleRef, RuleSet, ScopeEngine, Target,
+    Verdict,
 };
+use burpwn_proxy::LiveReplayScope;
 use burpwn_store::model::{NewScopeRule, ScopeClearTarget, ScopeKind, ScopeRule, Workspace};
 use burpwn_store::schema::DEFAULT_WORKSPACE_ID;
 use burpwn_store::Store;
@@ -261,8 +265,15 @@ fn rule_ref_json(r: &RuleRef) -> Value {
 
 /// Load and parse the session's rules.
 fn load_rules(store: &Store) -> Result<RuleSet> {
-    let rows = store.reader().list_scope_rules()?;
-    RuleSet::from_store(&rows).map_err(|e| {
+    parse_rules(&store.reader().list_scope_rules()?)
+}
+
+/// Parse rows already read from the store. Split out from [`load_rules`] so a
+/// caller that also needs the rows themselves (to seed a refresher's notion of
+/// what it last saw) parses exactly what it read, with no second SELECT in
+/// between that could miss a rule added at that instant.
+fn parse_rules(rows: &[ScopeRule]) -> Result<RuleSet> {
+    RuleSet::from_store(rows).map_err(|e| {
         crate::coded!(
             ErrorCode::InputBadScopePattern,
             "the session's network scope cannot be loaded ({e}); fix it with `burpwn scope rm <id>`"
@@ -358,19 +369,18 @@ pub fn test(store: &Store, target: &str, workspace: Option<&str>) -> Result<Valu
 /// really resolves to it: that lookup happens only when needed, and only for a
 /// name the scope would let resolve (a refused name is never looked up).
 ///
-/// Returns the [`ReplayScope`] a per-request sender re-checks with (`None`
-/// when the session has no rule at all).
+/// Returns the [`ReplayScope`] a per-request sender re-checks with. A session
+/// with no rule at all still gets one (it evaluates to "allowed"): returning
+/// nothing here used to switch the per-request check off for the whole run, so
+/// a rule added afterwards applied to no request of it.
 pub async fn check_replay(
     store: &Store,
     workspace_id: i64,
     flow_id: i64,
     host: &str,
     dst: SocketAddr,
-) -> Result<Option<ReplayScope>> {
+) -> Result<ReplayScope> {
     let rules = load_rules(store)?;
-    if rules.is_empty() {
-        return Ok(None);
-    }
     let mut scope = ReplayScope {
         rules: Arc::new(rules),
         workspace_id,
@@ -403,7 +413,56 @@ pub async fn check_replay(
             "flow {flow_id}: {host} ({dst}) is outside the network scope ({reason}); nothing was sent"
         );
     }
-    Ok(Some(scope))
+    Ok(scope)
+}
+
+/// The scope a multi-request run (`fuzz`) is held to: [`check_replay`]'s
+/// verdict on the base target, then the same rules in a [`LiveReplayScope`]
+/// whose engine stays in sync with the store for as long as the returned guard
+/// lives.
+///
+/// An attack is thousands of requests over minutes, and the operator watching
+/// it is the one who types `burpwn scope deny <host>` when it reaches somewhere
+/// it should not. A snapshot taken at attack start would make that edit arrive
+/// only after the run, leaving cancellation as the only way to stop it. The
+/// engine is therefore refreshed on the daemon's cadence
+/// ([`crate::daemon::HOOK_REFRESH_INTERVAL`], two seconds) by the daemon's own
+/// refresher: the enforcement window is the same for an attack as for proxied
+/// traffic — a rule takes effect on every request sent more than one interval
+/// after it was stored — and the store is read once per interval rather than
+/// once per request, which matters when the run is a hot loop and the read is
+/// a synchronous SQLite query.
+pub async fn live_replay_scope(
+    store: &Store,
+    workspace_id: i64,
+    flow_id: i64,
+    host: &str,
+    dst: SocketAddr,
+) -> Result<(LiveReplayScope, ScopeRefresh)> {
+    let base = check_replay(store, workspace_id, flow_id, host, dst).await?;
+    let rows = store.reader().list_scope_rules()?;
+    let engine = ScopeEngine::new();
+    engine.set_rules(parse_rules(&rows)?);
+    let live = LiveReplayScope {
+        engine: engine.clone(),
+        workspace_id: base.workspace_id,
+        dst_ip: base.dst_ip,
+        dst_port: base.dst_port,
+        resolved_name: base.resolved_name,
+    };
+    let task = tokio::spawn(crate::daemon::scope_refresher(engine, store.reader(), rows));
+    Ok((live, ScopeRefresh(task)))
+}
+
+/// Keeps a [`live_replay_scope`]'s refresher alive; aborts it on drop, so the
+/// task cannot outlive the run that needed it (a long-lived MCP server would
+/// otherwise accumulate one poller per attack).
+pub struct ScopeRefresh(tokio::task::JoinHandle<()>);
+
+impl Drop for ScopeRefresh {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Address equality that treats an IPv4-mapped IPv6 address as its IPv4 form.
@@ -418,6 +477,7 @@ fn same_ip(a: IpAddr, b: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn store() -> (TempDir, Store) {
@@ -566,12 +626,11 @@ mod tests {
     #[tokio::test]
     async fn replay_check_blocks_before_sending() {
         let (_d, s) = store();
-        // No rules: nothing to hold.
+        // No rules: nothing to enforce, but the caller still gets a scope to
+        // re-check with — the run may outlive the empty rule set.
         let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert!(check_replay(&s, 1, 1, "evil.test", dst)
-            .await
-            .unwrap()
-            .is_none());
+        let scope = check_replay(&s, 1, 1, "evil.test", dst).await.unwrap();
+        assert!(scope.check(&["evil.test"]).allowed);
 
         add(&s, ScopeKind::Deny, &["evil.test".into()], None)
             .await
@@ -586,18 +645,12 @@ mod tests {
         add(&s, ScopeKind::Allow, &["127.0.0.0/8".into()], None)
             .await
             .unwrap();
-        assert!(check_replay(&s, 1, 1, "127.0.0.1", dst)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(check_replay(&s, 1, 1, "127.0.0.1", dst).await.is_ok());
         let e = check_replay(&s, 1, 1, "evil.test", dst).await.unwrap_err();
         assert_eq!(code_of(&e), ErrorCode::NetworkBlockedByScope);
         // …but a name that really resolves to the allowed address is bound to
         // it (replay's own lookup), so an IP-only allowlist lets it through.
-        let scope = check_replay(&s, 1, 1, "localhost:9", dst)
-            .await
-            .unwrap()
-            .expect("rules exist");
+        let scope = check_replay(&s, 1, 1, "localhost:9", dst).await.unwrap();
         assert_eq!(scope.resolved_name.as_deref(), Some("localhost"));
         // The per-request re-check (fuzz) keeps refusing a Host that never
         // resolved there.
@@ -609,9 +662,41 @@ mod tests {
         add(&s, ScopeKind::Allow, &["localhost".into()], None)
             .await
             .unwrap();
-        assert!(check_replay(&s, 1, 1, "localhost", dst)
+        assert!(check_replay(&s, 1, 1, "localhost", dst).await.is_ok());
+    }
+
+    /// The scope a fuzz attack is held to follows the store while the attack
+    /// runs. Both halves of the old snapshot behaviour are covered: a session
+    /// with NO rule at start is still checked (it used to get no scope at all,
+    /// which disabled the per-request check for the whole run), and a deny rule
+    /// stored afterwards is picked up by the refresher within its interval
+    /// (it used to apply only to the next attack).
+    #[tokio::test]
+    async fn live_replay_scope_follows_rules_added_after_the_attack_started() {
+        let (_d, s) = store();
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (scope, _refresh) = live_replay_scope(&s, 1, 1, "evil.test", dst).await.unwrap();
+        assert!(
+            scope.check(&["evil.test"]).allowed,
+            "no rule yet, nothing to enforce"
+        );
+
+        add(&s, ScopeKind::Deny, &["evil.test".into()], None)
             .await
-            .unwrap()
-            .is_some());
+            .unwrap();
+        // Polled rather than slept through: the guarantee is the interval, not
+        // a precise instant.
+        let deadline = std::time::Instant::now()
+            + crate::daemon::HOOK_REFRESH_INTERVAL * 5
+            + Duration::from_secs(1);
+        while scope.check(&["evil.test"]).allowed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refresher never picked the new rule up"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // A real rule set, not a kill switch: another host is still allowed.
+        assert!(scope.check(&["ok.test"]).allowed);
     }
 }
