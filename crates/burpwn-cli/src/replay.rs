@@ -152,15 +152,32 @@ pub fn parse_request_headers(raw: &[u8]) -> Vec<(String, String)> {
 }
 
 /// The destination socket address parsed from the flow's `dst_ip:dst_port`.
-fn dst_addr(detail: &FlowDetail) -> Result<SocketAddr> {
-    format!("{}:{}", detail.flow.dst_ip, detail.flow.dst_port)
+/// Shared by `req replay` and `fuzz`.
+///
+/// An UNSPECIFIED address (`0.0.0.0` / `::`) is refused: it is what an
+/// explicit-proxy flow the scope refused before resolving its name is recorded
+/// with, and dialing it reaches the local host (on Linux) instead of the
+/// target. Nothing is re-resolved here: the replay path always dials the
+/// recorded destination, never a fresh lookup of the name.
+pub(crate) fn dst_addr(detail: &FlowDetail) -> Result<SocketAddr> {
+    let addr: SocketAddr = format!("{}:{}", detail.flow.dst_ip, detail.flow.dst_port)
         .parse()
         .with_context(|| {
             format!(
                 "flow {} has an unparseable destination {}:{}",
                 detail.flow.id, detail.flow.dst_ip, detail.flow.dst_port
             )
-        })
+        })?;
+    if addr.ip().is_unspecified() {
+        crate::fail!(
+            ErrorCode::InputNothingToDo,
+            "flow {} has no destination address (recorded {}: it was blocked by the network \
+             scope before its host was resolved); re-issue the request through the proxy instead",
+            detail.flow.id,
+            detail.flow.dst_ip
+        );
+    }
+    Ok(addr)
 }
 
 /// The host used for SNI and `:authority`: the recorded SNI, else the request
@@ -245,6 +262,15 @@ pub async fn replay_flow(
     // spawning namespaces.
     let hooks = store.reader().list_hooks()?;
     apply_hooks(&hooks, &detail, &mut req)?;
+    // The network scope of the flow's workspace, BEFORE anything is dialed: a
+    // target the proxy would refuse is not reachable through the Repeater
+    // either. Checked on the final request (after edits and hooks). A replay
+    // sends exactly one request, so this verdict IS the enforcement — there is
+    // no later request for a rule change to catch, and the returned scope (what
+    // `fuzz` re-checks each rendered request with) has no use here.
+    let addr = dst_addr(&detail)?;
+    let host = replay_host(&detail, &req);
+    crate::scope::check_replay(store, detail.flow.workspace_id, id, &host, addr).await?;
     replay(&detail, &req).await
 }
 
@@ -391,6 +417,7 @@ mod tests {
                 path: Some("/".into()),
                 status: None,
                 intercepted: false,
+                blocked: None,
             },
             exec_id: None,
             client_addr: "127.0.0.1:1".into(),
@@ -427,6 +454,99 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 200\r\n"));
         assert!(s.contains("Content-Type: text/plain\r\n"));
         assert!(s.ends_with("\r\nhi"));
+    }
+
+    /// A replay whose target the network scope refuses fails with the scope
+    /// code and never reaches the origin: the local listener must see zero
+    /// connections.
+    #[tokio::test]
+    async fn a_scope_blocked_replay_sends_nothing() {
+        use burpwn_store::model::{FlowStart, Protocol, ScopeKind};
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let id = w
+            .flow_start(FlowStart {
+                workspace_id: 1,
+                ts_start: 1,
+                exec_id: None,
+                client_addr: "127.0.0.1:1".into(),
+                dst_ip: "127.0.0.1".into(),
+                dst_port: port,
+                sni: None,
+                scheme: "http".into(),
+                protocol: Protocol::H1,
+                intercepted: false,
+                blocked: None,
+            })
+            .await
+            .unwrap();
+        let mut req = base_req();
+        req.authority = "blocked.test".into();
+        w.request(id, req).await.unwrap();
+        crate::scope::add(&store, ScopeKind::Deny, &["blocked.test".into()], None)
+            .await
+            .unwrap();
+
+        let err = replay_flow(&store, id, None, &[], None).await.unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::NetworkBlockedByScope
+        );
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(300), origin.accept()).await;
+        assert!(accepted.is_err(), "the origin must not have been contacted");
+
+        // Without the rule, the same replay does reach it.
+        crate::scope::clear(&store, None, true, None).await.unwrap();
+        let replay = tokio::spawn(async move {
+            let _ = replay_flow(&store, id, None, &[], None).await;
+        });
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), origin.accept()).await;
+        assert!(accepted.is_ok(), "an allowed replay connects");
+        replay.abort();
+    }
+
+    /// An explicit-proxy flow the scope refused before resolving its host is
+    /// recorded with `0.0.0.0`. Once the rule is gone, replaying it must not
+    /// dial `0.0.0.0` (the local host on Linux): it is refused, clearly.
+    #[tokio::test]
+    async fn a_flow_without_a_destination_address_is_not_replayed() {
+        use burpwn_store::model::{FlowStart, Protocol};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("session.db")).unwrap();
+        let w = store.writer();
+        let id = w
+            .flow_start(FlowStart {
+                workspace_id: 1,
+                ts_start: 1,
+                exec_id: None,
+                client_addr: "127.0.0.1:1".into(),
+                dst_ip: "0.0.0.0".into(),
+                dst_port: 80,
+                sni: None,
+                scheme: "http".into(),
+                protocol: Protocol::H1,
+                intercepted: false,
+                blocked: Some("deny rule #1 gone.test".into()),
+            })
+            .await
+            .unwrap();
+        let mut req = base_req();
+        req.authority = "gone.test".into();
+        w.request(id, req).await.unwrap();
+
+        let err = replay_flow(&store, id, None, &[], None).await.unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::InputNothingToDo
+        );
+        assert!(err.to_string().contains("no destination address"), "{err}");
     }
 
     /// Live replay requires network/a listening origin; gate it off by default.

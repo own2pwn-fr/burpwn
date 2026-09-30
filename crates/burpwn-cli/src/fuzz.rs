@@ -155,14 +155,7 @@ pub async fn fuzz_run(
     }
 
     // Transport target: same resolution as `req replay`.
-    let addr: SocketAddr = format!("{}:{}", detail.flow.dst_ip, detail.flow.dst_port)
-        .parse()
-        .with_context(|| {
-            format!(
-                "flow {} has an unparseable destination {}:{}",
-                detail.flow.id, detail.flow.dst_ip, detail.flow.dst_port
-            )
-        })?;
+    let addr: SocketAddr = crate::replay::dst_addr(&detail)?;
     let host = detail
         .flow
         .sni
@@ -171,10 +164,28 @@ pub async fn fuzz_run(
         .or_else(|| detail.flow.authority.clone())
         .unwrap_or_else(|| detail.flow.dst_ip.clone());
 
+    // The network scope of the flow's workspace, checked BEFORE the first
+    // request: a blocked target aborts the attack with nothing sent (and no
+    // attack row). Each rendered request is then re-checked by the sender, both
+    // because a payload can sit in the `Host` header and because the rules can
+    // change while the attack runs — `_scope_refresh` keeps the sender's engine
+    // in sync with the store until it is dropped at the end of this function,
+    // so a `burpwn scope deny` typed mid-run stops the rest of the attack
+    // within one refresh interval instead of at the end of it.
+    let (scope, _scope_refresh) = crate::scope::live_replay_scope(
+        &store,
+        detail.flow.workspace_id,
+        detail.flow.id,
+        &host,
+        addr,
+    )
+    .await?;
+
     let sender = Arc::new(HttpReplaySender {
         scheme: detail.flow.scheme.clone(),
         sni: host,
         addr,
+        scope,
         // The session's declarative hooks apply to every request of the attack
         // (see `HttpReplaySender::hooks`): an Intruder run that carries a token
         // the hooks keep fresh is the whole point of having them.
@@ -472,6 +483,10 @@ mod tests {
     }
 
     async fn seed_flow(paths: &Paths, session: &str) -> i64 {
+        seed_flow_at(paths, session, "127.0.0.1").await
+    }
+
+    async fn seed_flow_at(paths: &Paths, session: &str, dst_ip: &str) -> i64 {
         let store = open_store(paths, session).unwrap();
         let w = store.writer();
         let fid = w
@@ -480,12 +495,13 @@ mod tests {
                 ts_start: 0,
                 exec_id: None,
                 client_addr: "127.0.0.1:1".into(),
-                dst_ip: "127.0.0.1".into(),
+                dst_ip: dst_ip.into(),
                 dst_port: 9,
                 sni: Some("example.com".into()),
                 scheme: "http".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -503,6 +519,38 @@ mod tests {
         .await
         .unwrap();
         fid
+    }
+
+    /// A flow recorded with the unspecified address (an explicit-proxy flow the
+    /// scope refused before resolving it) is refused up front: dialing
+    /// `0.0.0.0` would hit the local host, not the target.
+    #[tokio::test]
+    async fn fuzz_refuses_a_flow_without_a_destination_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let fid = seed_flow_at(&paths, "default", "0.0.0.0").await;
+        let spec = FuzzSpec {
+            flow_id: fid,
+            request_bytes: None,
+            positions: vec![(0, 1)],
+            marker: None,
+            payloads: vec![b"1".to_vec()],
+            mode: AttackMode::Sniper,
+            concurrency: Some(1),
+            delay_ms: None,
+            name: None,
+        };
+        let e = fuzz_run(&paths, "default", spec, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&e).code,
+            burpwn_error::ErrorCode::InputNothingToDo
+        );
+        assert!(e.to_string().contains("no destination address"), "{e}");
+        let listed = fuzz_list(&paths, "default", None).unwrap();
+        assert_eq!(listed["count"], 0, "no attack row");
     }
 
     /// End-to-end persistence wiring WITHOUT the network: cancel immediately so
@@ -568,5 +616,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no injection positions"), "got: {err}");
+    }
+
+    /// A target outside the network scope aborts the attack before the first
+    /// request (the baseline included): the origin sees nothing and no attack
+    /// row is written.
+    #[tokio::test]
+    async fn fuzz_run_aborts_on_a_scope_blocked_target() {
+        use burpwn_store::model::ScopeKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let fid = seed_flow(&paths, "default").await;
+        {
+            let store = open_store(&paths, "default").unwrap();
+            crate::scope::add(&store, ScopeKind::Deny, &["example.com".into()], None)
+                .await
+                .unwrap();
+        }
+        let raw = flow_request_bytes(&base_req());
+        let s = String::from_utf8_lossy(&raw).into_owned();
+        let idx = s.find("id=").unwrap() + 3;
+        let spec = FuzzSpec {
+            flow_id: fid,
+            positions: vec![(idx, idx + 1)],
+            payloads: vec![b"1".to_vec()],
+            mode: AttackMode::Sniper,
+            ..Default::default()
+        };
+        let err = fuzz_run(&paths, "default", spec, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::diag::diagnose(&err).code,
+            ErrorCode::NetworkBlockedByScope
+        );
+        assert_eq!(fuzz_list(&paths, "default", None).unwrap()["count"], 0);
     }
 }

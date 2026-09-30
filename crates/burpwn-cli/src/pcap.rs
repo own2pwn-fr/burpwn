@@ -976,7 +976,7 @@ fn end_options(buf: &mut Vec<u8>) {
 }
 
 fn pad4(buf: &mut Vec<u8>) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }
@@ -1226,6 +1226,7 @@ mod tests {
                 scheme: "http".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -1275,6 +1276,7 @@ mod tests {
                 scheme: "http".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -1323,6 +1325,7 @@ mod tests {
                     scheme: String::new(),
                     protocol: proto,
                     intercepted: false,
+                    blocked: None,
                 })
                 .await
                 .unwrap();
@@ -1341,6 +1344,7 @@ mod tests {
             scheme: "http".into(),
             protocol: Protocol::H1,
             intercepted: false,
+            blocked: None,
         })
         .await
         .unwrap();
@@ -1473,6 +1477,7 @@ mod tests {
                 scheme: "http".into(),
                 protocol: Protocol::Ws,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -1574,6 +1579,7 @@ mod tests {
                 scheme: "https".into(),
                 protocol: Protocol::H2,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -1659,6 +1665,7 @@ mod tests {
                     scheme: "http".into(),
                     protocol: Protocol::Ws,
                     intercepted: false,
+                    blocked: None,
                 })
                 .await
                 .unwrap();
@@ -1710,6 +1717,7 @@ mod tests {
                 scheme: "https".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();

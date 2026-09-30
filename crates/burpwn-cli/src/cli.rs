@@ -2,7 +2,7 @@
 //! [`crate::commands`]. A global `--json` flag selects the machine envelope
 //! output; `--session` overrides the active session for the relevant commands.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// burpwn — transparent intercepting proxy + sandbox + agent interface.
 #[derive(Debug, Parser)]
@@ -92,6 +92,24 @@ pub enum Command {
         /// Hook subcommand.
         #[command(subcommand)]
         action: HookAction,
+    },
+
+    /// Network scope: which destinations sandboxed traffic may reach.
+    ///
+    /// An allowlist (`scope allow`) and a denylist (`scope deny`) of hosts,
+    /// `*.host` subtrees, IPs and CIDRs, global or per workspace. The proxy
+    /// enforces them BEFORE any upstream contact (not even a DNS query or a SYN
+    /// for a refused destination), and `req replay` / `fuzz` are held to them
+    /// too. Deny always wins; once any allow rule applies to a workspace, only
+    /// allowed destinations pass. Blocked flows are still recorded
+    /// (`req list --blocked`).
+    ///
+    /// Unrelated to `intercept scope`, which only picks the flows the
+    /// interceptor parks and never blocks anything.
+    Scope {
+        /// Scope subcommand.
+        #[command(subcommand)]
+        action: ScopeAction,
     },
 
     /// Workspace management.
@@ -546,6 +564,91 @@ pub enum ReqAction {
     Replay(ReqReplayArgs),
 }
 
+/// `scope` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ScopeAction {
+    /// Allow destinations. Once any allow rule applies to a workspace (global
+    /// or its own), traffic of that workspace may only reach allowed
+    /// destinations.
+    Allow(ScopeAddArgs),
+    /// Deny destinations. A deny rule always wins over allow rules.
+    Deny(ScopeAddArgs),
+    /// List rules: every rule (global and per workspace), or with `--workspace`
+    /// the EFFECTIVE set of that workspace (the global rules plus its own).
+    List {
+        /// Show the effective rules of this workspace (by NAME).
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Remove rules by id.
+    Rm {
+        /// Rule ids (see `burpwn scope list`).
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<i64>,
+    },
+    /// Remove rules in bulk: the GLOBAL rules by default, one workspace's own
+    /// rules with `--workspace`, or every rule with `--all`.
+    Clear {
+        /// Clear this workspace's own rules (not the global ones it inherits).
+        #[arg(long, conflicts_with = "all")]
+        workspace: Option<String>,
+        /// Clear every rule, global and per workspace.
+        #[arg(long)]
+        all: bool,
+        /// Only rules of this kind.
+        #[arg(long, value_enum)]
+        kind: Option<ScopeKindArg>,
+    },
+    /// Evaluate a target against the scope and print the verdict and the
+    /// deciding rule. Pure evaluation: nothing is resolved or sent.
+    ///
+    /// TARGET is `host`, `host:port`, `ip`, `ip:port` or `[v6]:port`. A host is
+    /// evaluated as a connection burpwn resolved that name for (IP/CIDR rules
+    /// cannot justify it, since nothing is resolved; test the address for
+    /// those), and also gets the verdict of a DNS query for it. Without a port,
+    /// only rules without a port constraint apply.
+    Test {
+        /// `host`, `host:port`, `ip`, `ip:port` or `[v6]:port`.
+        target: String,
+        /// Evaluate for this workspace (by NAME); default: the `default` workspace.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+}
+
+/// `scope allow` / `scope deny` arguments.
+#[derive(Debug, Args)]
+pub struct ScopeAddArgs {
+    /// Destination patterns: `toto.fr` (exactly that host), `*.toto.fr` (the
+    /// host and every subdomain), `10.0.0.5`, `2001:db8::1`, `10.0.0.0/8`,
+    /// each with an optional port (`toto.fr:8443`, `[2001:db8::1]:443`).
+    /// Case-insensitive; a bare `*` is refused (use `scope clear`).
+    #[arg(required = true, value_name = "PATTERN")]
+    pub patterns: Vec<String>,
+    /// Apply to this workspace only (by NAME; created if missing). Omit for a
+    /// global rule, applying to every workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+}
+
+/// A scope rule kind, as a flag value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScopeKindArg {
+    /// Allow rules.
+    Allow,
+    /// Deny rules.
+    Deny,
+}
+
+impl From<ScopeKindArg> for burpwn_store::model::ScopeKind {
+    fn from(k: ScopeKindArg) -> Self {
+        match k {
+            ScopeKindArg::Allow => burpwn_store::model::ScopeKind::Allow,
+            ScopeKindArg::Deny => burpwn_store::model::ScopeKind::Deny,
+        }
+    }
+}
+
 /// `req list` filters.
 #[derive(Debug, Args, Default)]
 pub struct ReqListArgs {
@@ -570,6 +673,9 @@ pub struct ReqListArgs {
     /// Restrict to the flows in a group, by NAME (see `burpwn group list`).
     #[arg(long)]
     pub group: Option<String>,
+    /// Only the flows the network scope blocked (see `burpwn scope`).
+    #[arg(long)]
+    pub blocked: bool,
     /// Max rows.
     #[arg(long)]
     pub limit: Option<i64>,
@@ -630,8 +736,13 @@ pub enum InterceptAction {
     },
     /// Narrow blocking interception to a host/path (so not every flow parks), or
     /// clear the scope with `--clear`.
+    ///
+    /// This is the INTERCEPT scope: it never blocks traffic. The network
+    /// allow/deny list that does is `burpwn scope`.
     Scope {
-        /// Host substring the flow must contain to be intercepted. Omit with
+        /// Host substring the flow must contain to be intercepted (this only
+        /// selects what gets parked; to restrict where traffic may GO, see
+        /// `burpwn scope`). Omit with
         /// `--clear` to widen back to every flow.
         #[arg(required_unless_present = "clear")]
         pattern: Option<String>,
@@ -837,8 +948,9 @@ pub enum WorkspaceAction {
     },
     /// List workspaces.
     List,
-    /// (informational) Print the workspace to attribute flows to. Pass `--workspace`
-    /// on `exec`/`req` to actually scope; this records the choice in config.
+    /// (informational) Resolve a workspace name to its id and print it. Nothing
+    /// is persisted: pass `--workspace` explicitly on `exec`/`req`/`scope` to
+    /// use it (network scope rules added without `--workspace` are global).
     Use {
         /// Workspace name.
         name: String,

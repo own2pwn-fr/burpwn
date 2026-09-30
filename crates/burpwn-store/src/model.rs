@@ -94,6 +94,11 @@ pub struct FlowStart {
     /// the operator drops never reaches `flow_start` (the handler answers 403
     /// and returns), so a dropped intercept leaves no row at all.
     pub intercepted: bool,
+    /// Why the network scope refused this flow (`None` = not blocked). Unlike a
+    /// hook drop, a scope-blocked flow IS recorded, with the reason here, and
+    /// nothing was sent upstream for it (schema v9).
+    #[serde(default)]
+    pub blocked: Option<String>,
 }
 
 /// Request payload for a flow. Headers are an order-preserving raw byte blob.
@@ -163,6 +168,9 @@ pub struct FlowRow {
     pub status: Option<u16>,
     /// Whether the flow was intercepted.
     pub intercepted: bool,
+    /// Why the network scope refused this flow (`None` = not blocked).
+    #[serde(default)]
+    pub blocked: Option<String>,
 }
 
 /// A fully-joined flow with decoded request + response.
@@ -766,6 +774,78 @@ pub struct NewHook {
     pub ttl_ms: i64,
 }
 
+/// Whether a network-scope rule admits or refuses what it matches (schema v9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeKind {
+    /// Allowlist entry: once any allow rule applies, only matching destinations pass.
+    Allow,
+    /// Denylist entry: matching destinations are always refused (deny wins).
+    Deny,
+}
+
+impl ScopeKind {
+    /// String stored in the DB (`allow` / `deny`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeKind::Allow => "allow",
+            ScopeKind::Deny => "deny",
+        }
+    }
+
+    /// Parse the DB / user spelling; `None` for anything else.
+    pub fn parse(s: &str) -> Option<ScopeKind> {
+        match s {
+            "allow" => Some(ScopeKind::Allow),
+            "deny" => Some(ScopeKind::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// A network-scope rule: an allow/deny destination pattern, global when
+/// `workspace_id` is `None`, else applying to that workspace only (schema v9).
+///
+/// `pattern` is stored validated and normalized (see `burpwn_proxy::scope`),
+/// so two spellings of one destination are one row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRule {
+    /// Rule id.
+    pub id: i64,
+    /// Owning workspace, or `None` for a global rule.
+    pub workspace_id: Option<i64>,
+    /// Name of the owning workspace (`None` for a global rule).
+    pub workspace: Option<String>,
+    /// Allow or deny.
+    pub kind: ScopeKind,
+    /// Normalized destination pattern (`host`, `*.host`, IP, CIDR, optional `:port`).
+    pub pattern: String,
+    /// Creation timestamp (unix millis).
+    pub created_at: i64,
+}
+
+/// Parameters to create a [`ScopeRule`] (id is generated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewScopeRule {
+    /// Owning workspace, or `None` for a global rule.
+    pub workspace_id: Option<i64>,
+    /// Allow or deny.
+    pub kind: ScopeKind,
+    /// Normalized pattern (the caller validated it).
+    pub pattern: String,
+}
+
+/// Which rules a scope clear removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeClearTarget {
+    /// Only the global rules (`workspace_id IS NULL`).
+    Global,
+    /// Only this workspace's own rules (not the global ones it inherits).
+    Workspace(i64),
+    /// Every rule, global and per workspace.
+    All,
+}
+
 // An intercept is a SYNCHRONOUS, in-flight decision: the proxy handler parks on
 // a oneshot inside `burpwn_proxy::InterceptController` and unblocks the moment an
 // operator forwards, edits or drops. Nothing outlives the flow, so there is no
@@ -799,6 +879,9 @@ pub struct FlowFilter {
     pub min_resp_len: Option<i64>,
     /// Maximum response body size in bytes (inclusive).
     pub max_resp_len: Option<i64>,
+    /// Only the flows the network scope blocked (`flows.blocked IS NOT NULL`).
+    #[serde(default)]
+    pub blocked_only: bool,
     /// Substring match over the decoded request + response header bytes.
     ///
     /// Matched at the SQL layer against uncompressed header blobs (headers are

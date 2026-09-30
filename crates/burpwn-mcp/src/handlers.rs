@@ -150,6 +150,7 @@ pub fn req_list(
         port: params.port,
         limit: params.limit,
         offset: params.offset,
+        blocked_only: params.blocked,
         ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
@@ -354,6 +355,67 @@ fn resolve_group(
             "no such group: {name}"
         )),
     }
+}
+
+// --- network scope ----------------------------------------------------------
+//
+// Thin wrappers over `burpwn_cli::scope`, the code `burpwn scope` runs, so an
+// agent gets the same validation, the same idempotence and the same JSON.
+
+/// `scope_allow` / `scope_deny` — add rules of `kind`.
+pub async fn scope_add(
+    paths: &Paths,
+    session: &str,
+    kind: burpwn_store::model::ScopeKind,
+    params: &crate::params::ScopeAddParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    burpwn_cli::scope::add(&store, kind, &params.patterns, params.workspace.as_deref()).await
+}
+
+/// `scope_list` — every rule, or one workspace's effective set.
+pub fn scope_list(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::ScopeListParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    burpwn_cli::scope::list(&store, params.workspace.as_deref())
+}
+
+/// `scope_rm` — delete rules by id.
+pub async fn scope_rm(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::ScopeRmParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    burpwn_cli::scope::rm(&store, &params.ids).await
+}
+
+/// `scope_clear` — delete rules in bulk.
+pub async fn scope_clear(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::ScopeClearParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    let kind = params
+        .kind
+        .as_deref()
+        .map(burpwn_cli::scope::parse_kind)
+        .transpose()?;
+    burpwn_cli::scope::clear(&store, params.workspace.as_deref(), params.all, kind).await
+}
+
+/// `scope_test` — pure evaluation of a target.
+pub fn scope_test(
+    paths: &Paths,
+    session: &str,
+    params: &crate::params::ScopeTestParams,
+) -> Result<Value> {
+    let store = open_store(paths, session)?;
+    burpwn_cli::scope::test(&store, &params.target, params.workspace.as_deref())
 }
 
 // --- hooks ------------------------------------------------------------------
@@ -1275,6 +1337,7 @@ mod tests {
                 scheme: "https".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -1327,6 +1390,7 @@ mod tests {
                     scheme: "https".into(),
                     protocol: Protocol::H1,
                     intercepted: false,
+                    blocked: None,
                 })
                 .await
                 .unwrap();
@@ -1764,6 +1828,97 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no burpwn proxy daemon"));
+    }
+
+    #[tokio::test]
+    async fn scope_tools_round_trip() {
+        use burpwn_store::model::ScopeKind;
+        let (_dir, paths, s) = temp_session().await;
+
+        let added = scope_add(
+            &paths,
+            &s,
+            ScopeKind::Allow,
+            &crate::params::ScopeAddParams {
+                patterns: vec!["*.Toto.fr".into(), "10.0.0.0/8".into()],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(added["rules"][0]["pattern"], "*.toto.fr");
+        scope_add(
+            &paths,
+            &s,
+            ScopeKind::Deny,
+            &crate::params::ScopeAddParams {
+                patterns: vec!["admin.toto.fr".into()],
+                workspace: Some("w".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let bad = scope_add(
+            &paths,
+            &s,
+            ScopeKind::Deny,
+            &crate::params::ScopeAddParams {
+                patterns: vec!["*".into()],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            burpwn_cli::diag::diagnose(&bad).code,
+            ErrorCode::InputBadScopePattern
+        );
+
+        let all = scope_list(&paths, &s, &Default::default()).unwrap();
+        assert_eq!(all["rules"].as_array().unwrap().len(), 3);
+
+        let t = scope_test(
+            &paths,
+            &s,
+            &crate::params::ScopeTestParams {
+                target: "admin.toto.fr:443".into(),
+                workspace: Some("w".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(t["verdict"], "blocked");
+        let t = scope_test(
+            &paths,
+            &s,
+            &crate::params::ScopeTestParams {
+                target: "admin.toto.fr:443".into(),
+                workspace: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(t["verdict"], "allowed");
+
+        let e = scope_rm(&paths, &s, &crate::params::ScopeRmParams { ids: vec![42] })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            burpwn_cli::diag::diagnose(&e).code,
+            ErrorCode::InputNoSuchScopeRule
+        );
+        let c = scope_clear(
+            &paths,
+            &s,
+            &crate::params::ScopeClearParams {
+                all: true,
+                kind: Some("deny".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(c["removed"], 1);
+        let c = scope_clear(&paths, &s, &Default::default()).await.unwrap();
+        assert_eq!(c["removed"], 2);
     }
 
     #[tokio::test]

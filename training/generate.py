@@ -449,6 +449,16 @@ MCP_TOOL_NAMES = {
     "hook_test",
     # 0.3.x: portable session bundle.
     "session_export",
+    # 0.4.x: the network scope (allowlist / denylist of destinations). A SAFETY
+    # surface — it restricts where sandboxed traffic may go, enforced by the
+    # proxy before any upstream contact. Six tools, verified by `tools/list`
+    # (42 -> 48). Not the same thing as `intercept_scope`, which only parks flows.
+    "scope_allow",
+    "scope_deny",
+    "scope_list",
+    "scope_rm",
+    "scope_clear",
+    "scope_test",
 }
 
 # Known CLI tokens (subcommands + flags) for the lenient command linter. Kept in
@@ -474,6 +484,11 @@ KNOWN_CLI_SUBCOMMANDS = {
     # `debug bundle/list/show`. `test` is `hook test`, `rm-flow` is
     # `group rm-flow`, `bundle` is `debug bundle`, `import` is `session import`.
     "group", "hook", "test", "rm-flow", "debug", "bundle", "import",
+    # 0.4.x: `scope` (network allow/deny list) actions. `scope`, `list`, `rm`,
+    # `test` already appear above (top-level `scope` is `intercept scope`'s
+    # sibling; `list`/`rm`/`test` are shared action verbs). `allow`, `deny` and
+    # `clear` are new.
+    "allow", "deny", "clear",
 }
 KNOWN_CLI_FLAGS = {
     "--json", "-g", "--global", "--agent", "--name", "--workspace",
@@ -496,6 +511,10 @@ KNOWN_CLI_FLAGS = {
     # 0.4.0: the WebSocket / DNS hook phases.
     "--find", "--replace",                # hook add --action replace-payload
     "--answer",                           # hook add --action set-answer
+    # 0.4.x: the network scope surface. `--workspace` and `--all` already appear
+    # above; `--kind` (scope clear, allow|deny) and `--blocked` (req list, only
+    # the flows the scope refused) are new.
+    "--kind", "--blocked",
 }
 
 # Tools the engine commonly drives via `exec` (the sandboxed pentest tooling).
@@ -7641,6 +7660,827 @@ def fam_integration_setup() -> list[dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# 0.4.x SAFETY surface: the network scope (allowlist / denylist).
+# --------------------------------------------------------------------------- #
+
+
+def _scope_rule(rid: int, kind: str, pattern: str, scope: str = "global",
+                workspace_id: int | None = None, *, created: bool | None = None,
+                created_at: int | None = None) -> dict[str, Any]:
+    """One scope-rule object. `scope allow|deny` (and `scope_allow`/`scope_deny`)
+    emit `created` (bool); `scope list` (and `scope_list`) emit `created_at`."""
+    row: dict[str, Any] = {
+        "id": rid, "kind": kind, "pattern": pattern,
+        "scope": scope, "workspace_id": workspace_id,
+    }
+    if created is not None:
+        row["created"] = created
+    if created_at is not None:
+        row["created_at"] = created_at
+    return row
+
+
+def _scope_verdict(target: str, *, workspace: str = "default", kind: str = "host",
+                   port: int | None = None, allowed: bool, reason: str,
+                   rule: dict[str, Any] | None = None,
+                   dns: dict[str, Any] | None = None,
+                   note: str | None = None) -> dict[str, Any]:
+    """A `scope test` / `scope_test` result object (see reference.md `## scope`)."""
+    return {
+        "target": target, "workspace": workspace, "kind": kind, "port": port,
+        "verdict": "allowed" if allowed else "blocked", "allowed": allowed,
+        "reason": reason, "rule": rule, "dns": dns, "note": note,
+    }
+
+
+def _dns_verdict(allowed: bool, reason: str,
+                 rule: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"verdict": "allowed" if allowed else "blocked",
+            "allowed": allowed, "reason": reason, "rule": rule}
+
+
+def _rule_ref(rid: int, kind: str, pattern: str, scope: str = "global") -> dict[str, Any]:
+    return {"id": rid, "kind": kind, "pattern": pattern, "scope": scope}
+
+
+def _blocked_flow_row(fid: int, host: str, dst_ip: str, reason: str, *,
+                      method: str = "GET", path: str = "/", port: int = 443,
+                      scheme: str = "https", protocol: str = "h2",
+                      status: int | None = 403) -> dict[str, Any]:
+    """A `req list --blocked` row: a recorded flow the scope refused. The synthetic
+    403 for cleartext/MITM HTTP; `status` is null for a TLS/raw/DNS block."""
+    return {
+        "authority": host, "dst_ip": dst_ip, "dst_port": port, "id": fid,
+        "intercepted": False, "method": method, "path": path,
+        "protocol": protocol, "scheme": scheme,
+        "sni": host if scheme == "https" else None, "status": status,
+        "ts_end": 1786662000726, "ts_start": 1786662000697, "workspace_id": 1,
+        "blocked": reason,
+    }
+
+
+def fam_scope_cli() -> list[dict[str, Any]]:
+    """CLI prose for the network scope — the SAFETY rail that fences sandboxed
+    egress to the authorized targets. Set the allowlist before `exec`, deny what
+    must never be touched, read `scope test`, and — the load-bearing lesson —
+    read a `blocked` flow / `BW-NETWORK-003` as *burpwn refusing*, not a target
+    defence: adjust the scope or stop, never keep hammering."""
+    out: list[dict[str, Any]] = []
+
+    # --- 1. Pin the sandbox to the authorized target BEFORE running anything. -
+    out.append(
+        cli_example(
+            tags=["scope", "allow", "allowlist", "safety", "exec", "authz"],
+            turns=[
+                (
+                    "user",
+                    "My engagement only authorizes staging.example.com and its "
+                    "subdomains. Make sure nothing I run in the sandbox can reach "
+                    "anything else, then curl the site.",
+                ),
+                (
+                    "assistant",
+                    "Set an allow rule first — the moment one allow rule applies, the "
+                    "scope becomes an allowlist and every other destination is refused "
+                    "by the proxy before a single packet leaves — no SYN, and no lookup of a "
+                    "name a host rule refuses. "
+                    "`req replay` and `fuzz` are held to it too.\n\n```\n"
+                    "burpwn --json scope allow '*.staging.example.com' staging.example.com\n"
+                    "```\n\n```json\n"
+                    + _ok({"rules": [
+                        _scope_rule(1, "allow", "*.staging.example.com", created=True),
+                        _scope_rule(2, "allow", "staging.example.com", created=True),
+                    ]})
+                    + "\n```\n\nBoth rules are `global` (no `--workspace`), so they apply "
+                    "to every workspace. `*.staging.example.com` is a strict label-suffix "
+                    "match — it covers the apex and any subdomain, never "
+                    "`notstaging.example.com` and never `staging.example.com.evil.com`. "
+                    "Now run the request through the sandbox:\n\n```\n"
+                    "burpwn exec -- curl -s https://staging.example.com/\n```\n\nAnything "
+                    "the page then tries to pull from a third-party host is blocked and "
+                    "recorded — check with `burpwn req list --blocked`. To scope the rule "
+                    "to one workspace instead of globally, add `--workspace <name>`.",
+                ),
+            ],
+        )
+    )
+
+    # --- 2. Deny what must never be touched (deny always wins). ---------------
+    out.append(
+        cli_example(
+            tags=["scope", "deny", "denylist", "safety", "metadata", "authz"],
+            turns=[
+                (
+                    "user",
+                    "Even with the staging allowlist, I want belt-and-braces: never let "
+                    "the sandbox hit the cloud metadata IP or the production payments "
+                    "provider.",
+                ),
+                (
+                    "assistant",
+                    "Add deny rules. A deny rule always wins over any allow rule, so "
+                    "these hold even if something later widens the allowlist:\n\n```\n"
+                    "burpwn --json scope deny 169.254.169.254 '*.payments.example'\n```\n\n"
+                    "```json\n"
+                    + _ok({"rules": [
+                        _scope_rule(3, "deny", "169.254.169.254", created=True),
+                        _scope_rule(4, "deny", "*.payments.example", created=True),
+                    ]})
+                    + "\n```\n\n`169.254.169.254` is the link-local metadata address — a "
+                    "classic SSRF pivot — and `*.payments.example` fences off the payment "
+                    "provider and all its subdomains. Both are `global`. Denying by name "
+                    "stops the connection whenever the flow declares that name (`Host` / "
+                    "SNI) or resolves to it in this workspace; to be airtight against an "
+                    "SSRF that dials the raw address, deny the IP/CIDR as well — which is "
+                    "already the case for the metadata IP here.",
+                ),
+            ],
+        )
+    )
+
+    # --- 3. Read `scope test` before touching anything. ----------------------
+    out.append(
+        cli_example(
+            tags=["scope", "test", "verdict", "safety", "dry-run"],
+            turns=[
+                (
+                    "user",
+                    "Before I point a scanner at api.staging.example.com, is it in "
+                    "scope? And double-check that api.production.example is not.",
+                ),
+                (
+                    "assistant",
+                    "`scope test` evaluates a target against the rules without resolving "
+                    "or sending anything:\n\n```\n"
+                    "burpwn --json scope test api.staging.example.com\n```\n\n```json\n"
+                    + _ok(_scope_verdict(
+                        "api.staging.example.com", allowed=True,
+                        reason="allowed by allow rule *.staging.example.com",
+                        rule=_rule_ref(1, "allow", "*.staging.example.com"),
+                        dns=_dns_verdict(True, "allowed by allow rule *.staging.example.com",
+                                         _rule_ref(1, "allow", "*.staging.example.com"))))
+                    + "\n```\n\nAllowed, by the wildcard rule — and the `dns` block says a "
+                    "DNS query for it would be answered too. Now the production host:\n\n"
+                    "```\nburpwn --json scope test api.production.example\n```\n\n```json\n"
+                    + _ok(_scope_verdict(
+                        "api.production.example", allowed=False,
+                        reason="not in allowlist: api.production.example",
+                        rule=None,
+                        dns=_dns_verdict(False, "not in allowlist: api.production.example")))
+                    + "\n```\n\nBlocked: with an allowlist in force, anything not matched "
+                    "is refused (`rule` is null because nothing matched — it is the "
+                    "allowlist itself refusing). The scanner would get nothing on the "
+                    "wire for that host. Good to go on the staging target.",
+                ),
+            ],
+        )
+    )
+
+    # --- 4. Fix an invalid pattern (BW-INPUT-015). ---------------------------
+    out.append(
+        cli_example(
+            tags=["scope", "allow", "BW-INPUT-015", "negative", "pattern", "safety"],
+            turns=[
+                (
+                    "user",
+                    "This won't take: `burpwn scope allow *.target.example:` — I want "
+                    "everything under target.example.",
+                ),
+                (
+                    "assistant",
+                    "The trailing colon is the problem — an empty port. Every pattern is "
+                    "validated before anything is stored, and one bad pattern stores "
+                    "none of them:\n\n```json\n"
+                    + _err("BW-INPUT-015",
+                           "invalid scope pattern: empty port in \"*.target.example:\"")
+                    + "\n```\n\nDrop the colon (no `:port` means any port):\n\n```\n"
+                    "burpwn --json scope allow '*.target.example'\n```\n\n```json\n"
+                    + _ok({"rules": [
+                        _scope_rule(5, "allow", "*.target.example", created=True)]})
+                    + "\n```\n\nQuote the pattern so the shell does not glob the `*`. If "
+                    "you did mean a specific port, give a real one — `*.target.example:443`. "
+                    "And a bare `*` is refused on purpose (that is not 'allow everything' "
+                    "— to lift an allowlist, remove the allow rules with `scope clear`).",
+                ),
+            ],
+        )
+    )
+
+    # --- 5. THE lesson: a blocked flow is burpwn, not the target. ------------
+    out.append(
+        cli_example(
+            tags=["scope", "blocked", "BW-NETWORK-003", "req", "list", "safety",
+                  "interpretation"],
+            turns=[
+                (
+                    "user",
+                    "My scan is getting a wall of 403s with body `burpwn: blocked by "
+                    "scope (not in allowlist: cdn.thirdparty.example)`. Is the target "
+                    "WAF onto me? Should I rotate my user-agent?",
+                ),
+                (
+                    "assistant",
+                    "No — that 403 is burpwn, not the target. A body starting `burpwn: "
+                    "blocked by scope` and a `burpwn-error: BW-NETWORK-003` header mean "
+                    "the destination is outside your network scope, so the proxy refused "
+                    "it before anything left. Rotating a user-agent changes nothing; the "
+                    "packet never reaches the target. List what got refused:\n\n```\n"
+                    "burpwn --json req list --blocked\n```\n\n```json\n"
+                    + _ok([
+                        _blocked_flow_row(701, "cdn.thirdparty.example", "198.51.100.9",
+                                          "not in allowlist: cdn.thirdparty.example",
+                                          path="/lib/app.js"),
+                        _blocked_flow_row(702, "cdn.thirdparty.example", "198.51.100.9",
+                                          "not in allowlist: cdn.thirdparty.example",
+                                          path="/css/main.css"),
+                    ])
+                    + "\n```\n\nThese are third-party CDN assets the app pulls in — not "
+                    "your target. Two ways forward, both deliberate:\n\n* if that host is "
+                    "**in your authorization**, allow it: `burpwn scope allow "
+                    "cdn.thirdparty.example`\n* if it is **not**, this is the scope doing "
+                    "its job — leave it blocked and point the scan back at the in-scope "
+                    "host.\n\nConfirm the verdict for any host with `burpwn scope test "
+                    "<host>` before deciding. The rule of thumb: `burpwn: blocked by "
+                    "scope`, an `access_denied` TLS alert or a DNS `REFUSED` is your own "
+                    "guardrail — read `scope list` / `scope test`, do not treat it as a "
+                    "target defence to evade.",
+                ),
+            ],
+        )
+    )
+
+    # --- 6. Remove one rule; a wrong id removes nothing (BW-INPUT-014). ------
+    out.append(
+        cli_example(
+            tags=["scope", "list", "rm", "BW-INPUT-014", "negative", "safety"],
+            turns=[
+                (
+                    "user",
+                    "I added a temporary allow rule for a redirect host and want it gone. "
+                    "Show the rules and drop it.",
+                ),
+                (
+                    "assistant",
+                    "List first to get the id:\n\n```\nburpwn --json scope list\n```\n\n"
+                    "```json\n"
+                    + _ok({"workspace": None, "rules": [
+                        _scope_rule(1, "allow", "*.staging.example.com",
+                                    created_at=1786661000000),
+                        _scope_rule(2, "allow", "staging.example.com",
+                                    created_at=1786661000100),
+                        _scope_rule(6, "allow", "redirect.other.example",
+                                    created_at=1786662500000),
+                    ]})
+                    + "\n```\n\nThe redirect host is rule 6. Remove it:\n\n```\n"
+                    "burpwn --json scope rm 6\n```\n\n```json\n"
+                    + _ok({"removed": [6]})
+                    + "\n```\n\nGone. One caveat that trips people up: `scope rm` checks "
+                    "every id first, so a typo removes **nothing** rather than doing a "
+                    "partial job — `burpwn scope rm 6 99` when 99 does not exist fails "
+                    "with `[BW-INPUT-014] no such scope rule: 99` and rule 6 stays. Fix "
+                    "the id and re-run.",
+                ),
+            ],
+        )
+    )
+
+    # --- 7. Clear rules in bulk. ---------------------------------------------
+    out.append(
+        cli_example(
+            tags=["scope", "clear", "kind", "safety", "teardown"],
+            turns=[
+                (
+                    "user",
+                    "Engagement's over. Wipe all the scope rules. And earlier — how "
+                    "would I have lifted just the allowlist without touching my deny "
+                    "rules?",
+                ),
+                (
+                    "assistant",
+                    "To wipe everything, global and per-workspace:\n\n```\n"
+                    "burpwn --json scope clear --all\n```\n\n```json\n"
+                    + _ok({"removed": 6, "target": "all", "workspace": None,
+                           "kind": None})
+                    + "\n```\n\nFor the narrower question: clearing every **allow** rule "
+                    "lifts the allowlist (with no allow rule in force, everything is "
+                    "allowed except what a deny rule blocks), while leaving your deny "
+                    "rules intact:\n\n```\n"
+                    "burpwn --json scope clear --all --kind allow\n```\n\n```json\n"
+                    + _ok({"removed": 3, "target": "all", "workspace": None,
+                           "kind": "allow"})
+                    + "\n```\n\nDefault (no flag) clears only the GLOBAL rules; "
+                    "`--workspace <name>` clears one workspace's own rules (not the "
+                    "global ones it inherits); `--all` spans both. `--kind allow|deny` "
+                    "narrows any of those to one kind.",
+                ),
+            ],
+        )
+    )
+    return out
+
+
+def fam_scope_mcp() -> list[dict[str, Any]]:
+    """The scope SAFETY surface over MCP: `scope_allow`, `scope_deny`,
+    `scope_list`, `scope_rm`, `scope_clear`, `scope_test`, and `req_list`'s
+    `blocked` filter. Results are returned directly (NOT `{ok,data,error}`
+    wrapped). The recurring lesson: pin the allowlist before `exec`, and read a
+    `blocked` flow as out-of-scope — adjust the scope or stop."""
+    out: list[dict[str, Any]] = []
+
+    # --- 1. Scope-then-exec, verified with scope_test (multi-turn). ----------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "scope_allow", "scope_test", "exec", "allowlist",
+                  "safety", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "I'm only cleared to test *.target.example. Lock the sandbox "
+                            "to it before we do anything.",
+                    "steps": [{
+                        "preamble": "One allow rule turns the scope into an allowlist; "
+                                    "everything else is refused before any packet leaves.",
+                        "tool": "scope_allow",
+                        "args": {"patterns": ["*.target.example", "target.example"]},
+                        "result": {"rules": [
+                            _scope_rule(1, "allow", "*.target.example", created=True),
+                            _scope_rule(2, "allow", "target.example", created=True),
+                        ]},
+                        "interp": "Locked. Both rules are `global` (no workspace), and "
+                                  "`*.target.example` matches the apex plus any subdomain "
+                                  "by strict label suffix. From now on the sandbox, "
+                                  "`req_replay` and `fuzz` can only reach target.example "
+                                  "and its subdomains; anything else gets no SYN, its "
+                                  "name is not even looked up, and it is recorded as blocked.",
+                    }],
+                },
+                {
+                    "user": "Confirm app.target.example is in scope, then hit it.",
+                    "steps": [
+                        {
+                            "preamble": "Dry-run the verdict first — nothing is sent.",
+                            "tool": "scope_test",
+                            "args": {"target": "app.target.example"},
+                            "result": _scope_verdict(
+                                "app.target.example", allowed=True,
+                                reason="allowed by allow rule *.target.example",
+                                rule=_rule_ref(1, "allow", "*.target.example"),
+                                dns=_dns_verdict(
+                                    True, "allowed by allow rule *.target.example",
+                                    _rule_ref(1, "allow", "*.target.example"))),
+                            "interp": "Allowed by the wildcard, and a DNS query for it "
+                                      "would resolve. Safe to touch.",
+                        },
+                        {
+                            "preamble": "Run it through the sandbox.",
+                            "tool": "exec",
+                            "args": {"argv": ["curl", "-s", "-o", "/dev/null",
+                                              "https://app.target.example/"]},
+                            "result": {"exit_code": 0,
+                                       "captured_request_ids": [10, 11],
+                                       "exec_id": "exec-1-0-1786662100000000000"},
+                            "interp": "Captured (DNS + the HTTPS GET). It stayed inside "
+                                      "the allowlist, so nothing was refused.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 2. Deny production + metadata (single). ------------------------------
+    out.append(
+        mcp_example(
+            tags=["mcp", "scope_deny", "denylist", "metadata", "safety"],
+            user="Fence off the things the sandbox must never reach: the cloud metadata "
+                 "IP and anything under prod.example.",
+            steps=[{
+                "preamble": "Deny rules win over any allow rule, so these are absolute.",
+                "tool": "scope_deny",
+                "args": {"patterns": ["169.254.169.254", "*.prod.example"]},
+                "result": {"rules": [
+                    _scope_rule(3, "deny", "169.254.169.254", created=True),
+                    _scope_rule(4, "deny", "*.prod.example", created=True),
+                ]},
+                "final": "Done — rules 3 and 4, both `global`. Deny always wins, so even "
+                         "if an allow rule later covers one of these, the connection is "
+                         "still refused. `169.254.169.254` is the link-local metadata "
+                         "address (an SSRF pivot); denying the IP itself — not just a "
+                         "name — is what stops a request that dials the raw address.",
+            }],
+        )
+    )
+
+    # --- 3. A blocked flow → out of scope: read it, then decide (multi-turn). -
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "req_list", "blocked", "scope_test", "scope_allow",
+                  "BW-NETWORK-003", "safety", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "The app under test threw some 403s during the crawl. Did I "
+                            "get blocked by their WAF?",
+                    "steps": [{
+                        "preamble": "Check whether those were OUR scope refusing, not "
+                                    "the target.",
+                        "tool": "req_list",
+                        "args": {"blocked": True},
+                        "result": [
+                            _blocked_flow_row(
+                                55, "analytics.vendor.example", "203.0.113.7",
+                                "not in allowlist: analytics.vendor.example",
+                                path="/collect"),
+                            _blocked_flow_row(
+                                56, "app.target.example", "203.0.113.20",
+                                "not in allowlist: app.target.example",
+                                path="/api/orders"),
+                        ],
+                        "interp": "These 403s are burpwn, not the target: each carries a "
+                                  "`blocked` reason and a `BW-NETWORK-003` header, meaning "
+                                  "the network scope refused them before anything left. "
+                                  "Flow 55 is a third-party analytics beacon — correctly "
+                                  "blocked. But flow 56 is `app.target.example`, which "
+                                  "should be in scope — that one is a scope gap, not a "
+                                  "finding.",
+                    }],
+                },
+                {
+                    "user": "Right, app.target.example is authorized. Why was it blocked?",
+                    "steps": [
+                        {
+                            "preamble": "Ask the scope for its verdict on that host.",
+                            "tool": "scope_test",
+                            "args": {"target": "app.target.example"},
+                            "result": _scope_verdict(
+                                "app.target.example", allowed=False,
+                                reason="not in allowlist: app.target.example",
+                                rule=None,
+                                dns=_dns_verdict(
+                                    False, "not in allowlist: app.target.example")),
+                            "interp": "Blocked because an allowlist is in force and no "
+                                      "allow rule matches this host (`rule` is null — the "
+                                      "allowlist itself is refusing). The fix is to add "
+                                      "it, not to work around the 403.",
+                        },
+                        {
+                            "preamble": "Bring the authorized host into the allowlist.",
+                            "tool": "scope_allow",
+                            "args": {"patterns": ["app.target.example"]},
+                            "result": {"rules": [
+                                _scope_rule(7, "allow", "app.target.example",
+                                            created=True)]},
+                            "interp": "Added. The daemon picks up scope changes within a "
+                                      "couple of seconds, so re-run the crawl — flow 56's "
+                                      "host will now go through, while the analytics "
+                                      "beacon (flow 55) stays blocked.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 4. List, per-workspace effective set (single). ----------------------
+    out.append(
+        mcp_example(
+            tags=["mcp", "scope_list", "workspace", "effective", "safety"],
+            user="Show me the effective scope for the 'acme' workspace — everything "
+                 "traffic in it is held to.",
+            steps=[{
+                "preamble": "With a workspace, scope_list returns its EFFECTIVE set: the "
+                            "global rules plus that workspace's own.",
+                "tool": "scope_list",
+                "args": {"workspace": "acme"},
+                "result": {"workspace": "acme", "rules": [
+                    _scope_rule(3, "deny", "169.254.169.254",
+                                created_at=1786661500000),
+                    _scope_rule(1, "allow", "*.target.example",
+                                created_at=1786661000000),
+                    _scope_rule(8, "allow", "acme-internal.target.example", "acme", 2,
+                                created_at=1786662700000),
+                ]},
+                "final": "Traffic in `acme` is held to three rules: the global metadata "
+                         "deny and the global `*.target.example` allow, plus its own "
+                         "allow for `acme-internal.target.example` (its `scope` is "
+                         "`acme`, the others are `global`). Because an allow rule is in "
+                         "force, that workspace is on an allowlist — only those hosts "
+                         "pass, and the deny wins over everything.",
+            }],
+        )
+    )
+
+    # --- 5. Remove rules; a wrong id removes nothing (BW-INPUT-014). ---------
+    out.append(
+        mcp_conversation(
+            tags=["mcp", "scope_list", "scope_rm", "BW-INPUT-014", "negative",
+                  "safety", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Drop the temporary allow rule I added for the staging "
+                            "mirror. I think it was id 9.",
+                    "steps": [{
+                        "preamble": "An unknown id removes nothing, so verify with a list "
+                                    "first.",
+                        "tool": "scope_rm",
+                        "args": {"ids": [9]},
+                        "result": {"error": "[BW-INPUT-014] no such scope rule: 9"},
+                        "interp": "There is no rule 9 — `scope_rm` checks every id first "
+                                  "and removes nothing if any is unknown (`BW-INPUT-014`), "
+                                  "so nothing changed. Let me list to find the real id.",
+                    }],
+                },
+                {
+                    "user": "Yes, find it.",
+                    "steps": [
+                        {
+                            "preamble": "List every rule.",
+                            "tool": "scope_list",
+                            "args": {},
+                            "result": {"workspace": None, "rules": [
+                                _scope_rule(1, "allow", "*.target.example",
+                                            created_at=1786661000000),
+                                _scope_rule(10, "allow", "mirror.staging.example",
+                                            created_at=1786662900000),
+                            ]},
+                            "interp": "The staging mirror is rule 10, not 9.",
+                        },
+                        {
+                            "preamble": "Remove the right one.",
+                            "tool": "scope_rm",
+                            "args": {"ids": [10]},
+                            "result": {"removed": [10]},
+                            "interp": "Removed. The allowlist is back to just "
+                                      "`*.target.example`.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 6. Clear in bulk, by kind (single). ---------------------------------
+    out.append(
+        mcp_example(
+            tags=["mcp", "scope_clear", "kind", "safety", "teardown"],
+            user="Lift the allowlist for this session but keep my deny rules in place.",
+            steps=[{
+                "preamble": "Clearing every allow rule lifts the allowlist; scoping the "
+                            "clear to kind 'allow' leaves the deny rules untouched.",
+                "tool": "scope_clear",
+                "args": {"all": True, "kind": "allow"},
+                "result": {"removed": 2, "target": "all", "workspace": None,
+                           "kind": "allow"},
+                "final": "Removed 2 allow rules across every scope. With no allow rule in "
+                         "force the scope is no longer an allowlist — everything is "
+                         "allowed except what a deny rule still blocks (your denies are "
+                         "intact). Omit `kind` to clear both kinds; omit `all` (and give "
+                         "no workspace) to clear only the GLOBAL rules.",
+            }],
+        )
+    )
+
+    # --- 7. Test a bare IP target (single). ----------------------------------
+    out.append(
+        mcp_example(
+            tags=["mcp", "scope_test", "ip", "safety"],
+            user="Is 169.254.169.254 reachable from the sandbox?",
+            steps=[{
+                "preamble": "Test the address directly — an IP target declares no name.",
+                "tool": "scope_test",
+                "args": {"target": "169.254.169.254"},
+                "result": _scope_verdict(
+                    "169.254.169.254", kind="ip", allowed=False,
+                    reason="denied by deny rule 169.254.169.254",
+                    rule=_rule_ref(3, "deny", "169.254.169.254"), dns=None),
+                "final": "No — blocked by the deny rule on that exact address (`kind` is "
+                         "`ip`, and there is no `dns` block because an IP target is not a "
+                         "name to resolve). Deny wins unconditionally, so nothing in the "
+                         "sandbox can dial the metadata endpoint.",
+            }],
+        )
+    )
+    return out
+
+
+def fam_scope_shell() -> list[dict[str, Any]]:
+    """The scope SAFETY surface driven from a shell with real `Bash` tool calls
+    — the surface Claude Code's PreToolUse hook rewrites. Same lessons: pin the
+    allowlist before `exec`, read `--blocked` and `BW-NETWORK-003` as burpwn's
+    own guardrail."""
+    out: list[dict[str, Any]] = []
+
+    # --- 1. Allow, test, then exec. ------------------------------------------
+    out.append(
+        shell_example(
+            tags=["shell", "scope", "allow", "test", "exec", "allowlist", "safety",
+                  "multi-turn"],
+            exchanges=[
+                {
+                    "user": "Set up a session that can only reach staging.example.com "
+                            "and its subdomains, then confirm the lock.",
+                    "steps": [
+                        {
+                            "preamble": "Allow the apex and subtree — one allow rule "
+                                        "makes it an allowlist.",
+                            "command": "burpwn --json scope allow staging.example.com "
+                                       "'*.staging.example.com'",
+                            "result": _ok({"rules": [
+                                _scope_rule(1, "allow", "staging.example.com",
+                                            created=True),
+                                _scope_rule(2, "allow", "*.staging.example.com",
+                                            created=True),
+                            ]}),
+                            "interp": "Two global allow rules. The scope is now an "
+                                      "allowlist: only staging.example.com and its "
+                                      "subdomains are reachable; everything else is "
+                                      "refused before any packet leaves.",
+                        },
+                        {
+                            "preamble": "Prove a well-known third party is now out.",
+                            "command": "burpwn --json scope test example.org",
+                            "result": _ok(_scope_verdict(
+                                "example.org", allowed=False,
+                                reason="not in allowlist: example.org", rule=None,
+                                dns=_dns_verdict(
+                                    False, "not in allowlist: example.org"))),
+                            "interp": "Blocked, as expected — nothing outside the "
+                                      "allowlist gets through. The lock holds.",
+                        },
+                    ],
+                },
+                {
+                    "user": "Good. Fetch the staging home page.",
+                    "steps": [{
+                        "preamble": "In-scope, so this goes through and is captured.",
+                        "command": "burpwn exec -- curl -s -o /dev/null -w '%{http_code}' "
+                                   "https://staging.example.com/",
+                        "result": "200",
+                        "interp": "200 — the request stayed inside the allowlist and was "
+                                  "captured. Use `burpwn req list` to see it, or `burpwn "
+                                  "req list --blocked` to see anything the page tried to "
+                                  "pull from an out-of-scope host.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # --- 2. Read a blocked flow and confirm with scope test. -----------------
+    out.append(
+        shell_example(
+            tags=["shell", "scope", "blocked", "test", "BW-NETWORK-003", "req",
+                  "safety", "multi-turn"],
+            exchanges=[
+                {
+                    "user": "curl inside the sandbox just returned a 403 with body "
+                            "'burpwn: blocked by scope (not in allowlist: "
+                            "api.other.example)'. What's going on?",
+                    "steps": [{
+                        "preamble": "That 403 is burpwn's, not the target's. List the "
+                                    "refused flows.",
+                        "command": "burpwn --json req list --blocked",
+                        "result": _ok([
+                            _blocked_flow_row(
+                                88, "api.other.example", "198.51.100.42",
+                                "not in allowlist: api.other.example",
+                                method="POST", path="/v1/track"),
+                        ]),
+                        "interp": "One blocked flow: a POST to api.other.example, refused "
+                                  "by the allowlist (the `blocked` reason and the "
+                                  "`BW-NETWORK-003` header are burpwn's). The request "
+                                  "never left the proxy, so this is not a target WAF — it "
+                                  "is your own scope.",
+                    }],
+                },
+                {
+                    "user": "Is api.other.example something I'm allowed to test?",
+                    "steps": [{
+                        "preamble": "Only you can answer authorization; the scope shows "
+                                    "the current verdict.",
+                        "command": "burpwn --json scope test api.other.example",
+                        "result": _ok(_scope_verdict(
+                            "api.other.example", allowed=False,
+                            reason="not in allowlist: api.other.example", rule=None,
+                            dns=_dns_verdict(
+                                False, "not in allowlist: api.other.example"))),
+                        "interp": "Currently blocked. If that host IS in your engagement "
+                                  "scope, allow it with `burpwn scope allow "
+                                  "api.other.example` and re-run. If it is NOT, this is "
+                                  "the guardrail working — leave it blocked and keep the "
+                                  "scan on the authorized host. Do not try to evade a "
+                                  "burpwn 403; it means the packet never reached the "
+                                  "target.",
+                    }],
+                },
+            ],
+        )
+    )
+
+    # --- 3. Deny then list. --------------------------------------------------
+    out.append(
+        shell_example(
+            tags=["shell", "scope", "deny", "list", "denylist", "safety"],
+            exchanges=[
+                {
+                    "user": "Block the production API host, then show me every rule.",
+                    "steps": [
+                        {
+                            "preamble": "Deny the prod host and its subdomains.",
+                            "command": "burpwn --json scope deny '*.api.production.example'",
+                            "result": _ok({"rules": [
+                                _scope_rule(5, "deny", "*.api.production.example",
+                                            created=True)]}),
+                            "interp": "Rule 5, global. Deny wins over any allow rule, so "
+                                      "production is fenced off regardless of the "
+                                      "allowlist.",
+                        },
+                        {
+                            "preamble": "List every rule (global and per workspace).",
+                            "command": "burpwn --json scope list",
+                            "result": _ok({"workspace": None, "rules": [
+                                _scope_rule(1, "allow", "*.staging.example.com",
+                                            created_at=1786661000000),
+                                _scope_rule(5, "deny", "*.api.production.example",
+                                            created_at=1786663000000),
+                            ]}),
+                            "interp": "Two rules: the staging allowlist and the new "
+                                      "production deny. `scope` is `global` on both. With "
+                                      "`--workspace <name>` this would show that "
+                                      "workspace's effective set (global + its own) "
+                                      "instead.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 4. Fix a bad stored pattern by removing it (BW-INPUT-015 at start). -
+    out.append(
+        shell_example(
+            tags=["shell", "scope", "rm", "BW-INPUT-015", "negative", "daemon",
+                  "safety"],
+            exchanges=[
+                {
+                    "user": "The daemon won't start: it says a stored scope rule doesn't "
+                            "parse. How do I recover?",
+                    "steps": [
+                        {
+                            "preamble": "List the rules to find the malformed one.",
+                            "command": "burpwn --json scope list",
+                            "result": _ok({"workspace": None, "rules": [
+                                _scope_rule(1, "allow", "*.staging.example.com",
+                                            created_at=1786661000000),
+                                _scope_rule(4, "allow", "10.0.0.0/8:",
+                                            created_at=1786662000000),
+                            ]}),
+                            "interp": "Rule 4 is the culprit — `10.0.0.0/8:` has an empty "
+                                      "port, which no longer parses (`BW-INPUT-015`). A "
+                                      "daemon refuses to START while a stored rule is "
+                                      "invalid, so it has to go.",
+                        },
+                        {
+                            "preamble": "Remove the broken rule by id.",
+                            "command": "burpwn --json scope rm 4",
+                            "result": _ok({"removed": [4]}),
+                            "interp": "Removed. Re-add it correctly if you need it "
+                                      "(`burpwn scope allow 10.0.0.0/8` for any port, or "
+                                      "`10.0.0.0/8:22` for a real one), then start the "
+                                      "daemon — it will come up now the scope parses.",
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    # --- 5. Clear the global rules at teardown. ------------------------------
+    out.append(
+        shell_example(
+            tags=["shell", "scope", "clear", "all", "safety", "teardown"],
+            exchanges=[
+                {
+                    "user": "Tear down all scope rules everywhere before I archive this "
+                            "session.",
+                    "steps": [{
+                        "preamble": "--all spans global and per-workspace rules.",
+                        "command": "burpwn --json scope clear --all",
+                        "result": _ok({"removed": 4, "target": "all", "workspace": None,
+                                       "kind": None}),
+                        "interp": "Cleared all 4 rules, global and per-workspace. The "
+                                  "session no longer constrains egress at all — so only "
+                                  "do this at teardown, never mid-engagement. Bare `scope "
+                                  "clear` (no flag) would have cleared just the global "
+                                  "rules; `--workspace <name>` just that workspace's own; "
+                                  "`--kind allow|deny` narrows any of them.",
+                    }],
+                },
+            ],
+        )
+    )
+    return out
+
+
 # Assembly, dedup, split.
 # --------------------------------------------------------------------------- #
 
@@ -7695,6 +8535,10 @@ FAMILIES = [
     # 0.4.0 surface: the WebSocket / DNS hook phases.
     fam_hooks_ws_dns,
     fam_mcp_groups_hooks,
+    # 0.4.x SAFETY surface: the network scope (allow / deny list).
+    fam_scope_cli,
+    fam_scope_mcp,
+    fam_scope_shell,
     # 0.2.0 integration surface: skill install / mcp register.
     fam_skill_install,
     fam_mcp_register,

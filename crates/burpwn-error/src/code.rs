@@ -202,6 +202,11 @@ pub enum ErrorCode {
     InputFileExists,
     /// The referenced hook id does not exist.
     InputNoSuchHook,
+    /// The referenced network-scope rule id does not exist.
+    InputNoSuchScopeRule,
+    /// A network-scope pattern (`scope allow` / `scope deny`) or target
+    /// (`scope test`) is not a host, `*.host`, IP or CIDR with an optional port.
+    InputBadScopePattern,
 
     // --- agent integration (exit 76) ---------------------------------------
     /// The named agent / framework / MCP host is not one burpwn knows.
@@ -218,6 +223,9 @@ pub enum ErrorCode {
     // the login macro became a hook: an `exec` hook whose command fails or whose
     // regex does not match FAILS OPEN with a WARN — the traffic goes through
     // un-hooked — so there is no longer a failure to give an exit code to.)
+    /// The destination is outside the session's network scope (`burpwn scope`):
+    /// nothing was sent to it.
+    NetworkBlockedByScope,
 
     // --- internal (exit 78) ------------------------------------------------
     /// A failure burpwn did not classify — always a bug worth reporting.
@@ -255,9 +263,11 @@ impl ErrorCode {
             | InputBadRegex
             | InputNoSuchIntercept
             | InputFileExists
-            | InputNoSuchHook => ErrorClass::Input,
+            | InputNoSuchHook
+            | InputNoSuchScopeRule
+            | InputBadScopePattern => ErrorClass::Input,
             AgentUnknown | AgentConfigShape | AgentRefusedOverwrite => ErrorClass::Agent,
-            NetworkReplayFailed => ErrorClass::Network,
+            NetworkReplayFailed | NetworkBlockedByScope => ErrorClass::Network,
             Internal => ErrorClass::Internal,
         }
     }
@@ -313,12 +323,16 @@ impl ErrorCode {
             InputNoSuchIntercept => 11,
             InputFileExists => 12,
             InputNoSuchHook => 13,
+            InputNoSuchScopeRule => 14,
+            InputBadScopePattern => 15,
 
             AgentUnknown => 1,
             AgentConfigShape => 2,
             AgentRefusedOverwrite => 3,
 
             NetworkReplayFailed => 1,
+            // 2 is retired (the old login-macro failure); never reuse it.
+            NetworkBlockedByScope => 3,
 
             Internal => 1,
         }
@@ -385,12 +399,15 @@ impl ErrorCode {
             InputNoSuchIntercept => "no such parked intercept",
             InputFileExists => "the output file already exists",
             InputNoSuchHook => "no such hook",
+            InputNoSuchScopeRule => "no such scope rule",
+            InputBadScopePattern => "invalid scope pattern",
 
             AgentUnknown => "unknown agent / framework / MCP host",
             AgentConfigShape => "the agent config file is not a shape burpwn can edit",
             AgentRefusedOverwrite => "refusing to overwrite a file burpwn does not own",
 
             NetworkReplayFailed => "the replay request failed",
+            NetworkBlockedByScope => "the destination is outside the network scope",
 
             Internal => "unexpected internal error",
         }
@@ -533,6 +550,12 @@ impl ErrorCode {
                 "pass `--force` to overwrite it deliberately, or choose another `-o <file>`",
             ],
             InputNoSuchHook => vec!["list them with `burpwn hook list`"],
+            InputNoSuchScopeRule => vec!["list them with `burpwn scope list`"],
+            InputBadScopePattern => vec![
+                "accepted: `host`, `*.host` (apex + every subdomain), an IP, a CIDR, each with \
+                 an optional `:port` (`[v6]:port` for IPv6)",
+                "a bare `*` is refused: remove the allowlist with `burpwn scope clear` instead",
+            ],
 
             AgentUnknown => vec!["the supported names are listed in the message above"],
             AgentConfigShape => vec![
@@ -545,6 +568,11 @@ impl ErrorCode {
             NetworkReplayFailed => vec![
                 "the target may be down, or the flow's host may no longer resolve — check with \
                  `burpwn req show <id>`",
+            ],
+            NetworkBlockedByScope => vec![
+                "see which rule decides with `burpwn scope test <host[:port]> --workspace <name>`",
+                "widen the scope with `burpwn scope allow <pattern>` or drop the deny rule with \
+                 `burpwn scope rm <id>` if the target really is in scope",
             ],
 
             Internal => vec![
@@ -597,10 +625,13 @@ impl ErrorCode {
         ErrorCode::InputNoSuchIntercept,
         ErrorCode::InputFileExists,
         ErrorCode::InputNoSuchHook,
+        ErrorCode::InputNoSuchScopeRule,
+        ErrorCode::InputBadScopePattern,
         ErrorCode::AgentUnknown,
         ErrorCode::AgentConfigShape,
         ErrorCode::AgentRefusedOverwrite,
         ErrorCode::NetworkReplayFailed,
+        ErrorCode::NetworkBlockedByScope,
         ErrorCode::Internal,
     ];
 
@@ -635,7 +666,7 @@ mod tests {
             let back: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(*code, back);
         }
-        assert_eq!(ErrorCode::ALL.len(), 47, "register new codes in ALL");
+        assert_eq!(ErrorCode::ALL.len(), 50, "register new codes in ALL");
     }
 
     #[test]

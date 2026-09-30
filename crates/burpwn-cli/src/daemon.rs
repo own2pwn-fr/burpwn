@@ -495,6 +495,27 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
     let cfg = ProxyConfig::new(paths.ca_dir());
     let proxy = Arc::new(Proxy::new(cfg, store.writer(), store.reader())?);
 
+    // Network scope: loaded HERE, synchronously, before any front-end accepts a
+    // connection — a window where the rules are not yet in force would be a
+    // window where out-of-scope traffic flows. A rule set that cannot be read
+    // or parsed refuses to start the daemon rather than enforce nothing.
+    let scope = proxy.scope();
+    let scope_rows = store
+        .reader()
+        .list_scope_rules()
+        .context("reading the network scope rules")?;
+    let rule_set = burpwn_proxy::RuleSet::from_store(&scope_rows).map_err(|e| {
+        crate::coded!(
+            ErrorCode::InputBadScopePattern,
+            "the session's network scope cannot be loaded ({e}); fix it with `burpwn scope rm <id>`"
+        )
+    })?;
+    scope.set_rules(rule_set);
+    tracing::info!(rules = scope_rows.len(), "network scope loaded");
+    let scope_reader = store.reader();
+    let scope_task =
+        tokio::spawn(async move { scope_refresher(scope, scope_reader, scope_rows).await });
+
     // Bind the DNS UDP socket on an ephemeral port first, so we can publish the
     // chosen port before serving.
     let dns_sock = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -549,6 +570,7 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
     scm.abort();
     dns.abort();
     hooks_task.abort();
+    scope_task.abort();
     let _ = std::fs::remove_file(paths.proxy_sock(session));
     let _ = std::fs::remove_file(&control_sock);
     result
@@ -559,7 +581,7 @@ pub async fn run_daemon(paths: &Paths, session: &str) -> Result<()> {
 /// two seconds is imperceptible to an operator (and to an agent that just called
 /// `hook_add` and is about to send a request) while costing one small indexed
 /// SELECT per interval — off the request path entirely.
-const HOOK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const HOOK_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Keep the proxy's hook engine in sync with the store.
 ///
@@ -584,6 +606,40 @@ async fn hook_refresher(engine: burpwn_proxy::HookEngine, reader: burpwn_store::
             ),
         }
         tokio::time::sleep(HOOK_REFRESH_INTERVAL).await;
+    }
+}
+
+/// Keep a scope engine in sync with the store (same cadence and same failure
+/// policy as [`hook_refresher`]: a table that cannot be read, or a rule that no
+/// longer parses, keeps the previous rule set and logs a WARN — never a partial
+/// set, never an empty one). `last` is what the caller already loaded into the
+/// engine. Runs for the daemon's lifetime on the proxy's engine, and for one
+/// attack's lifetime on the engine `crate::scope::live_replay_scope` builds.
+pub(crate) async fn scope_refresher(
+    engine: burpwn_proxy::ScopeEngine,
+    reader: burpwn_store::Reader,
+    mut last: Vec<burpwn_store::model::ScopeRule>,
+) {
+    loop {
+        tokio::time::sleep(HOOK_REFRESH_INTERVAL).await;
+        match reader.list_scope_rules() {
+            Ok(rows) if rows == last => {}
+            Ok(rows) => match burpwn_proxy::RuleSet::from_store(&rows) {
+                Ok(set) => {
+                    tracing::info!(rules = rows.len(), "network scope reloaded");
+                    engine.set_rules(set);
+                    last = rows;
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "a network scope rule does not parse; keeping the previous scope"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read the network scope rules; keeping the previous scope"
+            ),
+        }
     }
 }
 

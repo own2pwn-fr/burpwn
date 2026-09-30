@@ -6,6 +6,7 @@
       "--all",
       "--answer",
       "--as",
+      "--blocked",
       "--check",
       "--clear",
       "--cmd",
@@ -26,6 +27,7 @@
       "--inject-if-absent",
       "--inject-param",
       "--json",
+      "--kind",
       "--limit",
       "--list",
       "--login",
@@ -73,13 +75,16 @@
     "provenance": "binary:target/debug/burpwn (0.4.0)",
     "subcommands": [
       "add",
+      "allow",
       "auth",
       "await",
       "bundle",
       "ca",
+      "clear",
       "compare",
       "debug",
       "decode",
+      "deny",
       "disable",
       "doctor",
       "drop",
@@ -246,6 +251,7 @@
         "protocol",
         "port",
         "workspace",
+        "blocked",
         "limit",
         "offset"
       ],
@@ -261,6 +267,25 @@
       "req_show": [
         "id",
         "raw"
+      ],
+      "scope_add": [
+        "patterns",
+        "workspace"
+      ],
+      "scope_clear": [
+        "workspace",
+        "all",
+        "kind"
+      ],
+      "scope_list": [
+        "workspace"
+      ],
+      "scope_rm": [
+        "ids"
+      ],
+      "scope_test": [
+        "target",
+        "workspace"
       ],
       "session_auth_refresh": [
         "host"
@@ -303,6 +328,12 @@
       "match_replace_add",
       "tag_add",
       "note_add",
+      "scope_allow",
+      "scope_deny",
+      "scope_list",
+      "scope_rm",
+      "scope_clear",
+      "scope_test",
       "hook_add",
       "hook_list",
       "hook_set_enabled",

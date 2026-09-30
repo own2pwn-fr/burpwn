@@ -44,6 +44,7 @@ use crate::decode::decode_body;
 use crate::hooks::{HookEngine, MatchCtx};
 use crate::intercept::{InterceptController, InterceptData, InterceptDecision, InterceptKind};
 use crate::matchreplace::{apply_request, apply_response, host_in_scope, Message};
+use crate::scope::{Identity, ScopeEngine};
 use crate::util::now_millis;
 use crate::ws;
 
@@ -127,6 +128,16 @@ pub struct HttpContext {
     pub rules: Arc<Vec<burpwn_store::model::MatchReplaceRule>>,
     /// The hook engine, shared with the daemon (not a per-connection snapshot).
     pub hooks: HookEngine,
+    /// The network scope, shared with the daemon (refreshed in place). Every
+    /// request is checked against it BEFORE the upstream is dialed.
+    pub scope: ScopeEngine,
+    /// The name burpwn itself resolved to obtain `dst_ip` (explicit proxy), a
+    /// scope identity that can justify the destination.
+    pub resolved_name: Option<String>,
+    /// A scope refusal the front-end already decided (the explicit proxy
+    /// checks a name before resolving it): every request is answered blocked,
+    /// nothing is forwarded — `upstream` is not a real address then.
+    pub preblocked: Option<String>,
     /// Default workspace id.
     pub workspace_id: i64,
     /// Optional exec correlation id.
@@ -199,6 +210,130 @@ pub async fn handle_explicit(req: Request<Incoming>, ctx: HttpContext) -> Respon
 /// Header carrying the upstream failure cause on the synthetic 502, for clients
 /// that discard the body (`curl -o /dev/null`) and for agents parsing responses.
 const ERROR_HEADER: &str = "burpwn-error";
+
+/// The scope's reason to refuse a request declaring `names` (authority / Host
+/// values, ports allowed) on this connection, or `None` when it may go.
+fn scope_block_reason(ctx: &HttpContext, names: &[Option<String>]) -> Option<String> {
+    if let Some(reason) = &ctx.preblocked {
+        return Some(reason.clone());
+    }
+    if !ctx.scope.is_active() {
+        return None;
+    }
+    let mut declared: Vec<Identity> = Vec::new();
+    let all = ctx
+        .sni
+        .iter()
+        .map(String::as_str)
+        .chain(names.iter().flatten().map(String::as_str));
+    for raw in all {
+        if let Some(id) = Identity::from_authority(raw) {
+            if !declared.contains(&id) {
+                declared.push(id);
+            }
+        }
+    }
+    let Ok(dst_ip) = ctx.dst_ip.parse::<std::net::IpAddr>() else {
+        return Some(format!("unparseable destination {}", ctx.dst_ip));
+    };
+    ctx.scope
+        .check_conn(
+            ctx.workspace_id,
+            Some(dst_ip),
+            ctx.dst_port,
+            &declared,
+            ctx.resolved_name.as_deref(),
+        )
+        .blocked_reason()
+        .map(str::to_string)
+}
+
+/// The request a scope refusal is recorded with.
+struct ScopeBlocked<'a> {
+    method: &'a str,
+    host: &'a str,
+    path: &'a str,
+    version: Version,
+    is_ws: bool,
+    headers: &'a [u8],
+    body: &'a [u8],
+}
+
+/// Record a scope-refused request (flow with `blocked`, the request, a
+/// synthetic 403) and build that 403. Nothing was sent upstream.
+async fn blocked_by_scope(
+    ctx: &HttpContext,
+    req: ScopeBlocked<'_>,
+    reason: String,
+) -> Response<ProxyBody> {
+    tracing::info!(host = %req.host, path = %req.path, %reason, "request blocked by scope");
+    let body = crate::scope::blocked_body(&reason);
+    let code = burpwn_error::ErrorCode::NetworkBlockedByScope.id();
+    let error_header = header_safe(&format!("{code} {}", body.trim_end()));
+    let now = now_millis();
+    let recorded = ctx
+        .writer
+        .flow_start(FlowStart {
+            workspace_id: ctx.workspace_id,
+            ts_start: now,
+            exec_id: ctx.exec_id.clone(),
+            client_addr: ctx.client_addr.clone(),
+            dst_ip: ctx.dst_ip.clone(),
+            dst_port: ctx.dst_port,
+            sni: ctx.sni.clone(),
+            scheme: ctx.scheme.clone(),
+            protocol: if req.is_ws {
+                Protocol::Ws
+            } else {
+                version_to_protocol(req.version)
+            },
+            intercepted: false,
+            blocked: Some(reason),
+        })
+        .await;
+    match recorded {
+        Ok(flow_id) => {
+            let _ = ctx
+                .writer
+                .request(
+                    flow_id,
+                    RequestData {
+                        method: req.method.to_string(),
+                        authority: req.host.to_string(),
+                        path: req.path.to_string(),
+                        http_version: version_str(req.version).into(),
+                        headers: req.headers.to_vec(),
+                        body: cap_for_store(req.body),
+                    },
+                )
+                .await;
+            let _ = ctx
+                .writer
+                .response(
+                    flow_id,
+                    ResponseData {
+                        status: StatusCode::FORBIDDEN.as_u16(),
+                        http_version: version_str(req.version).into(),
+                        headers: format!(
+                            "content-type: text/plain\r\n{ERROR_HEADER}: {error_header}\r\n"
+                        )
+                        .into_bytes(),
+                        body: body.clone().into_bytes(),
+                        timing_ms: Some(0),
+                    },
+                )
+                .await;
+            let _ = ctx.writer.flow_end(flow_id, now).await;
+        }
+        Err(e) => tracing::warn!(error = %e, "could not record a scope-blocked request"),
+    }
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(CONTENT_TYPE, "text/plain")
+        .header(ERROR_HEADER, error_header)
+        .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
 
 /// The per-request handler shared by H1 and H2.
 async fn handle(req: Request<Incoming>, ctx: HttpContext) -> Response<ProxyBody> {
@@ -302,6 +437,32 @@ async fn handle_inner(
         }
     };
 
+    // --- network scope ---
+    // Before match/replace, hooks (an `exec` hook would spawn a command for a
+    // request that is never sent) and the intercept, and — above all — before
+    // `forward_streaming`, which is where the upstream socket is first opened
+    // (it is dialed per request, never eagerly per connection).
+    let early_names = [
+        parts.uri.authority().map(|a| a.as_str().to_string()),
+        header_str(&parts.headers, HOST),
+    ];
+    if let Some(reason) = scope_block_reason(&ctx, &early_names) {
+        return Ok(blocked_by_scope(
+            &ctx,
+            ScopeBlocked {
+                method: &method,
+                host: &host,
+                path: &path,
+                version,
+                is_ws,
+                headers: &raw_req_headers,
+                body: &req_body,
+            },
+            reason,
+        )
+        .await);
+    }
+
     // --- request-side match/replace ---
     let mut msg = Message {
         host: host.clone(),
@@ -318,7 +479,7 @@ async fn handle_inner(
     // is configured: one relaxed atomic load inside `pre_request`.
     let hook_out = ctx
         .hooks
-        .pre_request(ctx.exec_id.as_deref(), &method, &mut msg)
+        .pre_request(ctx.exec_id.as_deref(), ctx.workspace_id, &method, &mut msg)
         .await;
     if hook_out.dropped {
         tracing::info!(host = %msg.host, path = %msg.url, "request dropped by hook");
@@ -363,6 +524,33 @@ async fn handle_inner(
         }
     }
 
+    // --- network scope, again, on what will actually leave ---
+    // Match/replace, a hook or an operator edit may have changed the authority
+    // the upstream sees (`build_upstream_request` sends `msg.host`).
+    let final_names = [
+        Some(msg.host.clone()),
+        msg.url
+            .parse::<http::Uri>()
+            .ok()
+            .and_then(|u| u.authority().map(|a| a.as_str().to_string())),
+    ];
+    if let Some(reason) = scope_block_reason(&ctx, &final_names) {
+        return Ok(blocked_by_scope(
+            &ctx,
+            ScopeBlocked {
+                method: &method,
+                host: &msg.host,
+                path: &msg.url,
+                version,
+                is_ws,
+                headers: &msg.headers,
+                body: &msg.body,
+            },
+            reason,
+        )
+        .await);
+    }
+
     // --- record the flow + request ---
     let flow_id = ctx
         .writer
@@ -381,6 +569,7 @@ async fn handle_inner(
                 version_to_protocol(version)
             },
             intercepted,
+            blocked: None,
         })
         .await?;
     // gRPC request bodies are length-prefixed frames; deframe the STORED copy so
@@ -436,6 +625,7 @@ async fn handle_inner(
     // buffering fork — so it covers both response paths.
     ctx.hooks.observe_status(
         ctx.exec_id.as_deref(),
+        ctx.workspace_id,
         // The REQUEST's context (the one the pre-request phase matched on), so a
         // narrowly-scoped hook is only invalidated by a refusal of the requests
         // it actually injects into.
@@ -526,6 +716,7 @@ async fn handle_inner(
         .hooks
         .post_response(
             ctx.exec_id.as_deref(),
+            ctx.workspace_id,
             &method,
             resp_parts.status.as_u16(),
             &mut resp_msg,

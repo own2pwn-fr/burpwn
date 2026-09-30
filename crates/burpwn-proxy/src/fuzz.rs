@@ -462,6 +462,45 @@ fn anomaly_score(base: &BaselineStats, status: u16, resp_len: usize, latency_ms:
     (0.5 * status_dev + 0.35 * len_dev + 0.15 * time_dev).clamp(0.0, 1.0)
 }
 
+/// The network scope an attack is held to, as a LIVE view instead of a
+/// snapshot: `engine` is the shared [`crate::scope::ScopeEngine`] the caller
+/// keeps in sync with the session store while the attack runs, so a rule added
+/// after the attack started still applies to the requests it has not sent yet.
+/// The destination is fixed — the sender dials one address, settled by the
+/// caller's up-front check.
+///
+/// This is the same arrangement the proxy uses for connections (one engine
+/// refreshed in place, never a per-connection copy), and for the same reason:
+/// an attack outlives the moment its rules were read.
+#[derive(Clone)]
+pub struct LiveReplayScope {
+    /// The rules, read fresh on every check.
+    pub engine: crate::scope::ScopeEngine,
+    /// Workspace of the base flow.
+    pub workspace_id: i64,
+    /// The address the sender connects to.
+    pub dst_ip: std::net::IpAddr,
+    /// The port it connects to.
+    pub dst_port: u16,
+    /// The name the caller verified resolves to `dst_ip`, when it verified one.
+    pub resolved_name: Option<String>,
+}
+
+impl LiveReplayScope {
+    /// Evaluate a request declaring `names` (SNI, `Host`; ports allowed)
+    /// against the rules as they stand NOW.
+    pub fn check(&self, names: &[&str]) -> crate::scope::Verdict {
+        crate::scope::ReplayScope {
+            rules: self.engine.snapshot(),
+            workspace_id: self.workspace_id,
+            dst_ip: self.dst_ip,
+            dst_port: self.dst_port,
+            resolved_name: self.resolved_name.clone(),
+        }
+        .check(names)
+    }
+}
+
 /// A [`RequestSender`] that parses a raw HTTP/1-style request and sends it via
 /// the proxy's own [`crate::replay_once`] upstream path (real TLS/h1/h2).
 pub struct HttpReplaySender {
@@ -476,6 +515,14 @@ pub struct HttpReplaySender {
     /// stale `Authorization` is exactly what makes an Intruder run useless, and
     /// this path never went through the proxy's own hook point.
     pub hooks: std::sync::Arc<Vec<burpwn_store::model::Hook>>,
+    /// The network scope every rendered request is checked against BEFORE it
+    /// is sent — unconditionally, even for a session that had no rule when the
+    /// attack started, since it may have one before the attack ends. The check
+    /// is per request both because a payload placed in the `Host` header
+    /// changes what the request declares, and because the rules are re-read
+    /// each time (see [`LiveReplayScope`]). An empty rule set allows, so this
+    /// costs a lock read when there is no policy.
+    pub scope: LiveReplayScope,
 }
 
 #[async_trait]
@@ -486,6 +533,21 @@ impl RequestSender for HttpReplaySender {
         // header would otherwise shift every payload offset the operator gave
         // against the template.
         apply_request_hooks(&self.hooks, &mut parsed)?;
+        // An absolute-form request target (`GET http://other/x`) is sent as
+        // is on h1 and becomes `:authority` on h2: it is declared too.
+        let target_authority = parsed
+            .path
+            .parse::<http::Uri>()
+            .ok()
+            .and_then(|u| u.authority().map(|a| a.as_str().to_string()));
+        let mut names = vec![self.sni.as_str(), parsed.authority.as_str()];
+        names.extend(target_authority.as_deref());
+        if let Some(reason) = self.scope.check(&names).blocked_reason() {
+            anyhow::bail!(
+                "{}: blocked by scope ({reason}); not sent",
+                burpwn_error::ErrorCode::NetworkBlockedByScope.id()
+            );
+        }
         let resp = crate::replay_once(
             &self.scheme,
             &self.sni,
@@ -822,5 +884,125 @@ mod tests {
             Some(AttackMode::ClusterBomb)
         );
         assert_eq!(AttackMode::from_str_opt("nope"), None);
+    }
+
+    /// Each rendered fuzz request is re-checked against the scope: a payload
+    /// that turns the `Host` into a refused name fails that request with the
+    /// scope code, and nothing reaches the target.
+    #[tokio::test]
+    async fn the_replay_sender_refuses_a_request_the_scope_blocks() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = origin.local_addr().unwrap();
+        let engine = crate::scope::ScopeEngine::new();
+        engine.set_rules(deny_evil_test());
+        let sender = HttpReplaySender {
+            scheme: "http".into(),
+            sni: "127.0.0.1".into(),
+            addr,
+            hooks: Arc::new(Vec::new()),
+            scope: live_scope(engine, addr),
+        };
+        for raw in [
+            &b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n"[..],
+            // Userinfo in the Host payload is not the host.
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:80@evil.test\r\n\r\n",
+            // An absolute-form target declares its own authority.
+            b"GET http://evil.test/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        ] {
+            let err = sender.send(raw).await.unwrap_err().to_string();
+            assert!(
+                err.contains("BW-NETWORK-003"),
+                "{}: {err}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        let accepted = tokio::time::timeout(Duration::from_millis(200), origin.accept()).await;
+        assert!(accepted.is_err(), "nothing may reach the target");
+    }
+
+    /// A global deny rule on `evil.test`.
+    fn deny_evil_test() -> crate::scope::RuleSet {
+        crate::scope::RuleSet::new(vec![crate::scope::Rule {
+            id: 1,
+            workspace_id: None,
+            workspace: None,
+            kind: burpwn_store::model::ScopeKind::Deny,
+            pattern: crate::scope::Pattern::parse("evil.test").unwrap(),
+        }])
+    }
+
+    /// A [`LiveReplayScope`] reading `engine`, for a sender dialing `addr`.
+    fn live_scope(
+        engine: crate::scope::ScopeEngine,
+        addr: std::net::SocketAddr,
+    ) -> LiveReplayScope {
+        LiveReplayScope {
+            engine,
+            workspace_id: 1,
+            dst_ip: addr.ip(),
+            dst_port: addr.port(),
+            resolved_name: None,
+        }
+    }
+
+    /// An origin that answers every request `200 OK` and counts the connections
+    /// it accepted.
+    fn counting_origin(listener: tokio::net::TcpListener) -> Arc<AtomicUsize> {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    // Stay open until the client hangs up, so it reads it all.
+                    let _ = sock.read(&mut buf).await;
+                });
+            }
+        });
+        hits
+    }
+
+    /// The sender re-reads the rules between requests instead of holding the
+    /// snapshot it was built with. An attack launched by a session with NO rule
+    /// at all is still checked (that used to switch the check off for the whole
+    /// run), and a deny rule stored while the attack runs refuses the requests
+    /// that follow it — the operator who spots an attack hitting the wrong host
+    /// can stop it with `scope deny` instead of only by cancelling.
+    #[tokio::test]
+    async fn the_replay_sender_reads_the_live_scope_between_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = counting_origin(listener);
+
+        let engine = crate::scope::ScopeEngine::new();
+        let sender = HttpReplaySender {
+            scheme: "http".into(),
+            sni: "127.0.0.1".into(),
+            addr,
+            hooks: Arc::new(Vec::new()),
+            scope: live_scope(engine.clone(), addr),
+        };
+        let raw = b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n";
+
+        // Started ruleless: nothing to enforce, the request goes out.
+        let resp = sender.send(raw).await.expect("no rule blocks this");
+        assert_eq!(resp.status, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The operator denies the host mid-attack.
+        engine.set_rules(deny_evil_test());
+        let err = sender.send(raw).await.unwrap_err().to_string();
+        assert!(err.contains("BW-NETWORK-003"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the denied request must not reach the origin"
+        );
     }
 }
