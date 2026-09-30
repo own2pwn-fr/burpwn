@@ -14,9 +14,10 @@
 //!
 //! Checked FIRST, before any hook and before step 2: a question name the scope
 //! refuses (see [`crate::scope`]) is answered `REFUSED` here and never
-//! forwarded. Every A/AAAA answer the shim relays (resolved upstream or
-//! synthesized by a hook) feeds the scope's name cache, which is what lets a
-//! later connection to that IP be justified by an allow host rule.
+//! forwarded. Every A/AAAA answer an upstream resolution brings back feeds the
+//! scope's name cache, which is what lets a later connection to that IP be
+//! justified by an allow host rule. Answers burpwn makes up itself do NOT feed
+//! it — see [`Answer`] for why that asymmetry is the security boundary.
 //!
 //! # Hooks
 //!
@@ -34,6 +35,8 @@
 //! EDNS support", which is a defined answer), and it is unsigned — a client that
 //! set `DO` and validates will refuse it, correctly. Both are properties of
 //! answering rather than resolving, and neither can be fixed by trying harder.
+//! It is not an OBSERVATION either: it says where the hook wants the client to
+//! go, not where the name points, so it justifies no destination to the scope.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -162,6 +165,33 @@ pub async fn serve_socket(
 /// Stop serving a (passed) DNS socket after this long with no query.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The datagram the shim is about to send back, and WHERE IT CAME FROM.
+///
+/// The provenance is load-bearing, which is why it travels with the bytes
+/// instead of being recomputed: only an answer a real upstream resolution
+/// returned may feed the scope's name cache ([`learn_names`], which takes this
+/// type for exactly that reason). Everything burpwn fabricates here — a hook's
+/// `set-answer` or `drop`, the scope's own `REFUSED` — must not, because a
+/// binding is what justifies a destination IP under an allow HOST rule: a
+/// `dns-query` hook that could write the cache would bind any name to any
+/// address and reach a destination the scope forbids, through the very CLI/MCP
+/// surface the scope is supposed to bound.
+enum Answer {
+    /// The upstream resolver's reply, verbatim.
+    Upstream(Vec<u8>),
+    /// Synthesized here from the query, by a hook or by the scope.
+    Local(Vec<u8>),
+}
+
+impl Answer {
+    /// The bytes to send to the client and to log, whatever the provenance.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Answer::Upstream(b) | Answer::Local(b) => b,
+        }
+    }
+}
+
 async fn handle_query(
     sock: &UdpSocket,
     peer: SocketAddr,
@@ -187,7 +217,7 @@ async fn handle_query(
         tracing::info!(qname = ?described.as_ref().map(|d| &d.0), %reason, "dns query blocked by scope");
         // `None` only for a query that cannot be decoded: then there is nothing
         // to answer, and it is still not forwarded.
-        synthesize(&query, ResponseCode::Refused, None)
+        synthesize(&query, ResponseCode::Refused, None).map(Answer::Local)
     } else {
         let decision = if cfg.hooks.any_dns() {
             let (qname, qtype) = described.clone().unwrap_or_else(|| describe_query(&query));
@@ -200,22 +230,24 @@ async fn handle_query(
             DnsDecision::Resolve
         };
         Some(match hooked_answer(&query, decision) {
-            Some(bytes) => bytes,
-            None => forward_upstream(&query, cfg).await?,
+            Some(bytes) => Answer::Local(bytes),
+            None => Answer::Upstream(forward_upstream(&query, cfg).await?),
         })
     };
     // Reply to the client first (latency), then log.
     if let Some(answer) = &answer {
-        sock.send_to(answer, peer).await?;
-        // Every relayed address answer teaches the scope which names point at
-        // which IPs (cheap; filled whether or not rules exist yet, so a rule
-        // added mid-session can already justify connections).
+        sock.send_to(answer.bytes(), peer).await?;
+        // Every address answer a resolution brought back teaches the scope
+        // which names point at which IPs (cheap; filled whether or not rules
+        // exist yet, so a rule added mid-session can already justify
+        // connections). An answer burpwn made up teaches it nothing — see
+        // [`Answer`].
         learn_names(&cfg.scope, cfg.workspace_id, answer);
     }
 
     let (qname, qtype) = described.unwrap_or_else(|| describe_query(&query));
     let answer_text = match &answer {
-        Some(a) => describe_answer(a),
+        Some(a) => describe_answer(a.bytes()),
         None => "; not answered: blocked by scope\n".to_string(),
     };
 
@@ -333,7 +365,12 @@ fn scope_name(name: &Name) -> Option<String> {
 /// cap chains at a similar depth; the bound also makes a CNAME loop harmless.
 const MAX_CNAME_CHAIN: usize = 16;
 
-/// Feed the scope's name cache from a DNS response.
+/// Feed the scope's name cache from a DNS response — an UPSTREAM one only.
+///
+/// The provenance is the point of taking an [`Answer`] rather than bytes: a
+/// binding justifies a destination IP under an allow host rule, so only a name
+/// that really resolved somewhere may create one. An [`Answer::Local`] is
+/// dropped here, and no call site can pass fabricated bytes past the type.
 ///
 /// Every A/AAAA address in the answer section is bound to its owner name and
 /// to every name of the CNAME chain that leads to it from the question (the
@@ -342,12 +379,15 @@ const MAX_CNAME_CHAIN: usize = 16;
 /// address whose owner no question reaches is bound to its owner alone. The
 /// cache floors the TTL and handles expiry (see
 /// [`crate::scope::DNS_BINDING_FLOOR`]).
-fn learn_names(scope: &ScopeEngine, workspace_id: i64, answer: &[u8]) {
+fn learn_names(scope: &ScopeEngine, workspace_id: i64, answer: &Answer) {
     learn_names_at(scope, workspace_id, answer, Instant::now());
 }
 
 /// [`learn_names`] at an explicit `now` (the bindings' expiry is relative to it).
-fn learn_names_at(scope: &ScopeEngine, workspace_id: i64, answer: &[u8], now: Instant) {
+fn learn_names_at(scope: &ScopeEngine, workspace_id: i64, answer: &Answer, now: Instant) {
+    let Answer::Upstream(answer) = answer else {
+        return;
+    };
     let Ok(msg) = Message::from_vec(answer) else {
         return;
     };
@@ -725,6 +765,108 @@ mod tests {
         );
     }
 
+    /// A `set-answer` hook answers the client, and that is ALL it does: the
+    /// scope never SAW the name resolve to the hook's address, so a connection
+    /// there is still not justified by the allow host rule. Without that, a
+    /// host allowlist was escapable from the CLI/MCP surface it is supposed to
+    /// bound — `hook add --phase dns-query --host toto.fr --action set-answer
+    /// 203.0.113.9` bound `x.toto.fr` to that address, and the connection rode
+    /// the binding out of the scope.
+    #[tokio::test]
+    async fn a_set_answer_hook_does_not_justify_its_address_to_the_scope() {
+        use crate::scope::{Identity, Pattern, Rule, RuleSet};
+        use burpwn_store::model::{FlowFilter, Hook, HookAction, HookPhase, HookScope, ScopeKind};
+
+        let forced: IpAddr = "203.0.113.9".parse().unwrap();
+        let hooks = HookEngine::new();
+        hooks.set_hooks(vec![Hook {
+            id: 1,
+            enabled: true,
+            name: "force".into(),
+            phase: HookPhase::DnsQuery,
+            scope: HookScope {
+                host: "toto.fr".into(),
+                ..Default::default()
+            },
+            action: HookAction::SetAnswer { ip: forced },
+            order: 0,
+            timeout_ms: 1_000,
+            ttl_ms: 0,
+            created_at: 0,
+        }]);
+        // A HOST allowlist: a destination IP is justified only by a name that
+        // resolved to it, which is the judgement the hook must not forge.
+        let scope = ScopeEngine::new();
+        scope.set_rules(RuleSet::new(vec![Rule {
+            id: 1,
+            workspace_id: None,
+            workspace: None,
+            kind: ScopeKind::Allow,
+            pattern: Pattern::parse("*.toto.fr").unwrap(),
+        }]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = burpwn_store::Store::open(dir.path().join("session.db")).unwrap();
+        let shim = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let shim_addr = shim.local_addr().unwrap();
+        let cfg = DnsConfig {
+            // Nobody listens there: an answer proves the hook produced it.
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            workspace_id: 1,
+            exec_id: None,
+            timeout: Duration::from_millis(200),
+            hooks,
+            scope: scope.clone(),
+        };
+        tokio::spawn(serve_socket(shim, cfg, store.writer()));
+
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        client
+            .send_to(&sample_query("x.toto.fr."), shim_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("the hook must still answer the client")
+            .unwrap();
+        let msg = Message::from_vec(&buf[..n]).unwrap();
+        assert_eq!(msg.answers()[0].data().ip_addr(), Some(forced));
+
+        // The flow is logged AFTER the shim would have fed the cache, so its
+        // arrival is what makes the assertions below race-free.
+        for _ in 0..100 {
+            if !store
+                .reader()
+                .list_flows(&FlowFilter::default())
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let learned = scope.cache().names(1, forced);
+        assert!(learned.is_empty(), "the hook taught the scope: {learned:?}");
+        let verdict = scope.check_conn(
+            1,
+            Some(forced),
+            443,
+            &[Identity::Name("x.toto.fr".into())],
+            None,
+        );
+        assert!(
+            !verdict.allowed,
+            "the hook's address must stay out of scope: {}",
+            verdict.reason
+        );
+        assert!(
+            verdict.reason.starts_with("not in allowlist"),
+            "{}",
+            verdict.reason
+        );
+    }
+
     /// A name the scope refuses is answered REFUSED by the shim and never
     /// reaches the upstream resolver (a live socket that must see nothing), and
     /// the query is recorded as a blocked flow.
@@ -800,7 +942,7 @@ mod tests {
             .starts_with("not in allowlist"));
     }
 
-    /// Relayed address answers feed the scope cache with the question name and
+    /// Upstream address answers feed the scope cache with the question name and
     /// the whole CNAME chain.
     #[test]
     fn answers_feed_the_name_cache_with_the_cname_chain() {
@@ -824,7 +966,7 @@ mod tests {
             RData::A("9.9.9.9".parse::<Ipv4Addr>().unwrap().into()),
         ));
         let scope = ScopeEngine::new();
-        learn_names(&scope, 4, &msg.to_vec().unwrap());
+        learn_names(&scope, 4, &Answer::Upstream(msg.to_vec().unwrap()));
         let names = scope.cache().names(4, "9.9.9.9".parse().unwrap());
         assert!(names.contains(&"www.toto.fr".to_string()), "{names:?}");
         assert!(names.contains(&"edge.cdn.net".to_string()), "{names:?}");
@@ -832,18 +974,19 @@ mod tests {
             .cache()
             .names(1, "9.9.9.9".parse().unwrap())
             .is_empty());
-        // A hook's synthesized answer is learned too.
+        // A hook's synthesized answer is NOT: the same bytes, minus the
+        // provenance, bind nothing (see `Answer`).
         let synth = synthesize(
             &sample_query("forced.toto.fr."),
             ResponseCode::NoError,
             Some("10.0.0.9".parse().unwrap()),
         )
         .unwrap();
-        learn_names(&scope, 4, &synth);
-        assert_eq!(
-            scope.cache().names(4, "10.0.0.9".parse().unwrap()),
-            vec!["forced.toto.fr".to_string()]
-        );
+        learn_names(&scope, 4, &Answer::Local(synth));
+        assert!(scope
+            .cache()
+            .names(4, "10.0.0.9".parse().unwrap())
+            .is_empty());
     }
 
     /// A response for `www.toto.fr` whose chain is
@@ -887,7 +1030,12 @@ mod tests {
         for (cname_ttl, a_ttl) in [(short, long), (long, short)] {
             let scope = ScopeEngine::new();
             let t0 = Instant::now();
-            learn_names_at(&scope, 4, &chained_answer(cname_ttl, a_ttl), t0);
+            learn_names_at(
+                &scope,
+                4,
+                &Answer::Upstream(chained_answer(cname_ttl, a_ttl)),
+                t0,
+            );
             let at = |s: u64| scope.cache().names_at(4, ip, t0 + Duration::from_secs(s));
             assert_eq!(
                 at(u64::from(short) - 1),
@@ -908,7 +1056,7 @@ mod tests {
         let ip: IpAddr = "9.9.9.9".parse().unwrap();
         let scope = ScopeEngine::new();
         let t0 = Instant::now();
-        learn_names_at(&scope, 4, &chained_answer(30, 300), t0);
+        learn_names_at(&scope, 4, &Answer::Upstream(chained_answer(30, 300)), t0);
         let second = Duration::from_secs(1);
         assert_eq!(scope.cache().names_at(4, ip, t0 + floor - second).len(), 2);
         assert!(scope.cache().names_at(4, ip, t0 + floor).is_empty());
@@ -963,7 +1111,7 @@ mod tests {
 
         let synth =
             synthesize(&q, ResponseCode::NoError, Some("10.0.0.7".parse().unwrap())).unwrap();
-        learn_names(&scope, 1, &synth);
+        learn_names(&scope, 1, &Answer::Upstream(synth));
         assert_eq!(
             scope.cache().names(1, "10.0.0.7".parse().unwrap()),
             vec!["xn--bcher-kva.example".to_string()]
@@ -1016,7 +1164,7 @@ mod tests {
         // The cache does not learn the tricky name.
         let synth =
             synthesize(&q, ResponseCode::NoError, Some("10.0.0.8".parse().unwrap())).unwrap();
-        learn_names(&allow, 1, &synth);
+        learn_names(&allow, 1, &Answer::Upstream(synth));
         assert!(allow
             .cache()
             .names(1, "10.0.0.8".parse().unwrap())

@@ -795,8 +795,8 @@ const NAMES_PER_IP: usize = 32;
 /// — which is what keeping bindings for the daemon's whole lifetime got wrong.
 pub const DNS_BINDING_FLOOR: Duration = Duration::from_secs(3_600);
 
-/// `(workspace, IP) -> names` learned from DNS answers the shim relayed, each
-/// binding with its own expiry.
+/// `(workspace, IP) -> names` learned from the answers upstream resolvers
+/// returned through the shim, each binding with its own expiry.
 ///
 /// Policy: in-memory, bounded to [`DNS_CACHE_CAP`] entries with the
 /// least-recently-UPDATED entry evicted first, and at most [`NAMES_PER_IP`]
@@ -810,7 +810,10 @@ pub const DNS_BINDING_FLOOR: Duration = Duration::from_secs(3_600);
 ///
 /// Within that life, a name keeps justifying an IP it resolved to, which can
 /// only widen an ALLOW to an address that name really pointed at — never an
-/// unrelated one.
+/// unrelated one. That holds only because nothing burpwn fabricates is ever
+/// recorded here: an answer a `dns-query` hook synthesized is not an
+/// observation, and writing it would let the hook bind any name to any address
+/// and so justify a destination outside the scope (see [`crate::dns`]).
 ///
 /// Every method has an `_at` twin taking `now` explicitly, so expiry is tested
 /// deterministically; the plain methods use [`Instant::now`].
