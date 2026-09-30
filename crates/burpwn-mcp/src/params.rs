@@ -29,6 +29,9 @@ pub struct ReqListParams {
     /// Restrict to a workspace id.
     #[serde(default)]
     pub workspace: Option<i64>,
+    /// Only the flows the network scope blocked (see `scope_list`).
+    #[serde(default)]
+    pub blocked: bool,
     /// Max rows to return (default 100).
     #[serde(default)]
     pub limit: Option<i64>,
@@ -209,6 +212,61 @@ pub struct HookTestParams {
     pub id: i64,
     /// Captured flow to replay it against.
     pub flow_id: i64,
+}
+
+/// `scope_allow` / `scope_deny` — add network-scope rules.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ScopeAddParams {
+    /// Destination patterns: `toto.fr` (exactly that host), `*.toto.fr` (the
+    /// host AND every subdomain), `10.0.0.5`, `2001:db8::1`, `10.0.0.0/8`, each
+    /// with an optional port (`toto.fr:8443`, `[2001:db8::1]:443`). A bare `*`
+    /// is refused. One invalid pattern stores none of them.
+    pub patterns: Vec<String>,
+    /// Apply to this workspace only (by NAME; created if missing). Omit for a
+    /// global rule applying to every workspace.
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// `scope_list` — list network-scope rules.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ScopeListParams {
+    /// Return the EFFECTIVE rules of this workspace (global + its own), by
+    /// NAME. Omit for every rule.
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// `scope_rm` — delete network-scope rules by id.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ScopeRmParams {
+    /// Rule ids from `scope_list`. An unknown id removes nothing and fails.
+    pub ids: Vec<i64>,
+}
+
+/// `scope_clear` — delete network-scope rules in bulk.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ScopeClearParams {
+    /// Clear this workspace's OWN rules (by NAME). Omit (and leave `all`
+    /// false) to clear the GLOBAL rules.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Clear every rule, global and per workspace.
+    #[serde(default)]
+    pub all: bool,
+    /// Only rules of this kind: `allow` or `deny`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// `scope_test` — evaluate a target against the scope, sending nothing.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ScopeTestParams {
+    /// `host`, `host:port`, `ip`, `ip:port` or `[v6]:port`.
+    pub target: String,
+    /// Evaluate for this workspace (by NAME); default: the `default` workspace.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 /// `group_new` — create (or re-describe) a named collection of flows.

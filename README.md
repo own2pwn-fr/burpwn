@@ -16,8 +16,9 @@ through a built-in intercepting proxy. The agent can then go back through histor
 the decrypted request/response flows, replay and edit them (Repeater), fuzz them with a native
 Intruder, diff responses, encode/decode tokens, keep itself authenticated with a login macro, apply
 match/replace rules, hook every request or response with an action of its own, block and rewrite
-traffic in flight, organize flows into workspaces and named groups, and pack a whole session into
-one portable file to hand to someone else — all from a scriptable CLI or over MCP (42 tools). It is at once a Burp and a tshark, but driven by an agent.
+traffic in flight, pin it to the authorised targets with a network scope, organize flows into
+workspaces and named groups, and pack a whole session into one portable file to hand to someone
+else — all from a scriptable CLI or over MCP (48 tools). It is at once a Burp and a tshark, but driven by an agent.
 
 > **Status:** early development. See the milestones below.
 
@@ -58,6 +59,14 @@ namespace, so LLM traffic is excluded by construction.
   complete **WebSocket messages** inside a socket the page is already holding open (nothing else can
   reach those — there is no replaying a message that only exists in a live socket), and
   `--phase dns-query` drops a lookup or **forces a name to resolve** where you want it.
+- **Network scope.** An allowlist and a denylist of destinations — `host`, `*.host` (the apex and
+  every subdomain, a strict label match), IP, CIDR, each with an optional port — global or per
+  workspace. The proxy enforces it **before any upstream contact**: an out-of-scope destination gets
+  no DNS query and no SYN, only a local refusal (HTTP `403 burpwn: blocked by scope (...)`, a TLS
+  `access_denied` alert, DNS `REFUSED`). Deny always wins, one allow rule blocks everything else,
+  `Host: evil.com` on an allowed IP is refused, and `req replay` / `fuzz` are held to it too.
+  Blocked flows are recorded (`req list --blocked`), so an agent can tell "out of scope" from "the
+  target said no".
 - **Agent integration (rtk-style).** `burpwn init` installs the right command-rewrite hook for the
   detected agent (Claude Code / Copilot, Cursor, Gemini CLI, Cline/Roo), plus a generic global shell
   hook so even a custom agent is covered.
@@ -68,6 +77,9 @@ namespace, so LLM traffic is excluded by construction.
 burpwn doctor                                  # prerequisites + a LIVE sandbox probe (--quick skips it)
 burpwn ca init && burpwn ca export             # generate / print the MITM CA
 burpwn session new --name engagement-1
+burpwn scope allow '*.target.example' 203.0.113.0/24  # nothing else is reachable from the sandbox
+burpwn scope deny admin.target.example         # deny always wins
+burpwn scope test evil.example:443             # verdict + deciding rule, sends nothing
 burpwn exec -- curl -s https://target.example/ # runs sandboxed; traffic captured + decrypted
 burpwn req list                                # browse captured flows
 burpwn req show 42 --raw                       # decrypted request + response
@@ -88,7 +100,8 @@ burpwn hook add esc --phase ws-c2s --host chat.target.example \
   --action replace-payload --find '"role":"user"' --replace '"role":"admin"'  # inside an OPEN socket
 burpwn hook add pin --phase dns-query --host internal.target.example \
   --action set-answer --answer 10.0.0.5         # force a resolution (A/AAAA)
-burpwn intercept scope target.example --path /admin  # narrow blocking intercept
+burpwn req list --blocked                      # what the network scope refused
+burpwn intercept scope target.example --path /admin  # narrow blocking intercept (never blocks traffic)
 burpwn intercept enable                        # blocking intercept (also via MCP await_intercept)
 burpwn group new auth-flow \
   --description 'login form -> POST /login -> redirect + Set-Cookie'  # name a scenario

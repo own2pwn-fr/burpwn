@@ -51,12 +51,12 @@ agent's own LLM traffic stays outside the sandbox and is never captured.
 | `validation` | see `dataset.validation.jsonl` |
 | combined | `dataset.jsonl` (train + validation, same records) |
 
-**1,534** deduplicated examples by default (`546 cli`, `327 mcp`, `661 shell`), of
+**1,544** deduplicated examples by default (`549 cli`, `331 mcp`, `664 shell`), of
 which **~50% are multi-turn** — this is exactly the committed `dataset.jsonl`
-(split 1,458 train / 76 validation). The split is a deterministic,
+(split 1,467 train / 77 validation). The split is a deterministic,
 **style-stratified** 95/5 split (all three styles appear in each split). The
 default emitted set is balanced to ~50% multi-turn by deterministically
-subsampling single-turn records; the **full corpus is 3,359 examples**
+subsampling single-turn records; the **full corpus is 3,378 examples**
 (`python generate.py --multiturn-frac 0`, no multi-turn balancing).
 Both the multi-turn fraction and the size are tunable — see *(Re)generate* — and
 the generator asserts zero near-duplicates.
@@ -178,7 +178,7 @@ turns, each driving tool rounds) follow the same grammar as `shell`.
 }
 ```
 
-The 42 MCP tools are: `session_list`, `session_current`, `session_stats`,
+The 48 MCP tools are: `session_list`, `session_current`, `session_stats`,
 `session_export`, `session_auth_set`, `session_auth_refresh`,
 `session_auth_status`, `req_list`, `req_show`, `req_search`, `req_replay`,
 `workspace_list`, `workspace_new`, `tag_list`, `tag_add`, `note_add`,
@@ -187,12 +187,13 @@ The 42 MCP tools are: `session_list`, `session_current`, `session_stats`,
 `group_list`, `group_show`, `group_rm`, `intercept_enable`,
 `intercept_disable`, `intercept_list`, `await_intercept`, `intercept_forward`,
 `intercept_scope`, `intercept_drop`, `exec`, `fuzz`, `fuzz_list`,
-`fuzz_results`, `compare`, `encode`, `decode`.
+`fuzz_results`, `compare`, `encode`, `decode`, `scope_allow`, `scope_deny`,
+`scope_list`, `scope_rm`, `scope_clear`, `scope_test`.
 
-All 42 appear as real tool calls in the emitted `dataset.jsonl` **and** in
+All 48 appear as real tool calls in the emitted `dataset.jsonl` **and** in
 `dataset.train.jsonl` — `python generate.py --validate` fails if any is missing,
-and prints the count it measured (`42/42 MCP tools exercised`). Only
-`dataset.validation.jsonl` is partial (9/42), which is expected of a 5% held-out
+and prints the count it measured (`48/48 MCP tools exercised`). Only
+`dataset.validation.jsonl` is partial (5/48), which is expected of a 5% held-out
 sample and is therefore exempt from the check.
 
 That guarantee is recent, and it is worth knowing what it replaced. The emitted
@@ -418,8 +419,8 @@ flags and phrasings, then deduplicated):
 
 ```
 cd training
-python generate.py                     # writes dataset.jsonl + splits (1,534 records, ~50% multi-turn)
-python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,359 records)
+python generate.py                     # writes dataset.jsonl + splits (1,544 records, ~50% multi-turn)
+python generate.py --multiturn-frac 0  # full corpus, no multi-turn balancing (3,378 records)
 python generate.py --multiturn-frac 0.35  # keep more single-turn (larger set, ~35% multi-turn)
 python generate.py --target 3000       # aim for ~N examples (style-balanced subsample)
 python generate.py --seed 7            # change the deterministic RNG seed
@@ -458,7 +459,7 @@ rounds, single tool call per round, matching `tool_call_id`/`name`, JSON-parseab
 `mcp` calls target a **known** MCP tool with a JSON-encoded tool result; only
 known burpwn subcommands/flags appear in emitted commands; **no near-duplicates**
 (normalized-content hash); and — for `dataset.jsonl` and `dataset.train.jsonl` —
-that all 42 MCP tools actually appear as tool calls. Exit code is non-zero on any
+that all 48 MCP tools actually appear as tool calls. Exit code is non-zero on any
 problem.
 
 ## Intended use (SFT for tool-use)

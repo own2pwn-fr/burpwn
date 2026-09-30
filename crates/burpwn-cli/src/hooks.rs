@@ -1031,6 +1031,7 @@ mod tests {
                 path: Some("/v1/users".into()),
                 status,
                 intercepted: false,
+                blocked: None,
             },
             exec_id: None,
             client_addr: "127.0.0.1:1".into(),

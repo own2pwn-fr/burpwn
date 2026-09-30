@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// Current schema version. Bump when adding a migration step.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Id of the always-present default workspace.
 pub const DEFAULT_WORKSPACE_ID: i64 = 1;
@@ -29,6 +29,7 @@ const MIGRATIONS: &[(i64, MigrationStep)] = &[
     (6, migrate_v6),
     (7, migrate_v7),
     (8, migrate_v8),
+    (9, migrate_v9),
 ];
 
 /// Apply pending migrations, stamp the version, and ensure the default
@@ -118,7 +119,10 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
             tls_version    TEXT,
             tls_cipher     TEXT,
             tls_alpn       TEXT,
-            origin_cert_fp TEXT
+            origin_cert_fp TEXT,
+            -- Why the network scope refused this flow (schema v9, nullable;
+            -- NULL = not blocked). Added to older files by migrate_v9.
+            blocked        TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_flows_workspace ON flows(workspace_id);
@@ -222,6 +226,17 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 
         -- The proxy reads hooks by phase, in application order.
         CREATE INDEX IF NOT EXISTS idx_hooks_phase ON hooks(phase, ord, id);
+
+        -- Network scope (schema v9): allow/deny destination patterns, global
+        -- (workspace_id NULL) or per workspace. Mirrored in migrate_v9.
+        CREATE TABLE IF NOT EXISTS scope_rules (
+            id           INTEGER PRIMARY KEY,
+            workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+            kind         TEXT NOT NULL CHECK(kind IN ('allow','deny')),
+            pattern      TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scope_rules_workspace ON scope_rules(workspace_id);
 
         -- (`intercepts` used to be created here; it was never written outside its
         -- own tests and is dropped by migrate_v7. Interception is a synchronous
@@ -600,6 +615,34 @@ fn migrate_v8(conn: &Connection) -> Result<()> {
     outcome
 }
 
+/// v9: the network scope. A `scope_rules` table (allow/deny destination
+/// patterns, global when `workspace_id` is NULL, else scoped to one workspace)
+/// and a nullable `flows.blocked` column holding the reason a flow was refused
+/// by that scope (NULL = not blocked). The table uses `IF NOT EXISTS` and the
+/// column a guarded ALTER, so the step is a no-op on the fresh-create replay
+/// (the v1 baseline ships both) and adds them in place on a v8→v9 upgrade.
+///
+/// Patterns are stored already validated and normalized (the store does not
+/// parse them; `burpwn_proxy::scope` does, at add time).
+fn migrate_v9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS scope_rules (
+            id           INTEGER PRIMARY KEY,
+            workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+            kind         TEXT NOT NULL CHECK(kind IN ('allow','deny')),
+            pattern      TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scope_rules_workspace ON scope_rules(workspace_id);
+        "#,
+    )?;
+    if table_exists(conn, "flows")? {
+        add_column_if_missing(conn, "flows", "blocked", "TEXT")?;
+    }
+    Ok(())
+}
+
 /// The hook name a session-auth profile for `host` is stored under. Kept in sync
 /// with `burpwn_cli::auth::auth_hook_name`, which is what `session auth status`
 /// looks the hooks back up by (this module cannot reach the CLI crate).
@@ -732,6 +775,7 @@ mod tests {
             "attacks",
             "attack_results",
             "execs",
+            "scope_rules",
         ] {
             assert!(table_exists(&conn, t), "missing table {t}");
         }
@@ -741,8 +785,14 @@ mod tests {
         // v8: nor the auth profiles, which are hooks now.
         assert!(!table_exists(&conn, "auth_profiles"));
 
-        // v3 TLS columns present on a fresh create.
-        for c in ["tls_version", "tls_cipher", "tls_alpn", "origin_cert_fp"] {
+        // v3 TLS columns (and the v9 scope verdict) present on a fresh create.
+        for c in [
+            "tls_version",
+            "tls_cipher",
+            "tls_alpn",
+            "origin_cert_fp",
+            "blocked",
+        ] {
             assert!(column_exists(&conn, "flows", c), "missing flows.{c}");
         }
 
@@ -1402,6 +1452,66 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn migrates_v8_to_v9_adds_scope_rules_and_flows_blocked() {
+        // A file in the real v8 shape: `flows` pre-created with its v8 columns
+        // (so the baseline's `IF NOT EXISTS` keeps it without `blocked`), v1..v8
+        // applied, then v9's table dropped (the baseline ships it too).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE flows (
+                id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL, ts_start INTEGER NOT NULL,
+                ts_end INTEGER, exec_id TEXT, client_addr TEXT NOT NULL, dst_ip TEXT NOT NULL,
+                dst_port INTEGER NOT NULL, sni TEXT, scheme TEXT NOT NULL, protocol TEXT NOT NULL,
+                intercepted INTEGER NOT NULL DEFAULT 0, tls_version TEXT, tls_cipher TEXT,
+                tls_alpn TEXT, origin_cert_fp TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for step in [
+            migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7,
+            migrate_v8,
+        ] {
+            step(&conn).unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        conn.execute_batch(
+            "DROP TABLE scope_rules;
+             INSERT INTO workspaces(id, name, created_at) VALUES (1, 'default', 0);
+             INSERT INTO flows(id, workspace_id, ts_start, client_addr, dst_ip, dst_port, scheme, protocol)
+                VALUES (7, 1, 111, '127.0.0.1:1', '10.0.0.1', 443, 'https', 'h1');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        assert!(!table_exists(&conn, "scope_rules"));
+        assert!(!column_exists(&conn, "flows", "blocked"));
+
+        init(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "scope_rules"));
+        assert!(index_exists(&conn, "idx_scope_rules_workspace"));
+        assert!(column_exists(&conn, "flows", "blocked"));
+        // The pre-existing flow survives, not blocked.
+        let blocked: Option<String> = conn
+            .query_row("SELECT blocked FROM flows WHERE id = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blocked, None);
+        // The kind CHECK holds.
+        assert!(conn
+            .execute(
+                "INSERT INTO scope_rules(kind, pattern, created_at) VALUES ('maybe', 'x', 0)",
+                [],
+            )
+            .is_err());
+        // Idempotent second init.
+        init(&conn).unwrap();
     }
 
     #[test]
