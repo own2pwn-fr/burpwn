@@ -16,8 +16,8 @@
 //! declarative actions (header/query edits, drop) are pure byte work on the
 //! message that is already in memory: no spawn, no I/O, no store access. Only
 //! [`HookAction::Exec`] is expensive, and it pays for a whole sandbox (a network
-//! namespace) per run — which is why its value is cached per hook and why the
-//! declarative path never touches any of that machinery.
+//! namespace) per run — which is why its value is cached per (hook, workspace)
+//! and why the declarative path never touches any of that machinery.
 //!
 //! # The phases, and what an action means on each
 //!
@@ -128,6 +128,24 @@
 //! child, and — since the marker already handles recursion structurally — no
 //! debounce doing double duty as a recursion guard. What is left is a rate
 //! question, answered by [`REMINT_COOLDOWN`].
+//!
+//! # Workspaces: a hook runs where the flow that fired it lives
+//!
+//! Hooks are session-wide, but the traffic that fires them belongs to a
+//! workspace, and so does everything a hook's command does on its behalf. The
+//! command therefore runs under the TRIGGERING flow's workspace (the runner is
+//! handed it, see [`HookRunner::run`]): its connections are checked against
+//! that workspace's network scope and its captured flows are filed there. A
+//! hook fired by a flow in `audit` that ran in `default` would both escape
+//! `audit`'s scope and scatter its evidence into the wrong workspace.
+//!
+//! The TTL cache follows: a value is keyed by `(hook id, workspace id)`, so a
+//! token minted under one workspace (against its scope, possibly with its own
+//! credentials in the environment) is never injected into another's traffic.
+//! The one-command claim stays GLOBAL — it is a recursion backstop, and a
+//! per-workspace claim would let a missing marker fan out once per workspace —
+//! but a request only waits on a running command that mints the exact
+//! `(hook, workspace)` value it needs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -219,6 +237,10 @@ pub enum DnsDecision {
     Answer(std::net::IpAddr),
 }
 
+/// The cache and single-flight key of an `exec` hook's value: `(hook id,
+/// workspace id)`. See the module docs, "Workspaces".
+type ValueKey = (i64, i64);
+
 /// Runs a hook's command and returns its stdout.
 ///
 /// The engine deliberately knows nothing about HOW (the sandbox, the session,
@@ -232,7 +254,11 @@ pub trait HookRunner: Send + Sync {
     /// stdout. The engine also enforces `budget` around this call, but the
     /// implementation gets it too so it can KILL the process rather than leave
     /// an orphan running past a cancelled future.
-    async fn run(&self, cmd: &str, budget: Duration) -> anyhow::Result<String>;
+    ///
+    /// `workspace_id` is the workspace of the flow that fired the hook: the
+    /// command's own traffic must be scope-checked and recorded under it, not
+    /// under a fixed default (see the module docs, "Workspaces").
+    async fn run(&self, cmd: &str, workspace_id: i64, budget: Duration) -> anyhow::Result<String>;
 }
 
 /// A cached value extracted from a hook's command output.
@@ -257,13 +283,14 @@ struct Inner {
     /// skipped (fail-open), which is what the CLI-side `hook test` and the unit
     /// tests rely on.
     runner: RwLock<Option<Arc<dyn HookRunner>>>,
-    /// Extracted values, per hook id, with their TTL deadline.
-    cache: Mutex<HashMap<i64, CachedValue>>,
-    /// WHICH hook's command is running right now, if any. The claim is taken
-    /// under this lock, so "at most one for the whole proxy" is an invariant
-    /// and not a race — and a request that finds it taken can see whose value
-    /// is being minted, which is what decides whether waiting could pay.
-    running: Mutex<Option<i64>>,
+    /// Extracted values, per `(hook id, workspace id)`, with their TTL deadline.
+    cache: Mutex<HashMap<ValueKey, CachedValue>>,
+    /// WHICH hook's command is running right now, and for which workspace, if
+    /// any. The claim is taken under this lock, so "at most one for the whole
+    /// proxy" is an invariant and not a race — and a request that finds it
+    /// taken can see whose value is being minted, which is what decides whether
+    /// waiting could pay.
+    running: Mutex<Option<ValueKey>>,
     /// Signalled when a command releases the claim, so the requests parked on
     /// it wake on the value rather than on their timer.
     finished: Notify,
@@ -318,7 +345,7 @@ impl HookEngine {
         {
             let previous = self.snapshot();
             let mut cache = self.inner.cache.lock();
-            cache.retain(|id, _| {
+            cache.retain(|(id, _workspace), _| {
                 let before = previous.iter().find(|h| h.id == *id);
                 let after = hooks.iter().find(|h| h.id == *id);
                 match (before, after) {
@@ -396,10 +423,12 @@ impl HookEngine {
     ///
     /// `exec_id` is the connection's exec correlation id: hook-originated
     /// traffic ([`is_hook_traffic`]) returns immediately, which is the primary
-    /// recursion guard.
+    /// recursion guard. `workspace_id` is the flow's workspace: an `exec` hook's
+    /// command runs under it and its value is cached for it alone.
     pub async fn pre_request(
         &self,
         exec_id: Option<&str>,
+        workspace_id: i64,
         method: &str,
         msg: &mut Message,
     ) -> HookOutcome {
@@ -417,15 +446,19 @@ impl HookEngine {
             path: &path,
             status: None,
         };
-        self.apply(HookPhase::PreRequest, exec_id, m, msg).await
+        self.apply(HookPhase::PreRequest, exec_id, workspace_id, m, msg)
+            .await
     }
 
     /// Apply the `post-response` hooks to a response message in place. `msg`
     /// carries the REQUEST host/url (so scoping works) and the RESPONSE
     /// headers/body, exactly like the response-side match/replace call.
+    /// `workspace_id` is the flow's workspace, as in
+    /// [`pre_request`](Self::pre_request).
     pub async fn post_response(
         &self,
         exec_id: Option<&str>,
+        workspace_id: i64,
         method: &str,
         status: u16,
         msg: &mut Message,
@@ -440,7 +473,8 @@ impl HookEngine {
             path: &path,
             status: Some(status),
         };
-        self.apply(HookPhase::PostResponse, exec_id, m, msg).await
+        self.apply(HookPhase::PostResponse, exec_id, workspace_id, m, msg)
+            .await
     }
 
     /// Apply the WebSocket hooks of one direction to one COMPLETE message,
@@ -558,6 +592,7 @@ impl HookEngine {
         &self,
         phase: HookPhase,
         exec_id: Option<&str>,
+        workspace_id: i64,
         m: MatchCtx<'_>,
         msg: &mut Message,
     ) -> HookOutcome {
@@ -577,7 +612,8 @@ impl HookEngine {
                     extract,
                     inject,
                 } => {
-                    let Some(value) = self.exec_value(hook, cmd, extract).await else {
+                    let Some(value) = self.exec_value(hook, workspace_id, cmd, extract).await
+                    else {
                         continue; // fail open: already logged
                     };
                     out.changed |= apply_inject(inject, &value, msg);
@@ -597,18 +633,25 @@ impl HookEngine {
 
     /// The value for an `exec` hook: cached, single-flighted, timeout-bounded,
     /// fail-open. `None` means "leave the message alone".
-    async fn exec_value(&self, hook: &Hook, cmd: &str, extract: &str) -> Option<String> {
+    async fn exec_value(
+        &self,
+        hook: &Hook,
+        workspace_id: i64,
+        cmd: &str,
+        extract: &str,
+    ) -> Option<String> {
         let budget = Duration::from_millis(hook.timeout_ms.max(0) as u64);
         // The whole acquisition — waiting on another task's run included — is
         // under ONE budget, so a hook can never hold a request longer than its
         // own timeout (which the operator sized against the client's patience).
-        match tokio::time::timeout(budget, self.exec_value_inner(hook, cmd, extract, budget)).await
-        {
+        let inner = self.exec_value_inner(hook, workspace_id, cmd, extract, budget);
+        match tokio::time::timeout(budget, inner).await {
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!(
                     hook = hook.id,
                     name = %hook.name,
+                    workspace_id,
                     timeout_ms = hook.timeout_ms,
                     "hook exec timed out; forwarding un-hooked (fail open)"
                 );
@@ -620,19 +663,25 @@ impl HookEngine {
     async fn exec_value_inner(
         &self,
         hook: &Hook,
+        workspace_id: i64,
         cmd: &str,
         extract: &str,
         budget: Duration,
     ) -> Option<String> {
-        if let Some(v) = self.cached(hook.id) {
+        let key: ValueKey = (hook.id, workspace_id);
+        if let Some(v) = self.cached(key) {
             return Some(v);
         }
         // Guard 2 + single flight, in one claim: exactly one hook command runs
         // at a time. Losing the claim never spawns a second command — it waits
         // for the winner's value instead, briefly and only when that can work.
-        let _running = match RunGuard::claim(&self.inner, hook.id) {
+        let _running = match RunGuard::claim(&self.inner, key) {
             Ok(guard) => guard,
-            Err(holder) => return self.wait_for_running_command(hook, holder, budget).await,
+            Err(holder) => {
+                return self
+                    .wait_for_running_command(hook, key, holder, budget)
+                    .await
+            }
         };
         let runner = self.inner.runner.read().clone();
         let Some(runner) = runner else {
@@ -643,7 +692,7 @@ impl HookEngine {
             return None;
         };
 
-        let stdout = match runner.run(cmd, budget).await {
+        let stdout = match runner.run(cmd, workspace_id, budget).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -670,7 +719,7 @@ impl HookEngine {
         if hook.ttl_ms > 0 {
             let now = Instant::now();
             self.inner.cache.lock().insert(
-                hook.id,
+                key,
                 CachedValue {
                     value: value.clone(),
                     minted_at: now,
@@ -690,15 +739,21 @@ impl HookEngine {
     async fn wait_for_running_command(
         &self,
         hook: &Hook,
-        holder: i64,
+        key: ValueKey,
+        holder: ValueKey,
         budget: Duration,
     ) -> Option<String> {
-        // Two cases where waiting is provably pointless, and therefore stays
+        // Cases where waiting is provably pointless, and therefore stays
         // immediate fail-open: nothing will be published for us to read.
         let pointless = if hook.ttl_ms <= 0 {
             Some("this hook caches nothing (ttl 0), so the running command publishes no value")
-        } else if holder != hook.id {
+        } else if holder.0 != key.0 {
             Some("the running command belongs to another hook, whose value this one cannot use")
+        } else if holder.1 != key.1 {
+            Some(
+                "the running command mints this hook's value for another workspace, \
+                 which is never reused across workspaces",
+            )
         } else {
             None
         };
@@ -707,7 +762,9 @@ impl HookEngine {
             tracing::warn!(
                 hook = hook.id,
                 name = %hook.name,
-                running_hook = holder,
+                running_hook = holder.0,
+                running_workspace = holder.1,
+                workspace_id = key.1,
                 reason,
                 "another hook command is already running; forwarding un-hooked \
                  (single-flight / recursion backstop)"
@@ -720,13 +777,13 @@ impl HookEngine {
         // Register interest BEFORE the last cache read: a winner that finishes
         // in between then wakes us instead of leaving us on the timer.
         notified.as_mut().enable();
-        if let Some(v) = self.cached(hook.id) {
+        if let Some(v) = self.cached(key) {
             return Some(v);
         }
         let woken = tokio::time::timeout(wait, notified).await.is_ok();
         // The winner published through the cache, so that is where the answer
         // is — a loser never runs a command of its own.
-        if let Some(v) = self.cached(hook.id) {
+        if let Some(v) = self.cached(key) {
             return Some(v);
         }
         if woken {
@@ -780,7 +837,16 @@ impl HookEngine {
     /// — the one the pre-request phase matched on — so a hook narrowed to
     /// `--method POST` or a path prefix is invalidated by a refusal of the
     /// requests it actually injects into, and not by any other flow to that host.
-    pub fn observe_status(&self, exec_id: Option<&str>, m: &MatchCtx, status: u16) {
+    ///
+    /// `workspace_id` is the refused flow's workspace: only the value minted for
+    /// THAT workspace is dropped, since it is the only one the request carried.
+    pub fn observe_status(
+        &self,
+        exec_id: Option<&str>,
+        workspace_id: i64,
+        m: &MatchCtx,
+        status: u16,
+    ) {
         if status != 401 && status != 403 {
             return;
         }
@@ -811,15 +877,17 @@ impl HookEngine {
         let now = Instant::now();
         let mut cache = self.inner.cache.lock();
         for id in stale {
+            let key: ValueKey = (id, workspace_id);
             let young = cache
-                .get(&id)
+                .get(&key)
                 .is_some_and(|c| now.duration_since(c.minted_at) < REMINT_COOLDOWN);
             if young {
                 continue;
             }
-            if cache.remove(&id).is_some() {
+            if cache.remove(&key).is_some() {
                 tracing::info!(
                     hook = id,
+                    workspace_id,
                     host = %m.host,
                     status,
                     "the target refused a request carrying this hook's value; \
@@ -830,7 +898,10 @@ impl HookEngine {
     }
 
     /// Drop cached values on request: `hook_ids` when non-empty, otherwise every
-    /// one. Returns the ids that actually had a value.
+    /// one — in EVERY workspace, since an operator asking for a fresh token
+    /// (`session auth refresh`, `hook cache clear`) means "this token", not "this
+    /// token in one workspace". Returns the hook ids that actually had a value
+    /// (in at least one workspace), sorted and de-duplicated.
     ///
     /// Unlike [`observe_status`](Self::observe_status) this ignores
     /// [`REMINT_COOLDOWN`]: an operator (or `session auth refresh`) asking for a
@@ -838,23 +909,25 @@ impl HookEngine {
     /// how a command ends up appearing not to work.
     pub fn invalidate(&self, hook_ids: &[i64]) -> Vec<i64> {
         let mut cache = self.inner.cache.lock();
-        let dropped: Vec<i64> = cache
-            .keys()
-            .copied()
-            .filter(|id| hook_ids.is_empty() || hook_ids.contains(id))
-            .collect();
-        for id in &dropped {
-            cache.remove(id);
-        }
+        let mut dropped: Vec<i64> = Vec::new();
+        cache.retain(|(id, _workspace), _| {
+            let drop = hook_ids.is_empty() || hook_ids.contains(id);
+            if drop {
+                dropped.push(*id);
+            }
+            !drop
+        });
+        dropped.sort_unstable();
+        dropped.dedup();
         dropped
     }
 
-    fn cached(&self, id: i64) -> Option<String> {
+    fn cached(&self, key: ValueKey) -> Option<String> {
         let mut cache = self.inner.cache.lock();
-        match cache.get(&id) {
+        match cache.get(&key) {
             Some(entry) if entry.expires_at > Instant::now() => Some(entry.value.clone()),
             Some(_) => {
-                cache.remove(&id);
+                cache.remove(&key);
                 None
             }
             None => None,
@@ -880,15 +953,15 @@ fn single_flight_wait(budget: Duration) -> Duration {
 struct RunGuard(Arc<Inner>);
 
 impl RunGuard {
-    /// Take the right for `hook_id`, or report WHICH hook already holds it (a
-    /// loser needs to know: only the value it is itself waiting for is worth
-    /// waiting for).
-    fn claim(inner: &Arc<Inner>, hook_id: i64) -> Result<Self, i64> {
+    /// Take the right for `key`, or report WHICH `(hook, workspace)` already
+    /// holds it (a loser needs to know: only the value it is itself waiting for
+    /// is worth waiting for).
+    fn claim(inner: &Arc<Inner>, key: ValueKey) -> Result<Self, ValueKey> {
         let mut running = inner.running.lock();
         match *running {
             Some(holder) => Err(holder),
             None => {
-                *running = Some(hook_id);
+                *running = Some(key);
                 Ok(Self(inner.clone()))
             }
         }
@@ -1225,6 +1298,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// The workspace the single-workspace tests run their flows in.
+    const WS: i64 = 1;
+
     fn msg() -> Message {
         Message {
             host: "api.example.com".into(),
@@ -1275,7 +1351,12 @@ mod tests {
 
     #[async_trait]
     impl HookRunner for CountingRunner {
-        async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+        async fn run(
+            &self,
+            _cmd: &str,
+            _workspace_id: i64,
+            _budget: Duration,
+        ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(self.output.clone())
@@ -1309,11 +1390,11 @@ mod tests {
         let mut m = msg();
         let before = m.clone();
         assert_eq!(
-            engine.pre_request(None, "GET", &mut m).await,
+            engine.pre_request(None, WS, "GET", &mut m).await,
             HookOutcome::default()
         );
         assert_eq!(
-            engine.post_response(None, "GET", 200, &mut m).await,
+            engine.post_response(None, WS, "GET", 200, &mut m).await,
             HookOutcome::default()
         );
         assert_eq!(m, before);
@@ -1325,7 +1406,7 @@ mod tests {
         let engine = HookEngine::new();
         engine.set_hooks(vec![hook(1, HookPhase::PreRequest, add_ua())]);
         let mut m = msg();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(out.changed && !out.dropped);
         let headers = String::from_utf8(m.headers.clone()).unwrap();
         assert!(headers.ends_with("User-Agent: burpwn/1\r\n"), "{headers}");
@@ -1334,7 +1415,7 @@ mod tests {
 
         // Idempotent: a second pass sees the header and leaves it alone (that is
         // what makes it "add", not "append forever" on a keep-alive connection).
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(!out.changed);
         assert_eq!(headers.matches("User-Agent").count(), 1);
     }
@@ -1368,7 +1449,7 @@ mod tests {
             ),
         ]);
         let mut m = msg();
-        assert!(engine.pre_request(None, "GET", &mut m).await.changed);
+        assert!(engine.pre_request(None, WS, "GET", &mut m).await.changed);
         let headers = String::from_utf8(m.headers).unwrap();
         assert!(!headers.contains("host:"), "{headers}");
         assert_eq!(headers.matches("Accept").count(), 1, "{headers}");
@@ -1413,7 +1494,7 @@ mod tests {
         engine.set_hooks(vec![first, second, disabled]);
 
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         let headers = String::from_utf8(m.headers).unwrap();
         assert!(headers.contains("X-Stage: two"), "{headers}");
         assert!(!headers.contains("three"), "disabled hook ran: {headers}");
@@ -1434,18 +1515,18 @@ mod tests {
 
         // Wrong method.
         let mut m = msg();
-        assert!(!engine.pre_request(None, "GET", &mut m).await.changed);
+        assert!(!engine.pre_request(None, WS, "GET", &mut m).await.changed);
         // Right method, right host, right path prefix.
         let mut m = msg();
-        assert!(engine.pre_request(None, "POST", &mut m).await.changed);
+        assert!(engine.pre_request(None, WS, "POST", &mut m).await.changed);
         // Wrong host.
         let mut m = msg();
         m.host = "other.test".into();
-        assert!(!engine.pre_request(None, "POST", &mut m).await.changed);
+        assert!(!engine.pre_request(None, WS, "POST", &mut m).await.changed);
         // Wrong path.
         let mut m = msg();
         m.url = "/v2/users".into();
-        assert!(!engine.pre_request(None, "POST", &mut m).await.changed);
+        assert!(!engine.pre_request(None, WS, "POST", &mut m).await.changed);
 
         // A status-scoped response hook only fires on that status.
         let engine = HookEngine::new();
@@ -1460,8 +1541,18 @@ mod tests {
         h.scope.status = Some(500);
         engine.set_hooks(vec![h]);
         let mut m = msg();
-        assert!(!engine.post_response(None, "GET", 200, &mut m).await.changed);
-        assert!(engine.post_response(None, "GET", 500, &mut m).await.changed);
+        assert!(
+            !engine
+                .post_response(None, WS, "GET", 200, &mut m)
+                .await
+                .changed
+        );
+        assert!(
+            engine
+                .post_response(None, WS, "GET", 500, &mut m)
+                .await
+                .changed
+        );
         // …and `should_stream` can see it coming, per status.
         assert!(engine.has_post_response_for(&MatchCtx {
             host: "api.example.com",
@@ -1485,7 +1576,7 @@ mod tests {
             hook(2, HookPhase::PreRequest, add_ua()),
         ]);
         let mut m = msg();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(out.dropped);
         assert!(
             !String::from_utf8_lossy(&m.headers).contains("User-Agent"),
@@ -1507,7 +1598,7 @@ mod tests {
         engine.set_hooks(vec![token_hook(1, 0)]);
 
         let mut m = msg();
-        assert!(engine.pre_request(None, "GET", &mut m).await.changed);
+        assert!(engine.pre_request(None, WS, "GET", &mut m).await.changed);
         let headers = String::from_utf8(m.headers).unwrap();
         assert!(
             headers.contains("Authorization: Bearer abc123"),
@@ -1523,7 +1614,12 @@ mod tests {
         struct Hang;
         #[async_trait]
         impl HookRunner for Hang {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 std::future::pending::<()>().await;
                 unreachable!()
             }
@@ -1536,7 +1632,7 @@ mod tests {
 
         let mut m = msg();
         let started = Instant::now();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(!out.changed && !out.dropped, "fail OPEN, never drop");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!String::from_utf8_lossy(&m.headers).contains("Authorization"));
@@ -1545,13 +1641,18 @@ mod tests {
         struct Boom;
         #[async_trait]
         impl HookRunner for Boom {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 Err(anyhow::anyhow!("no such command"))
             }
         }
         engine.set_runner(Arc::new(Boom));
         let mut m = msg();
-        assert!(!engine.pre_request(None, "GET", &mut m).await.changed);
+        assert!(!engine.pre_request(None, WS, "GET", &mut m).await.changed);
     }
 
     #[tokio::test]
@@ -1567,13 +1668,13 @@ mod tests {
 
         for _ in 0..3 {
             let mut m = msg();
-            assert!(engine.pre_request(None, "GET", &mut m).await.changed);
+            assert!(engine.pre_request(None, WS, "GET", &mut m).await.changed);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cached within the TTL");
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         let mut m = msg();
-        assert!(engine.pre_request(None, "GET", &mut m).await.changed);
+        assert!(engine.pre_request(None, WS, "GET", &mut m).await.changed);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "re-minted after the TTL");
     }
 
@@ -1597,7 +1698,7 @@ mod tests {
             let e = engine.clone();
             tasks.push(tokio::spawn(async move {
                 let mut m = msg();
-                let out = e.pre_request(None, "GET", &mut m).await;
+                let out = e.pre_request(None, WS, "GET", &mut m).await;
                 assert!(!out.dropped, "a busy hook never drops traffic");
                 (
                     out.changed,
@@ -1617,7 +1718,7 @@ mod tests {
 
         // The value is now cached: no further command, and the header lands.
         let mut m = msg();
-        assert!(engine.pre_request(None, "GET", &mut m).await.changed);
+        assert!(engine.pre_request(None, WS, "GET", &mut m).await.changed);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(String::from_utf8_lossy(&m.headers).contains("Bearer shared"));
     }
@@ -1630,7 +1731,12 @@ mod tests {
         struct SlowBoom(Arc<AtomicUsize>);
         #[async_trait]
         impl HookRunner for SlowBoom {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 Err(anyhow::anyhow!("the token endpoint is down"))
@@ -1647,7 +1753,7 @@ mod tests {
             let e = engine.clone();
             tasks.push(tokio::spawn(async move {
                 let mut m = msg();
-                e.pre_request(None, "GET", &mut m).await
+                e.pre_request(None, WS, "GET", &mut m).await
             }));
         }
         for t in tasks {
@@ -1680,14 +1786,19 @@ mod tests {
         }
         #[async_trait]
         impl HookRunner for ReEnter {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let engine = self.engine.lock().clone().unwrap();
                 let started = Instant::now();
                 let mut m = msg();
                 // No marker, and the SAME hook: this request is waiting for the
                 // command that is waiting for it.
-                let out = engine.pre_request(None, "GET", &mut m).await;
+                let out = engine.pre_request(None, WS, "GET", &mut m).await;
                 *self.nested_ms.lock() = started.elapsed().as_millis();
                 assert!(!out.changed, "the nested request cannot be hooked");
                 Ok(r#"{"token":"outer"}"#.to_string())
@@ -1710,7 +1821,7 @@ mod tests {
 
         let mut m = msg();
         let started = Instant::now();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         let elapsed = started.elapsed();
         assert!(
             out.changed,
@@ -1761,13 +1872,20 @@ mod tests {
         }
         #[async_trait]
         impl HookRunner for ReEnter {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let engine = self.engine.lock().clone().unwrap();
                 // The command's OWN request, as the proxy would present it:
                 // stamped with the hook exec-id marker.
                 let mut m = msg();
-                let out = engine.pre_request(Some("hook:abc123"), "GET", &mut m).await;
+                let out = engine
+                    .pre_request(Some("hook:abc123"), WS, "GET", &mut m)
+                    .await;
                 if out.changed {
                     self.inner_changed.fetch_add(1, Ordering::SeqCst);
                 }
@@ -1791,7 +1909,7 @@ mod tests {
         ]);
 
         let mut m = msg();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(out.changed);
         assert!(String::from_utf8_lossy(&m.headers).contains("Bearer deep"));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one command run");
@@ -1820,12 +1938,17 @@ mod tests {
         }
         #[async_trait]
         impl HookRunner for ReEnter {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let engine = self.engine.lock().clone().unwrap();
                 let mut m = msg();
                 // NO marker: this is the case the backstop exists for.
-                let out = engine.pre_request(None, "GET", &mut m).await;
+                let out = engine.pre_request(None, WS, "GET", &mut m).await;
                 assert!(!out.changed, "the nested request must not be hooked");
                 Ok(r#"{"token":"outer"}"#.to_string())
             }
@@ -1843,7 +1966,7 @@ mod tests {
 
         let mut m = msg();
         let started = Instant::now();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(out.changed, "the OUTER request still gets its token");
         assert!(
             started.elapsed() < Duration::from_millis(500),
@@ -1870,7 +1993,12 @@ mod tests {
         struct Rotating(Arc<AtomicUsize>);
         #[async_trait]
         impl HookRunner for Rotating {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> anyhow::Result<String> {
                 let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
                 Ok(format!(r#"{{"token":"t{n}"}}"#))
             }
@@ -1883,20 +2011,20 @@ mod tests {
         engine.set_hooks(vec![token_hook(1, 3_600_000)]);
 
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert!(String::from_utf8_lossy(&m.headers).contains("Bearer t1"));
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cached, as it should be");
 
         // The response comes back 401. (`minted_at` is backdated past the
         // cooldown: a value that has been in use IS what this is for, and the
         // test must not depend on wall-clock sleeps.)
         backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
-        engine.observe_status(None, &ctx_for("api.example.com"), 401);
+        engine.observe_status(None, WS, &ctx_for("api.example.com"), 401);
 
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "the 401 forced a re-mint");
         assert!(
             String::from_utf8_lossy(&m.headers).contains("Bearer t2"),
@@ -1920,9 +2048,9 @@ mod tests {
 
         for _ in 0..20 {
             let mut m = msg();
-            engine.pre_request(None, "GET", &mut m).await;
+            engine.pre_request(None, WS, "GET", &mut m).await;
             // Every single one of them comes back 401.
-            engine.observe_status(None, &ctx_for("api.example.com"), 401);
+            engine.observe_status(None, WS, &ctx_for("api.example.com"), 401);
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1932,9 +2060,9 @@ mod tests {
 
         // Once the value is old enough, the next 401 does invalidate it.
         backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
-        engine.observe_status(None, &ctx_for("api.example.com"), 401);
+        engine.observe_status(None, WS, &ctx_for("api.example.com"), 401);
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1957,18 +2085,19 @@ mod tests {
         engine.set_hooks(vec![h]);
 
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         backdate(&engine, 1, REMINT_COOLDOWN + Duration::from_secs(1));
 
-        engine.observe_status(None, &ctx_for("api.example.com"), 200);
-        engine.observe_status(None, &ctx_for("api.example.com"), 500);
-        engine.observe_status(None, &ctx_for("unrelated.test"), 401);
-        engine.observe_status(Some("hook:abc"), &ctx_for("api.example.com"), 401);
+        engine.observe_status(None, WS, &ctx_for("api.example.com"), 200);
+        engine.observe_status(None, WS, &ctx_for("api.example.com"), 500);
+        engine.observe_status(None, WS, &ctx_for("unrelated.test"), 401);
+        engine.observe_status(Some("hook:abc"), WS, &ctx_for("api.example.com"), 401);
         // A refusal of a request this hook does not inject into (it is scoped
         // to /v1/) says nothing about the value it holds.
         engine.observe_status(
             None,
+            WS,
             &MatchCtx {
                 host: "api.example.com",
                 method: "GET",
@@ -1978,7 +2107,7 @@ mod tests {
             401,
         );
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1986,9 +2115,9 @@ mod tests {
         );
 
         // …and the one that does apply, does.
-        engine.observe_status(None, &ctx_for("api.example.com"), 403);
+        engine.observe_status(None, WS, &ctx_for("api.example.com"), 403);
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1997,7 +2126,7 @@ mod tests {
     #[tokio::test]
     async fn observe_status_on_an_empty_engine_is_a_no_op() {
         let engine = HookEngine::new();
-        engine.observe_status(None, &ctx_for("api.example.com"), 401);
+        engine.observe_status(None, WS, &ctx_for("api.example.com"), 401);
         assert!(engine.invalidate(&[]).is_empty());
     }
 
@@ -2015,13 +2144,164 @@ mod tests {
         engine.set_hooks(vec![token_hook(1, 3_600_000), token_hook(2, 3_600_000)]);
 
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "both hooks minted");
 
         // Just minted — the cooldown would have refused, this must not.
         assert_eq!(engine.invalidate(&[1]), vec![1]);
         assert!(engine.invalidate(&[1]).is_empty(), "nothing left to drop");
         assert_eq!(engine.invalidate(&[]), vec![2], "empty = every hook");
+    }
+
+    // --- workspaces ---------------------------------------------------------
+
+    /// Records the workspace each command was run under, and mints a token that
+    /// names it, so a test can tell whose value ended up in which message.
+    struct WorkspaceRunner {
+        runs: Arc<Mutex<Vec<i64>>>,
+    }
+
+    #[async_trait]
+    impl HookRunner for WorkspaceRunner {
+        async fn run(
+            &self,
+            _cmd: &str,
+            workspace_id: i64,
+            _budget: Duration,
+        ) -> anyhow::Result<String> {
+            self.runs.lock().push(workspace_id);
+            Ok(format!(r#"{{"token":"ws{workspace_id}"}}"#))
+        }
+    }
+
+    fn workspace_engine(hooks: Vec<Hook>) -> (HookEngine, Arc<Mutex<Vec<i64>>>) {
+        let engine = HookEngine::new();
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        engine.set_runner(Arc::new(WorkspaceRunner { runs: runs.clone() }));
+        engine.set_hooks(hooks);
+        (engine, runs)
+    }
+
+    fn authorization(m: &Message) -> String {
+        String::from_utf8_lossy(&m.headers)
+            .lines()
+            .find(|l| l.starts_with("Authorization:"))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A hook fired by a flow in workspace 7 runs its command in workspace 7 —
+    /// on both HTTP phases — so the command's traffic is scope-checked and
+    /// recorded there, not in `default`.
+    #[tokio::test]
+    async fn an_exec_hook_runs_under_the_workspace_of_the_flow_that_fired_it() {
+        let mut post = token_hook(2, 0);
+        post.phase = HookPhase::PostResponse;
+        let (engine, runs) = workspace_engine(vec![token_hook(1, 0), post]);
+
+        let mut m = msg();
+        assert!(engine.pre_request(None, 7, "GET", &mut m).await.changed);
+        assert_eq!(authorization(&m), "Authorization: Bearer ws7");
+        let mut r = msg();
+        assert!(
+            engine
+                .post_response(None, 9, "GET", 200, &mut r)
+                .await
+                .changed
+        );
+        assert_eq!(authorization(&r), "Authorization: Bearer ws9");
+        assert_eq!(*runs.lock(), vec![7, 9]);
+    }
+
+    /// A value minted under one workspace is never injected into another's
+    /// traffic: each workspace mints (and then reuses) its own.
+    #[tokio::test]
+    async fn a_cached_value_is_never_reused_across_workspaces() {
+        let (engine, runs) = workspace_engine(vec![token_hook(1, 3_600_000)]);
+
+        for (ws, expected_runs) in [(1, 1), (1, 1), (2, 2), (2, 2), (1, 2)] {
+            let mut m = msg();
+            assert!(engine.pre_request(None, ws, "GET", &mut m).await.changed);
+            assert_eq!(authorization(&m), format!("Authorization: Bearer ws{ws}"));
+            assert_eq!(
+                runs.lock().len(),
+                expected_runs,
+                "after a request in ws {ws}"
+            );
+        }
+        assert_eq!(*runs.lock(), vec![1, 2]);
+    }
+
+    /// `session auth refresh` / `hook cache clear` drop a hook's value in EVERY
+    /// workspace, and report the hook once.
+    #[tokio::test]
+    async fn invalidate_clears_the_value_in_every_workspace() {
+        let (engine, runs) = workspace_engine(vec![token_hook(1, 3_600_000)]);
+        for ws in [1, 2, 3] {
+            engine.pre_request(None, ws, "GET", &mut msg()).await;
+        }
+        assert_eq!(runs.lock().len(), 3);
+
+        assert_eq!(
+            engine.invalidate(&[1]),
+            vec![1],
+            "reported once, not per workspace"
+        );
+        assert!(
+            engine.inner.cache.lock().is_empty(),
+            "every workspace cleared"
+        );
+        for ws in [1, 2, 3] {
+            engine.pre_request(None, ws, "GET", &mut msg()).await;
+        }
+        assert_eq!(*runs.lock(), vec![1, 2, 3, 1, 2, 3], "each re-minted");
+
+        assert_eq!(
+            engine.invalidate(&[]),
+            vec![1],
+            "empty = every hook, every workspace"
+        );
+        assert!(engine.inner.cache.lock().is_empty());
+    }
+
+    /// A `401` refuses the value the refused flow carried — its own workspace's —
+    /// and leaves the other workspaces' values alone.
+    #[tokio::test]
+    async fn a_401_drops_only_the_refused_workspaces_value() {
+        let (engine, runs) = workspace_engine(vec![token_hook(1, 3_600_000)]);
+        for ws in [1, 2] {
+            engine.pre_request(None, ws, "GET", &mut msg()).await;
+        }
+        for ws in [1, 2] {
+            if let Some(e) = engine.inner.cache.lock().get_mut(&(1, ws)) {
+                e.minted_at -= REMINT_COOLDOWN + Duration::from_secs(1);
+            }
+        }
+        engine.observe_status(None, 2, &ctx_for("api.example.com"), 401);
+        for ws in [1, 2] {
+            engine.pre_request(None, ws, "GET", &mut msg()).await;
+        }
+        assert_eq!(*runs.lock(), vec![1, 2, 2], "only workspace 2 re-minted");
+    }
+
+    /// A request waiting on the one-command claim only waits for its OWN
+    /// `(hook, workspace)` value: the same hook minting for another workspace
+    /// publishes nothing it may use, so it fails open instead of parking.
+    #[tokio::test]
+    async fn a_command_minting_for_another_workspace_is_not_waited_on() {
+        let (engine, _runs) = workspace_engine(vec![token_hook(1, 3_600_000)]);
+        let _held = RunGuard::claim(&engine.inner, (1, 2)).expect("claim is free");
+        let started = Instant::now();
+        let out = engine.pre_request(None, 1, "GET", &mut msg()).await;
+        assert!(
+            !out.changed,
+            "fails open rather than borrowing ws 2's value"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "did not park: {:?}",
+            started.elapsed()
+        );
     }
 
     /// The request context a response carries back to `observe_status`.
@@ -2038,7 +2318,7 @@ mod tests {
     /// exercised without sleeping through it.
     fn backdate(engine: &HookEngine, id: i64, by: Duration) {
         let mut cache = engine.inner.cache.lock();
-        if let Some(entry) = cache.get_mut(&id) {
+        if let Some(entry) = cache.get_mut(&(id, WS)) {
             entry.minted_at -= by;
         }
     }
@@ -2058,7 +2338,7 @@ mod tests {
         }));
         engine.set_hooks(vec![token_hook(1, 3_600_000)]);
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Same id, same everything except the command: a different login.
@@ -2068,7 +2348,7 @@ mod tests {
         }
         engine.set_hooks(vec![redefined]);
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -2078,7 +2358,7 @@ mod tests {
         // An UNCHANGED snapshot (the refresher re-reads every 2s) keeps it.
         engine.set_hooks(engine.snapshot().as_ref().clone());
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "re-reading is not editing");
     }
 
@@ -2093,14 +2373,14 @@ mod tests {
         }));
         engine.set_hooks(vec![token_hook(1, 60_000)]);
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // The hook is deleted and re-created under a new id: the old cached
         // token must not be reused for it.
         engine.set_hooks(vec![token_hook(2, 60_000)]);
         let mut m = msg();
-        engine.pre_request(None, "GET", &mut m).await;
+        engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -2311,7 +2591,7 @@ mod tests {
         engine.set_hooks(vec![hook(3, HookPhase::PreRequest, replace("api", "evil"))]);
         let mut m = msg();
         let before = m.clone();
-        let out = engine.pre_request(None, "GET", &mut m).await;
+        let out = engine.pre_request(None, WS, "GET", &mut m).await;
         assert_eq!(out, HookOutcome::default());
         assert_eq!(m, before);
     }

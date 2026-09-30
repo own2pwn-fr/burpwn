@@ -45,8 +45,11 @@ there through the DNS shim, or burpwn resolved it itself). So an IP-only allowli
 `https://intranet.corp` through when that name really resolves into the allowed range, while
 `Host: evil.com` sent to an allowed shared-CDN address evil.com never resolved to is refused.
 Name-to-IP links come from the DNS shim, which now remembers every A/AAAA answer it relays per
-workspace (in memory, 65536 entries; TTLs ignored, because a client keeps using an address long
-after its TTL). A denied name learned that way only counts against a connection that declares no
+workspace (in memory, 65536 entries). Each name-to-IP binding expires at max(answer TTL, 1 hour)
+after the last answer that carried it — the shortest TTL of a CNAME chain — and a fresh answer
+refreshes it: the one-hour floor covers clients (JVMs, browsers, connection pools) that keep using
+an address past its TTL, while a recycled cloud address stops being justified by a name that no
+longer points at it. A denied name learned that way only counts against a connection that declares no
 name of its own, so a denied tracker sharing a CDN address does not take allowed sites down with
 it. DNS questions are compared in their ASCII (punycode) form; with host rules in force a query
 without exactly one question, or with a label outside `[A-Za-z0-9-_]`, is refused. A port-qualified
@@ -55,7 +58,12 @@ deny (`evil.com:8443`) does not refuse the name, only that port.
 Repeater and Intruder are held to the same rules: `req replay` and `fuzz` check the replayed flow's
 workspace before sending, fail with `BW-NETWORK-003` and send nothing, and `fuzz` re-checks every
 rendered request since a payload can sit in the `Host` header. Hook `exec` commands are not exempt
-— they run under workspace `default` and follow its scope.
+— they run under the workspace of the flow that fired the hook and follow its scope, so a hook
+fired from `audit` cannot reach what `audit` refuses and its captured traffic is filed in `audit`.
+An `exec` hook's extracted value is cached per hook and per workspace (a token minted under one
+workspace is never injected into another's traffic); `session auth refresh` / a hook cache clear
+drop it in every workspace, and `hook test --flow` runs the command in the replayed flow's
+workspace.
 
 A refused flow is recorded, unlike a hook `drop`: `flows.blocked` (new column, schema v9, next to
 the new `scope_rules` table) holds the reason, `req list` prints `blocked` in the status column and

@@ -502,6 +502,11 @@ pub fn to_json(hook: &Hook) -> Value {
 /// it in the wire header of every connection the command makes, and the hook
 /// engine skips any flow that has it. Without that marker a hook that calls an
 /// API would trigger itself.
+///
+/// The run is also stamped with the workspace the engine hands it — the one
+/// of the flow that FIRED the hook — so the command's connections are checked
+/// against that workspace's network scope and its flows are filed there, not
+/// in `default`.
 pub struct SandboxHookRunner {
     paths: Paths,
     session: String,
@@ -543,7 +548,12 @@ impl SandboxHookRunner {
 
 #[async_trait]
 impl HookRunner for SandboxHookRunner {
-    async fn run(&self, cmd: &str, budget: Duration) -> Result<String, anyhow::Error> {
+    async fn run(
+        &self,
+        cmd: &str,
+        workspace_id: i64,
+        budget: Duration,
+    ) -> Result<String, anyhow::Error> {
         let runtime = self.runtime()?;
         let argv = vec!["sh".to_string(), "-c".to_string(), cmd.to_string()];
         // The marker. `run_exec_as` puts it in the wire header of every
@@ -558,7 +568,7 @@ impl HookRunner for SandboxHookRunner {
         let result = exec::run_exec_as(
             &self.paths,
             &self.session,
-            exec::DEFAULT_WORKSPACE_ID,
+            workspace_id,
             runtime,
             argv,
             Some(budget),
@@ -575,7 +585,8 @@ impl HookRunner for SandboxHookRunner {
 
 /// Replay one hook against one CAPTURED flow and report what it would do: no
 /// live traffic, no target touched. For an `exec` hook the command DOES run
-/// (that is the half an operator most needs to see), through `runner`.
+/// (that is the half an operator most needs to see), through `runner`, under
+/// the replayed flow's workspace — exactly where the live proxy would run it.
 pub async fn test_hook(
     hook: &Hook,
     detail: &FlowDetail,
@@ -683,7 +694,12 @@ pub async fn test_hook(
                 // Report the command's outcome rather than swallowing it the way
                 // the proxy does: on the hot path a broken hook must fail open
                 // and get out of the way; here, the failure IS the answer.
-                match tokio::time::timeout(budget, runner.run(cmd, budget)).await {
+                match tokio::time::timeout(
+                    budget,
+                    runner.run(cmd, detail.flow.workspace_id, budget),
+                )
+                .await
+                {
                     Ok(Ok(stdout)) => match hooks::extract_value(extract, &stdout) {
                         Some(value) => {
                             changed = hooks::apply_inject(inject, &value, &mut msg);
@@ -1102,7 +1118,12 @@ mod tests {
         struct Fake;
         #[async_trait]
         impl HookRunner for Fake {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> Result<String, anyhow::Error> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> Result<String, anyhow::Error> {
                 Ok(r#"{"token":"abcdefghijklmnop"}"#.to_string())
             }
         }
@@ -1128,7 +1149,12 @@ mod tests {
         struct Boom;
         #[async_trait]
         impl HookRunner for Boom {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> Result<String, anyhow::Error> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> Result<String, anyhow::Error> {
                 Err(anyhow::anyhow!("command not found"))
             }
         }
@@ -1140,6 +1166,68 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("command not found"));
+    }
+
+    /// Records the workspace the command was handed.
+    struct WorkspaceProbe(std::sync::Mutex<Vec<i64>>);
+
+    #[async_trait]
+    impl HookRunner for WorkspaceProbe {
+        async fn run(
+            &self,
+            _cmd: &str,
+            workspace_id: i64,
+            _budget: Duration,
+        ) -> Result<String, anyhow::Error> {
+            self.0.lock().unwrap().push(workspace_id);
+            Ok(r#"{"token":"abcdefghijklmnop"}"#.to_string())
+        }
+    }
+
+    /// `hook test --flow <id>` runs the command where the live proxy would: in
+    /// the replayed flow's workspace, not in `default`.
+    #[tokio::test]
+    async fn test_hook_runs_the_command_in_the_replayed_flows_workspace() {
+        let mut s = spec("exec");
+        s.cmd = Some("mint".into());
+        s.extract = Some(r#""token":"([^"]+)""#.into());
+        s.inject_header = Some("Authorization: Bearer {}".into());
+        let hook = stored(build_hook(&s).unwrap());
+        let mut d = detail(Some(200));
+        d.flow.workspace_id = 5;
+        let probe = WorkspaceProbe(std::sync::Mutex::new(Vec::new()));
+        let out = test_hook(&hook, &d, Some(&probe)).await.unwrap();
+        assert_eq!(out["exec"]["ok"], json!(true));
+        assert_eq!(*probe.0.lock().unwrap(), vec![5]);
+    }
+
+    /// The sandbox runner puts the workspace it is handed into the exec spec —
+    /// which is what the front-end writes into the wire header, and therefore
+    /// what the proxy scope-checks and files the command's flows under — next
+    /// to the `hook:` marker that keeps that traffic from being hooked again.
+    #[tokio::test]
+    async fn the_sandbox_runner_stamps_the_triggering_workspace_into_the_spec() {
+        use burpwn_sandbox::{ExecOutcome, MockRuntime};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_base(dir.path());
+        paths.ensure_session_dir("default").unwrap();
+        let rt = MockRuntime::new();
+        rt.set_canned(ExecOutcome {
+            exit_code: 0,
+            stdout: b"minted".to_vec(),
+            stderr: Vec::new(),
+        });
+        let runner = SandboxHookRunner::new(paths, "default").with_runtime(rt.clone());
+
+        let out = runner.run("mint", 3, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(out, "minted");
+        let spec = rt.last_spec().unwrap();
+        assert_eq!(spec.workspace_id, 3, "the triggering flow's workspace");
+        assert!(
+            hooks::is_hook_traffic(Some(&spec.exec_id)),
+            "the loop-guard marker is kept: {}",
+            spec.exec_id
+        );
     }
 
     #[tokio::test]
