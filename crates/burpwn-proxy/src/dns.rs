@@ -35,9 +35,10 @@
 //! set `DO` and validates will refuse it, correctly. Both are properties of
 //! answering rather than resolving, and neither can be fixed by trying harder.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -328,40 +329,80 @@ fn scope_name(name: &Name) -> Option<String> {
     Some(out)
 }
 
-/// Feed the scope's name cache from a DNS response: every A/AAAA address in
-/// the answer section maps to the question name AND every name of the answer's
-/// CNAME chain (the owner names and CNAME targets).
+/// Longest CNAME chain followed when binding names to an address. Resolvers
+/// cap chains at a similar depth; the bound also makes a CNAME loop harmless.
+const MAX_CNAME_CHAIN: usize = 16;
+
+/// Feed the scope's name cache from a DNS response.
+///
+/// Every A/AAAA address in the answer section is bound to its owner name and
+/// to every name of the CNAME chain that leads to it from the question (the
+/// question name, the intermediate owners and targets), with the chain's
+/// MINIMUM TTL — the answer is only as fresh as its shortest-lived link. An
+/// address whose owner no question reaches is bound to its owner alone. The
+/// cache floors the TTL and handles expiry (see
+/// [`crate::scope::DNS_BINDING_FLOOR`]).
 fn learn_names(scope: &ScopeEngine, workspace_id: i64, answer: &[u8]) {
+    learn_names_at(scope, workspace_id, answer, Instant::now());
+}
+
+/// [`learn_names`] at an explicit `now` (the bindings' expiry is relative to it).
+fn learn_names_at(scope: &ScopeEngine, workspace_id: i64, answer: &[u8], now: Instant) {
     let Ok(msg) = Message::from_vec(answer) else {
         return;
     };
     if msg.response_code() != ResponseCode::NoError {
         return;
     }
-    // ASCII (punycode) form, like the scope checks; a name that is not a plain
-    // host name can never match a rule and is not learned.
-    let mut names: Vec<String> = msg
-        .queries()
-        .iter()
-        .filter_map(|q| scope_name(q.name()))
-        .collect();
-    let mut ips: Vec<IpAddr> = Vec::new();
+    // ASCII (punycode) form, lowercased, like the scope checks; a name that is
+    // not a plain host name can never match a rule and is not learned (nor
+    // followed: a chain through it binds only what precedes it).
+    let key = |n: &Name| scope_name(n).map(|s| s.to_ascii_lowercase());
+    let questions: Vec<String> = msg.queries().iter().filter_map(|q| key(q.name())).collect();
+    let mut cnames: HashMap<String, (String, u32)> = HashMap::new();
+    let mut addrs: Vec<(String, IpAddr, u32)> = Vec::new();
     for rec in msg.answers() {
-        names.extend(scope_name(rec.name()));
+        let Some(owner) = key(rec.name()) else {
+            continue;
+        };
         match rec.data() {
-            RData::A(a) => ips.push(IpAddr::V4(a.0)),
-            RData::AAAA(a) => ips.push(IpAddr::V6(a.0)),
-            RData::CNAME(c) => names.extend(scope_name(&c.0)),
+            RData::A(a) => addrs.push((owner, IpAddr::V4(a.0), rec.ttl())),
+            RData::AAAA(a) => addrs.push((owner, IpAddr::V6(a.0), rec.ttl())),
+            RData::CNAME(c) => {
+                if let Some(target) = key(&c.0) {
+                    cnames.insert(owner, (target, rec.ttl()));
+                }
+            }
             _ => {}
         }
     }
-    if ips.is_empty() {
-        return;
-    }
-    names.sort();
-    names.dedup();
-    for ip in ips {
-        scope.cache().record(workspace_id, ip, &names);
+    for (owner, ip, ttl) in addrs {
+        let mut names = vec![owner.clone()];
+        let mut chain_ttl = ttl;
+        for q in &questions {
+            // Walk the chain from this question; it binds only if it ends on
+            // this address's owner.
+            let (mut at, mut path, mut min) = (q.clone(), vec![q.clone()], u32::MAX);
+            let mut steps = 0;
+            while at != owner && steps < MAX_CNAME_CHAIN {
+                let Some((target, t)) = cnames.get(&at) else {
+                    break;
+                };
+                min = min.min(*t);
+                at = target.clone();
+                path.push(at.clone());
+                steps += 1;
+            }
+            if at == owner {
+                chain_ttl = chain_ttl.min(min);
+                names.extend(path);
+            }
+        }
+        names.sort();
+        names.dedup();
+        scope
+            .cache()
+            .record_at(workspace_id, ip, &names, chain_ttl, now);
     }
 }
 
@@ -803,6 +844,74 @@ mod tests {
             scope.cache().names(4, "10.0.0.9".parse().unwrap()),
             vec!["forced.toto.fr".to_string()]
         );
+    }
+
+    /// A response for `www.toto.fr` whose chain is
+    /// `www.toto.fr CNAME edge.cdn.net (cname_ttl)` -> `edge.cdn.net A 9.9.9.9
+    /// (a_ttl)`, plus an unrelated CNAME that leads to no address.
+    fn chained_answer(cname_ttl: u32, a_ttl: u32) -> Vec<u8> {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut msg = Message::new();
+        msg.set_id(1)
+            .set_message_type(MessageType::Response)
+            .set_response_code(ResponseCode::NoError);
+        let mut q = Query::new();
+        q.set_name(Name::from_str("www.toto.fr.").unwrap())
+            .set_query_type(RecordType::A);
+        msg.add_query(q);
+        msg.add_answer(Record::from_rdata(
+            Name::from_str("www.toto.fr.").unwrap(),
+            cname_ttl,
+            RData::CNAME(CNAME(Name::from_str("edge.cdn.net.").unwrap())),
+        ));
+        msg.add_answer(Record::from_rdata(
+            Name::from_str("stray.example.").unwrap(),
+            cname_ttl,
+            RData::CNAME(CNAME(Name::from_str("elsewhere.example.").unwrap())),
+        ));
+        msg.add_answer(Record::from_rdata(
+            Name::from_str("edge.cdn.net.").unwrap(),
+            a_ttl,
+            RData::A("9.9.9.9".parse::<Ipv4Addr>().unwrap().into()),
+        ));
+        msg.to_vec().unwrap()
+    }
+
+    /// The address of a CNAME chain is bound for the chain's MINIMUM TTL (when
+    /// above the floor), to every name on the chain and to nothing off it.
+    #[test]
+    fn a_cname_chain_binds_for_its_minimum_ttl() {
+        let floor = crate::scope::DNS_BINDING_FLOOR.as_secs();
+        let (short, long) = (floor as u32 * 2, floor as u32 * 5);
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        for (cname_ttl, a_ttl) in [(short, long), (long, short)] {
+            let scope = ScopeEngine::new();
+            let t0 = Instant::now();
+            learn_names_at(&scope, 4, &chained_answer(cname_ttl, a_ttl), t0);
+            let at = |s: u64| scope.cache().names_at(4, ip, t0 + Duration::from_secs(s));
+            assert_eq!(
+                at(u64::from(short) - 1),
+                vec!["edge.cdn.net".to_string(), "www.toto.fr".to_string()],
+                "the chain's names only (cname {cname_ttl}, a {a_ttl})"
+            );
+            assert!(
+                at(u64::from(short)).is_empty(),
+                "expired at the chain's minimum TTL (cname {cname_ttl}, a {a_ttl})"
+            );
+        }
+    }
+
+    /// A chain whose minimum TTL is under the floor lives for the floor.
+    #[test]
+    fn a_short_ttl_chain_is_floored() {
+        let floor = crate::scope::DNS_BINDING_FLOOR;
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let scope = ScopeEngine::new();
+        let t0 = Instant::now();
+        learn_names_at(&scope, 4, &chained_answer(30, 300), t0);
+        let second = Duration::from_secs(1);
+        assert_eq!(scope.cache().names_at(4, ip, t0 + floor - second).len(), 2);
+        assert!(scope.cache().names_at(4, ip, t0 + floor).is_empty());
     }
 
     fn scope_with(pats: &[(crate::scope::Pattern, burpwn_store::model::ScopeKind)]) -> ScopeEngine {

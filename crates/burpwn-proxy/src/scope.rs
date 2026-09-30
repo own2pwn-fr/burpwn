@@ -54,8 +54,9 @@
 //! Every connection is evaluated for the workspace stamped in its wire header
 //! (`PassedConn::workspace_id`); the explicit-proxy front-end uses the proxy's
 //! configured workspace (1, `default`). A hook `exec` command runs in the
-//! sandbox under workspace 1 (`default`) whatever flow triggered it, so its own
-//! traffic is held to the global rules plus `default`'s — it is NOT exempt.
+//! sandbox under the workspace of the flow that TRIGGERED it, so its own
+//! traffic is held to the global rules plus that workspace's — it is NOT
+//! exempt, and a hook fired from `audit` cannot reach what `audit` refuses.
 //!
 //! # Matching is strict
 //!
@@ -68,6 +69,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -779,25 +781,52 @@ pub const DNS_CACHE_CAP: usize = 65_536;
 /// Names kept per IP (a shared CDN address can front thousands of names).
 const NAMES_PER_IP: usize = 32;
 
-/// `(workspace, IP) -> names` learned from DNS answers the shim relayed.
+/// The shortest life a name -> IP binding gets, whatever TTL the answer carried:
+/// a binding expires at `now + max(TTL, DNS_BINDING_FLOOR)`.
 ///
-/// Policy: in-memory, for the daemon's lifetime, bounded to [`DNS_CACHE_CAP`]
-/// entries with the least-recently-UPDATED entry evicted first. Record TTLs are
-/// deliberately ignored: a client keeps using an address well past its TTL (its
-/// own cache, a pooled connection), and forgetting the name at TTL expiry would
-/// block that still-legitimate connection as "not justified". The cost is that
-/// a name keeps justifying an IP it once resolved to for the rest of the
-/// session, which can only widen an ALLOW to an address that name really
-/// pointed at — never an unrelated one.
+/// The record TTL alone is too short to trust for a check that runs at CONNECT
+/// time: clients keep using an address well past it — JVMs cache lookups by
+/// policy (often for the process lifetime), browsers and HTTP clients pin a
+/// resolved address to a connection pool, and a CDN answer routinely carries a
+/// 20-60 s TTL. A binding that lapsed at the TTL would refuse those
+/// still-legitimate connections as "not justified". An hour covers that
+/// reuse while still letting a recycled cloud address (released, then handed
+/// to someone else) stop being justified by a name that no longer points at it
+/// — which is what keeping bindings for the daemon's whole lifetime got wrong.
+pub const DNS_BINDING_FLOOR: Duration = Duration::from_secs(3_600);
+
+/// `(workspace, IP) -> names` learned from DNS answers the shim relayed, each
+/// binding with its own expiry.
+///
+/// Policy: in-memory, bounded to [`DNS_CACHE_CAP`] entries with the
+/// least-recently-UPDATED entry evicted first, and at most [`NAMES_PER_IP`]
+/// names per entry. Every `(workspace, IP, name)` binding expires at
+/// `now + max(answer TTL, DNS_BINDING_FLOOR)` (see [`DNS_BINDING_FLOOR`] for
+/// why the TTL is floored); a new answer for the same binding refreshes it, and
+/// never shortens it — an earlier answer's longer TTL was a promise clients may
+/// still be acting on. An expired binding justifies nothing: lookups ignore it
+/// and prune it lazily (as does the next update of its entry), so there is no
+/// background sweeper.
+///
+/// Within that life, a name keeps justifying an IP it resolved to, which can
+/// only widen an ALLOW to an address that name really pointed at — never an
+/// unrelated one.
+///
+/// Every method has an `_at` twin taking `now` explicitly, so expiry is tested
+/// deterministically; the plain methods use [`Instant::now`].
 #[derive(Debug)]
 pub struct DnsCache {
     inner: Mutex<CacheInner>,
     cap: usize,
 }
 
+/// One entry: the tick of its last update (for LRU eviction) and its bindings,
+/// least recently refreshed first.
+type CacheEntry = (u64, Vec<(String, Instant)>);
+
 #[derive(Debug, Default)]
 struct CacheInner {
-    map: HashMap<(i64, IpAddr), (u64, Vec<String>)>,
+    map: HashMap<(i64, IpAddr), CacheEntry>,
     order: VecDeque<((i64, IpAddr), u64)>,
     tick: u64,
 }
@@ -817,26 +846,36 @@ impl DnsCache {
         }
     }
 
-    /// Record that every name in `names` resolved to `ip` in workspace `ws`.
-    pub fn record(&self, ws: i64, ip: IpAddr, names: &[String]) {
+    /// Record that every name in `names` resolved to `ip` in workspace `ws`,
+    /// in an answer valid for `ttl_secs` (for a CNAME chain, the minimum TTL
+    /// along it).
+    pub fn record(&self, ws: i64, ip: IpAddr, names: &[String], ttl_secs: u32) {
+        self.record_at(ws, ip, names, ttl_secs, Instant::now());
+    }
+
+    /// [`record`](Self::record) at an explicit `now`.
+    pub fn record_at(&self, ws: i64, ip: IpAddr, names: &[String], ttl_secs: u32, now: Instant) {
         if names.is_empty() {
             return;
         }
+        let expires = now + DNS_BINDING_FLOOR.max(Duration::from_secs(u64::from(ttl_secs)));
         let key = (ws, canonical_ip(ip));
         let mut g = self.inner.lock();
         g.tick += 1;
         let tick = g.tick;
         let entry = g.map.entry(key).or_insert_with(|| (tick, Vec::new()));
         entry.0 = tick;
+        entry.1.retain(|(_, exp)| *exp > now);
         for n in names {
             let n = normalize_name(n);
             if n.is_empty() {
                 continue;
             }
-            if let Some(pos) = entry.1.iter().position(|x| *x == n) {
-                entry.1.remove(pos);
+            let mut exp = expires;
+            if let Some(pos) = entry.1.iter().position(|(x, _)| *x == n) {
+                exp = exp.max(entry.1.remove(pos).1);
             }
-            entry.1.push(n);
+            entry.1.push((n, exp));
         }
         if entry.1.len() > NAMES_PER_IP {
             let excess = entry.1.len() - NAMES_PER_IP;
@@ -860,17 +899,29 @@ impl DnsCache {
         }
     }
 
-    /// Names seen resolving to `ip` in workspace `ws`.
+    /// Names whose binding to `ip` in workspace `ws` has not expired.
     pub fn names(&self, ws: i64, ip: IpAddr) -> Vec<String> {
-        self.inner
-            .lock()
-            .map
-            .get(&(ws, canonical_ip(ip)))
-            .map(|(_, n)| n.clone())
-            .unwrap_or_default()
+        self.names_at(ws, ip, Instant::now())
     }
 
-    /// Number of `(workspace, IP)` entries.
+    /// [`names`](Self::names) at an explicit `now`. Expired bindings are pruned
+    /// on the way (and an entry left with none is dropped).
+    pub fn names_at(&self, ws: i64, ip: IpAddr, now: Instant) -> Vec<String> {
+        let key = (ws, canonical_ip(ip));
+        let mut g = self.inner.lock();
+        let Some(entry) = g.map.get_mut(&key) else {
+            return Vec::new();
+        };
+        entry.1.retain(|(_, exp)| *exp > now);
+        if entry.1.is_empty() {
+            g.map.remove(&key);
+            return Vec::new();
+        }
+        entry.1.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// Number of `(workspace, IP)` entries (expired ones included until they
+    /// are pruned).
     pub fn len(&self) -> usize {
         self.inner.lock().map.len()
     }
@@ -1514,18 +1565,111 @@ mod tests {
     #[test]
     fn dns_cache_is_per_workspace_bounded_and_normalized() {
         let c = DnsCache::with_capacity(2);
-        c.record(1, ip("1.1.1.1"), &["A.example.".into(), "b.example".into()]);
+        c.record(
+            1,
+            ip("1.1.1.1"),
+            &["A.example.".into(), "b.example".into()],
+            60,
+        );
         assert_eq!(c.names(1, ip("1.1.1.1")), vec!["a.example", "b.example"]);
         assert!(c.names(2, ip("1.1.1.1")).is_empty(), "per workspace");
-        c.record(1, ip("2.2.2.2"), &["c.example".into()]);
+        c.record(1, ip("2.2.2.2"), &["c.example".into()], 60);
         // Touch 1.1.1.1 so 2.2.2.2 is now the least recently updated.
-        c.record(1, ip("1.1.1.1"), &["a.example".into()]);
-        c.record(1, ip("3.3.3.3"), &["d.example".into()]);
+        c.record(1, ip("1.1.1.1"), &["a.example".into()], 60);
+        c.record(1, ip("3.3.3.3"), &["d.example".into()], 60);
         assert_eq!(c.len(), 2);
         assert!(c.names(1, ip("2.2.2.2")).is_empty(), "evicted");
         assert_eq!(c.names(1, ip("1.1.1.1")), vec!["b.example", "a.example"]);
         // v4-mapped lookups hit the v4 entry.
         assert!(!c.names(1, ip("::ffff:3.3.3.3")).is_empty());
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// A binding from a short-TTL answer lives for the floor, and not a second
+    /// more: after that the name justifies nothing, and the entry is pruned.
+    #[test]
+    fn dns_binding_is_valid_until_the_floor_then_ignored_and_pruned() {
+        let c = DnsCache::default();
+        let t0 = Instant::now();
+        c.record_at(1, ip("1.1.1.1"), &["a.example".into()], 60, t0);
+        let floor = DNS_BINDING_FLOOR;
+        assert_eq!(
+            c.names_at(1, ip("1.1.1.1"), t0 + secs(61)),
+            vec!["a.example"]
+        );
+        assert_eq!(
+            c.names_at(1, ip("1.1.1.1"), t0 + floor - secs(1)),
+            vec!["a.example"],
+            "the TTL is floored"
+        );
+        assert!(
+            c.names_at(1, ip("1.1.1.1"), t0 + floor).is_empty(),
+            "expired"
+        );
+        assert!(
+            c.is_empty(),
+            "an entry with no live binding is pruned on lookup"
+        );
+    }
+
+    /// A TTL longer than the floor is honored as is.
+    #[test]
+    fn dns_binding_ttl_above_the_floor_is_honored() {
+        let c = DnsCache::default();
+        let t0 = Instant::now();
+        let ttl = DNS_BINDING_FLOOR.as_secs() * 3;
+        c.record_at(1, ip("1.1.1.1"), &["a.example".into()], ttl as u32, t0);
+        assert_eq!(
+            c.names_at(1, ip("1.1.1.1"), t0 + secs(ttl - 1)),
+            vec!["a.example"]
+        );
+        assert!(c.names_at(1, ip("1.1.1.1"), t0 + secs(ttl)).is_empty());
+    }
+
+    /// Each new answer refreshes its binding (and only its own); a later answer
+    /// with a shorter TTL never cuts an earlier, longer promise short. An update
+    /// of the entry prunes its expired bindings.
+    #[test]
+    fn dns_binding_refresh_extends_and_never_shortens() {
+        let c = DnsCache::default();
+        let t0 = Instant::now();
+        let floor = DNS_BINDING_FLOOR;
+        c.record_at(
+            1,
+            ip("1.1.1.1"),
+            &["a.example".into(), "b.example".into()],
+            60,
+            t0,
+        );
+        // Refresh `a` only, half-way through its life.
+        c.record_at(1, ip("1.1.1.1"), &["a.example".into()], 60, t0 + floor / 2);
+        assert_eq!(
+            c.names_at(1, ip("1.1.1.1"), t0 + floor + secs(1)),
+            vec!["a.example"],
+            "a refreshed, b expired"
+        );
+
+        let long = floor.as_secs() * 4;
+        c.record_at(2, ip("2.2.2.2"), &["c.example".into()], long as u32, t0);
+        c.record_at(2, ip("2.2.2.2"), &["c.example".into()], 60, t0 + secs(10));
+        assert_eq!(
+            c.names_at(2, ip("2.2.2.2"), t0 + secs(long - 1)),
+            vec!["c.example"],
+            "the shorter later answer did not shorten the binding"
+        );
+
+        // An update after `a` expired drops it rather than keep dead weight.
+        c.record_at(1, ip("1.1.1.1"), &["d.example".into()], 60, t0 + floor * 3);
+        let g = c.inner.lock();
+        let names: Vec<&str> = g.map[&(1, ip("1.1.1.1"))]
+            .1
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, vec!["d.example"]);
     }
 
     #[test]
@@ -1536,7 +1680,7 @@ mod tests {
         e.set_rules(RuleSet::new(vec![allow(1, None, "toto.fr")]));
         assert!(e.is_active());
         assert!(!e.check_conn(WS, Some(ip("1.1.1.1")), 80, &[], None).allowed);
-        e.cache().record(WS, ip("1.1.1.1"), &["toto.fr".into()]);
+        e.cache().record(WS, ip("1.1.1.1"), &["toto.fr".into()], 60);
         assert!(
             e.check_conn(WS, Some(ip("1.1.1.1")), 80, &[name("toto.fr")], None)
                 .allowed

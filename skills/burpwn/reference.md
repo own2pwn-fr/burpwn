@@ -273,10 +273,14 @@ inject what it prints.
     is captured — and never re-hooked), `--extract <REGEX>` (exactly one capture
     group), and one of `--inject-header 'Name: prefix {}'` /
     `--inject-param name={}` (`{}` is where the extracted value goes).
-    `--inject-if-absent` makes a header injection add-only.
+    `--inject-if-absent` makes a header injection add-only. The command runs
+    under the WORKSPACE of the flow that fired the hook: its traffic is held to
+    that workspace's scope and its flows are recorded there.
   - `--ttl <MS>` (default 300000) reuses the extracted value instead of running
     the command again; `--ttl 0` runs it on every matching request — one sandbox
-    per request. `--timeout <MS>` (default 10000) is a hard budget; on expiry the
+    per request. The value is cached per hook AND per workspace: a token minted
+    for one workspace is never injected into another's traffic (each mints its
+    own). `--timeout <MS>` (default 10000) is a hard budget; on expiry the
     hook FAILS OPEN and the traffic goes through un-hooked.
   - `--order <N>` orders hooks within a phase; `--disabled` creates it off.
 - `burpwn hook list [--json]` — in application order.
@@ -284,8 +288,9 @@ inject what it prints.
 - `burpwn hook enable <ID>` / `burpwn hook disable <ID>` / `burpwn hook rm <ID>`
 - `burpwn hook test <ID> --flow <FLOW_ID> [--json]` — replay the hook against a
   CAPTURED flow and report `matched` / `changed` / `dropped` plus the before and
-  after. No live traffic. For an `exec` hook the command really runs, so this is
-  also how you check the extraction regex still matches. HTTP phases only: a
+  after. No live traffic. For an `exec` hook the command really runs (in the
+  replayed flow's workspace), so this is also how you check the extraction regex
+  still matches. HTTP phases only: a
   `ws-*`/`dns-query` hook has no captured request to replay against and is
   refused rather than guessed at — watch it live (`req list --protocol ws|dns`).
 
@@ -402,9 +407,14 @@ saw it resolve there, or burpwn resolved it itself). So an IP-only allowlist
 `10/8`, and `Host: evil.com` sent to an allowed (shared-CDN) IP that `evil.com`
 never resolved to is refused: the upstream socket goes where the IP says, never
 where the header says. The name→IP cache is
-in-memory, per workspace, for the daemon's lifetime (65536 entries, oldest
-evicted, up to 32 names per IP); record TTLs are ignored, so a name keeps
-justifying an address it once resolved to.
+in-memory, per workspace (65536 entries, oldest evicted, up to 32 names per IP).
+Each name→IP binding expires at max(answer TTL, 1 hour) after the last answer
+that carried it (a CNAME chain counts its SHORTEST TTL); a new answer refreshes
+it and never shortens it. The 1-hour floor is deliberate: clients (JVMs,
+browsers, connection pools) keep using an address past its TTL, and the check
+only happens at connect time. After expiry the name no longer justifies the
+address — a recycled cloud IP stops being allowed — until it resolves there
+again.
 
 A DNS query is checked against HOST rules only, in its ASCII (punycode) form: a
 matching port-less deny rule, or host allow rules none of which matches (their
@@ -442,8 +452,9 @@ Caveats:
   a rule that stops parsing at runtime keeps the previous set (WARN).
   `export session` carries the rules.
 - Traffic is evaluated for the workspace of its `exec`. A hook `exec` command
-  runs under workspace `default` whatever flow triggered it, and is held to the
-  global rules plus `default`'s — it is not exempt, so allow its login endpoint.
+  runs under the workspace of the flow that TRIGGERED it, and is held to the
+  global rules plus that workspace's — it is not exempt, so allow its login
+  endpoint in every workspace whose traffic fires the hook.
 - `req replay` may resolve the flow's host on the host machine to confirm it
   still points at the recorded address, and only for a name the scope would let
   resolve. A flow blocked before burpwn resolved it (explicit proxy, recorded
@@ -478,7 +489,7 @@ unscoped); `hook list` / `hook show` / `hook test` / `hook rm` all work on it.
   hook id, host scope, injected header, login command, TTL. There is no token
   field: the token is minted on demand and held only in the running daemon.
 - `burpwn session auth refresh [--host <HOST>] [--session <SESSION>] [--json]` —
-  drop the cached token so the NEXT request through the proxy runs the login
+  drop the cached token (in every workspace) so the NEXT request through the proxy runs the login
   command again. Rarely needed: a 401/403 already drops it (a value minted less
   than 30 s ago is kept, so a target that refuses everything cannot turn into one
   sandbox per request). With no daemon running there is nothing cached and it
