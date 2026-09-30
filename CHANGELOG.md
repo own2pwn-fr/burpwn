@@ -28,13 +28,17 @@ read as "everything". The rules a flow is held to are the global ones plus its w
 deny rule always wins, and the first allow rule turns the scope into an allowlist.
 
 It is enforced **before any upstream contact** — the invariant is that an out-of-scope destination
-receives no packet at all, not even a DNS query or a SYN. So each protocol is refused at the first
-point burpwn knows enough to decide, and never later: cleartext HTTP is answered locally with a
+receives no SYN, and no name a host rule already refuses is looked up. So each protocol is refused
+at the first point burpwn knows enough to decide, and never later: cleartext HTTP is answered locally with a
 `403` (`burpwn: blocked by scope (<reason>)`, `burpwn-error: BW-NETWORK-003`) before the upstream
 socket is dialed, and again on what will actually leave after match/replace, hooks and intercept
 edits; TLS is decided on the ClientHello's SNI before MITM or passthrough and gets an
 `access_denied` alert; raw TCP is closed; DNS is answered `REFUSED`. An explicit-proxy name the
-scope refuses is not even looked up.
+scope refuses is not even looked up. What the shim cannot decide, it does not block: an allowlist
+made only of IP/CIDR rules has no name to match a question against, so the lookup goes out and the
+refusal lands on the address the answer carried — a destination still receives no SYN, but its
+authoritative nameserver does see the query. Put a host rule in the allowlist if a name must not
+leak at all.
 
 The allow check trusts the destination, not the declarations. The upstream socket goes where the
 IP says whatever the `Host` header claims, so a connection must be *justified* — its IP matches an
@@ -44,8 +48,12 @@ host rule, or the address is allowed by an IP/CIDR rule and the name is *bound* 
 there through the DNS shim, or burpwn resolved it itself). So an IP-only allowlist lets
 `https://intranet.corp` through when that name really resolves into the allowed range, while
 `Host: evil.com` sent to an allowed shared-CDN address evil.com never resolved to is refused.
-Name-to-IP links come from the DNS shim, which now remembers every A/AAAA answer it relays per
-workspace (in memory, 65536 entries). Each name-to-IP binding expires at max(answer TTL, 1 hour)
+Name-to-IP links come from the DNS shim, which now remembers every A/AAAA answer an upstream
+resolution brought back, per workspace (in memory, 65536 entries). Only those: an answer burpwn
+fabricated — a `dns-query` hook's `set-answer`, the scope's own `REFUSED` — says where the hook
+wants the client to go, not where the name points, so it justifies no destination. Otherwise a hook
+could bind any name to any address and reach what the scope forbids, through the same MCP surface
+the scope bounds. Each name-to-IP binding expires at max(answer TTL, 1 hour)
 after the last answer that carried it — the shortest TTL of a CNAME chain — and a fresh answer
 refreshes it: the one-hour floor covers clients (JVMs, browsers, connection pools) that keep using
 an address past its TTL, while a recycled cloud address stops being justified by a name that no
@@ -57,7 +65,9 @@ deny (`evil.com:8443`) does not refuse the name, only that port.
 
 Repeater and Intruder are held to the same rules: `req replay` and `fuzz` check the replayed flow's
 workspace before sending, fail with `BW-NETWORK-003` and send nothing, and `fuzz` re-checks every
-rendered request since a payload can sit in the `Host` header. Hook `exec` commands are not exempt
+rendered request since a payload can sit in the `Host` header — against the live rules, not a
+snapshot taken at the start, so a `scope deny` typed while a 10,000-request attack is running stops
+it within the same two seconds it stops proxied traffic. Hook `exec` commands are not exempt
 — they run under the workspace of the flow that fired the hook and follow its scope, so a hook
 fired from `audit` cannot reach what `audit` refuses and its captured traffic is filed in `audit`.
 An `exec` hook's extracted value is cached per hook and per workspace (a token minted under one
@@ -75,6 +85,12 @@ parse rather than run unscoped. Three codes: `BW-INPUT-014` (no such scope rule)
 wrap it — `scope_allow`, `scope_deny`, `scope_list`, `scope_rm`, `scope_clear`, `scope_test` — and
 `req_list` takes `blocked`: **48 tools** now. `intercept scope` is unrelated and unchanged; its help
 now says it never blocks traffic.
+
+What it is not: those same six tools let the agent rewrite the scope it runs under, and only the
+current rules are kept, so `scope clear` with no argument drops every global rule in one call and
+leaves a daemon log line for a trace. The scope bounds a cooperating agent's blast radius — a
+redirect it should not follow, a scanner phoning home, a typo'd host — and that is the threat it is
+built for. A boundary against the agent itself has to sit outside burpwn.
 
 ### Fixed — an agent was told to report a bug when it had typo'd an argument
 Three MCP tools — `hook_test`, `session_auth_refresh` and `exec` — answer by shelling out to the

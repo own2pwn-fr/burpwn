@@ -62,8 +62,10 @@ namespace, so LLM traffic is excluded by construction.
 - **Network scope.** An allowlist and a denylist of destinations — `host`, `*.host` (the apex and
   every subdomain, a strict label match), IP, CIDR, each with an optional port — global or per
   workspace. The proxy enforces it **before any upstream contact**: an out-of-scope destination gets
-  no DNS query and no SYN, only a local refusal (HTTP `403 burpwn: blocked by scope (...)`, a TLS
-  `access_denied` alert, DNS `REFUSED`). Deny always wins, one allow rule blocks everything else,
+  no SYN, only a local refusal (HTTP `403 burpwn: blocked by scope (...)`, a TLS
+  `access_denied` alert, DNS `REFUSED`). A name a host rule refuses is not even looked up; an
+  allowlist made only of IP/CIDR rules has nothing to match a question against, so names do resolve
+  and the refusal lands on the address that came back. Deny always wins, one allow rule blocks everything else,
   `Host: evil.com` on an allowed IP is refused, and `req replay` / `fuzz` are held to it too.
   Blocked flows are recorded (`req list --blocked`), so an agent can tell "out of scope" from "the
   target said no".

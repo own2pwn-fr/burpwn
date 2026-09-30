@@ -7743,7 +7743,8 @@ def fam_scope_cli() -> list[dict[str, Any]]:
                     "assistant",
                     "Set an allow rule first — the moment one allow rule applies, the "
                     "scope becomes an allowlist and every other destination is refused "
-                    "by the proxy before a single packet leaves (no DNS query, no SYN). "
+                    "by the proxy before a single packet leaves — no SYN, and no lookup of a "
+                    "name a host rule refuses. "
                     "`req replay` and `fuzz` are held to it too.\n\n```\n"
                     "burpwn --json scope allow '*.staging.example.com' staging.example.com\n"
                     "```\n\n```json\n"
@@ -8009,8 +8010,8 @@ def fam_scope_mcp() -> list[dict[str, Any]]:
                                   "`*.target.example` matches the apex plus any subdomain "
                                   "by strict label suffix. From now on the sandbox, "
                                   "`req_replay` and `fuzz` can only reach target.example "
-                                  "and its subdomains; anything else gets no DNS query "
-                                  "and no SYN, and is recorded as blocked.",
+                                  "and its subdomains; anything else gets no SYN, its "
+                                  "name is not even looked up, and it is recorded as blocked.",
                     }],
                 },
                 {

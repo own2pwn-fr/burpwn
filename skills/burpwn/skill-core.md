@@ -227,8 +227,8 @@ This only selects what parks; it never blocks traffic (that is `burpwn scope`).
 ## Network scope — where traffic may go
 
 An allowlist and a denylist of destinations, global or per workspace, enforced
-by the proxy BEFORE any upstream contact (no DNS query, no SYN) and by
-`req replay` / `fuzz` too. **Deny always wins; one allow rule makes everything
+by the proxy BEFORE any upstream contact (no SYN, and no lookup of a name a
+host rule refuses) and by `req replay` / `fuzz` too. **Deny always wins; one allow rule makes everything
 else blocked.**
 
 ```sh

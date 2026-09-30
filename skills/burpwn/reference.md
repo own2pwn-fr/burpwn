@@ -459,9 +459,13 @@ Caveats:
   still points at the recorded address, and only for a name the scope would let
   resolve. A flow blocked before burpwn resolved it (explicit proxy, recorded
   `0.0.0.0`) cannot be replayed or fuzzed (`BW-INPUT-009`, "no destination address").
-- Deny-only mode cannot stop a client that resolves on its own (DoH, hard-coded
-  IP) and opens raw TCP with no Host/SNI: only the IP (and names the DNS shim
-  saw) can be judged. Use an allowlist for a hard boundary.
+- Deny-only mode is advisory, not a boundary. A client that picks the address
+  itself (DoH, hard-coded IP) escapes a host deny rule two ways: with no
+  Host/SNI only the IP can be judged, and with a Host/SNI of its own the denied
+  name is not consulted at all (see the next bullet) — `deny
+  metadata.example` does not stop `curl -H 'Host: allowed.example'
+  http://169.254.169.254/`. Deny rules on IPs/CIDRs always hold. Use an
+  allowlist for a hard boundary.
 - A deny rule matches a name learned from the DNS cache only for a connection
   that declares NO name (raw TCP, SNI-less TLS); declared names and the IP are
   always checked.
@@ -470,6 +474,11 @@ Caveats:
 - ECH hides the real inner name on passthrough: only the outer SNI is judged.
 - A CNAME from an allowed name makes its target's addresses reachable — by
   design, the whole chain is learned as bound to those addresses.
+- The scope is writable by the agent it constrains, and only the current rules
+  are stored: `scope clear` with no argument (including `scope_clear({})` over
+  MCP) drops every global allow AND deny rule in one call, and the only trace
+  left is a daemon log line. It bounds a cooperating agent's blast radius; it is
+  not a boundary against the agent itself. Enforce that outside burpwn.
 - A 403 whose body starts `burpwn: blocked by scope`, an `access_denied` alert
   or a `REFUSED` answer is burpwn, not a target defense: read `scope test` /
   `scope list` before drawing conclusions.
