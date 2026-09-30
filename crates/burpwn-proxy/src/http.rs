@@ -479,7 +479,7 @@ async fn handle_inner(
     // is configured: one relaxed atomic load inside `pre_request`.
     let hook_out = ctx
         .hooks
-        .pre_request(ctx.exec_id.as_deref(), &method, &mut msg)
+        .pre_request(ctx.exec_id.as_deref(), ctx.workspace_id, &method, &mut msg)
         .await;
     if hook_out.dropped {
         tracing::info!(host = %msg.host, path = %msg.url, "request dropped by hook");
@@ -625,6 +625,7 @@ async fn handle_inner(
     // buffering fork — so it covers both response paths.
     ctx.hooks.observe_status(
         ctx.exec_id.as_deref(),
+        ctx.workspace_id,
         // The REQUEST's context (the one the pre-request phase matched on), so a
         // narrowly-scoped hook is only invalidated by a refusal of the requests
         // it actually injects into.
@@ -715,6 +716,7 @@ async fn handle_inner(
         .hooks
         .post_response(
             ctx.exec_id.as_deref(),
+            ctx.workspace_id,
             &method,
             resp_parts.status.as_u16(),
             &mut resp_msg,

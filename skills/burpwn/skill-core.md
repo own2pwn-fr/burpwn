@@ -253,7 +253,8 @@ socket, a DNS `REFUSED`, or a replay/fuzz failing with `BW-NETWORK-003`. It is
 recorded: `burpwn req list --blocked` lists them (status `blocked`). Check with
 `burpwn scope test <host:port>` before concluding anything, and widen the scope
 only if the destination really is authorised. Hook `exec` commands run under
-workspace `default` and are held to its scope — allow the login endpoint.
+the workspace of the flow that fired the hook and are held to its scope — allow
+the login endpoint in every workspace whose traffic fires it.
 
 Not to be confused with `intercept scope`, which only picks which flows park.
 

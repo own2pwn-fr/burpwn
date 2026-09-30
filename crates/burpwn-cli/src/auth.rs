@@ -278,7 +278,12 @@ mod tests {
         struct Login;
         #[async_trait::async_trait]
         impl HookRunner for Login {
-            async fn run(&self, _cmd: &str, _budget: Duration) -> Result<String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                _workspace_id: i64,
+                _budget: Duration,
+            ) -> Result<String> {
                 Ok(r#"{"token":"fresh-token"}"#.to_string())
             }
         }
@@ -309,7 +314,7 @@ mod tests {
             headers: b"host: api.example.com\r\n".to_vec(),
             body: Vec::new(),
         };
-        assert!(engine.pre_request(None, "GET", &mut msg).await.changed);
+        assert!(engine.pre_request(None, 1, "GET", &mut msg).await.changed);
         let headers = String::from_utf8(msg.headers).unwrap();
         assert!(
             headers.contains("Authorization: Bearer fresh-token"),
@@ -323,7 +328,7 @@ mod tests {
             headers: b"host: api.example.com\r\nauthorization: Bearer stale\r\n".to_vec(),
             body: Vec::new(),
         };
-        assert!(engine.pre_request(None, "GET", &mut msg).await.changed);
+        assert!(engine.pre_request(None, 1, "GET", &mut msg).await.changed);
         let headers = String::from_utf8(msg.headers).unwrap();
         assert!(
             headers.contains("Authorization: Bearer fresh-token"),
@@ -338,7 +343,7 @@ mod tests {
             headers: b"host: other.test\r\n".to_vec(),
             body: Vec::new(),
         };
-        assert!(!engine.pre_request(None, "GET", &mut msg).await.changed);
+        assert!(!engine.pre_request(None, 1, "GET", &mut msg).await.changed);
     }
 
     /// Re-`set`ting a host must UPDATE its profile, never stack a second login

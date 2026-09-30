@@ -407,6 +407,68 @@ async fn a_post_response_hook_takes_a_streaming_response_off_the_streaming_path(
     assert_eq!(body.as_ref(), b"data: 1\n\ndata: 2\n\n");
 }
 
+/// End to end: the proxy hands an `exec` hook's runner the workspace of the
+/// flow that fired it (here the front-end's configured workspace), so the
+/// command runs — and is scope-checked and recorded — there, not in `default`.
+#[tokio::test]
+async fn an_exec_hook_runs_in_the_workspace_of_the_triggering_flow() {
+    struct Probe(Arc<std::sync::Mutex<Vec<i64>>>);
+
+    #[async_trait::async_trait]
+    impl burpwn_proxy::HookRunner for Probe {
+        async fn run(
+            &self,
+            _cmd: &str,
+            workspace_id: i64,
+            _budget: Duration,
+        ) -> anyhow::Result<String> {
+            self.0.lock().unwrap().push(workspace_id);
+            Ok(format!(r#"{{"token":"ws{workspace_id}"}}"#))
+        }
+    }
+
+    let origin = spawn_header_echo_origin().await;
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("session.db")).unwrap();
+    let audit = store.writer().create_workspace("audit", 0).await.unwrap();
+    assert_ne!(audit, 1);
+    let mut cfg = ProxyConfig::new(dir.path().join("ca"));
+    cfg.workspace_id = audit;
+    let handle = Arc::new(Proxy::new(cfg, store.writer(), store.reader()).unwrap());
+    let (proxy, fut) = handle
+        .clone()
+        .explicit_http_bound(([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::spawn(fut);
+
+    let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    handle.hooks().set_runner(Arc::new(Probe(runs.clone())));
+    handle.hooks().set_hooks(vec![hook(
+        1,
+        HookPhase::PreRequest,
+        HookScope::default(),
+        HookAction::Exec {
+            cmd: "mint-a-token".into(),
+            extract: r#""token":"([^"]+)""#.into(),
+            inject: HookInject {
+                kind: HookInjectKind::SetHeader,
+                name: "Authorization".into(),
+                value_template: "Bearer {}".into(),
+            },
+        },
+    )]);
+
+    let (status, body) = request_through_proxy(proxy, origin, "GET", "/api", "").await;
+    assert_eq!(status, 200);
+    let seen = String::from_utf8(body).unwrap();
+    assert!(
+        seen.contains(&format!("authorization: Bearer ws{audit}")),
+        "{seen}"
+    );
+    assert_eq!(*runs.lock().unwrap(), vec![audit]);
+}
+
 /// The cold-TTL burst, end to end: eight concurrent requests through the live
 /// proxy on an empty cache. The command must run ONCE and all eight requests
 /// must reach the origin carrying the token it minted — the seven that lose the
@@ -421,7 +483,12 @@ async fn a_cold_ttl_burst_hooks_every_request_with_one_command() {
 
     #[async_trait::async_trait]
     impl burpwn_proxy::HookRunner for SlowMint {
-        async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+        async fn run(
+            &self,
+            _cmd: &str,
+            _workspace_id: i64,
+            _budget: Duration,
+        ) -> anyhow::Result<String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(r#"{"token":"minted-once"}"#.to_string())
@@ -494,7 +561,12 @@ async fn a_hook_command_that_talks_through_the_proxy_does_not_recurse() {
 
     #[async_trait::async_trait]
     impl burpwn_proxy::HookRunner for ProxiedRunner {
-        async fn run(&self, _cmd: &str, _budget: Duration) -> anyhow::Result<String> {
+        async fn run(
+            &self,
+            _cmd: &str,
+            _workspace_id: i64,
+            _budget: Duration,
+        ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let (status, body) =
                 request_through_proxy(self.proxy, self.origin, "GET", "/token", "").await;
