@@ -48,6 +48,7 @@ where
             scheme: "https".into(),
             protocol: Protocol::TlsPassthru,
             intercepted: false,
+            blocked: None,
         })
         .await
         .map_err(to_io)?;

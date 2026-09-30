@@ -15,14 +15,14 @@
 //! [`tokio::sync::oneshot`] reply channel so the caller can await the new id
 //! without blocking.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::blob::BlobStore;
 use crate::error::{Result, StoreError};
 use crate::model::{
     FlowStart, NewAttack, NewAttackResult, NewExecRecord, NewHook, NewMatchReplaceRule,
-    RequestData, ResponseData, WsDirection,
+    NewScopeRule, RequestData, ResponseData, ScopeClearTarget, ScopeKind, WsDirection,
 };
 
 /// Default bound for the writer channel. Large enough to absorb bursts without
@@ -55,6 +55,13 @@ pub type AckReply = oneshot::Sender<Result<()>>;
 
 /// A reply channel for ops that produce a list of generated/affected ids.
 pub type IdsReply = oneshot::Sender<Result<Vec<i64>>>;
+
+/// Reply for [`WriteOp::AddScopeRule`]: `(id, created)`, `created == false` when
+/// an identical rule already existed and its id is returned instead.
+pub type ScopeAddReply = oneshot::Sender<Result<(i64, bool)>>;
+
+/// Reply carrying a row count (how many rows an op removed).
+pub type CountReply = oneshot::Sender<Result<usize>>;
 
 /// Messages consumed by the writer task. Every variant is processed in arrival
 /// order on the single write connection.
@@ -221,6 +228,30 @@ pub enum WriteOp {
         id: i64,
         /// Optional completion ack.
         reply: Option<AckReply>,
+    },
+    /// Insert a network-scope rule unless an identical one (same workspace —
+    /// NULL included —, kind and pattern) exists; replies `(id, created)`.
+    AddScopeRule {
+        /// Rule definition (pattern already normalized by the caller).
+        rule: NewScopeRule,
+        /// Reply with the id and whether a row was created.
+        reply: ScopeAddReply,
+    },
+    /// Delete one scope rule; replies with how many rows went (0 = no such id).
+    DeleteScopeRule {
+        /// Rule id.
+        id: i64,
+        /// Reply with the number of deleted rows.
+        reply: CountReply,
+    },
+    /// Delete a set of scope rules; replies with how many rows went.
+    ClearScopeRules {
+        /// Which rules.
+        target: ScopeClearTarget,
+        /// Restrict to one kind (`None` = both).
+        kind: Option<ScopeKind>,
+        /// Reply with the number of deleted rows.
+        reply: CountReply,
     },
     /// Enable/disable a match/replace rule.
     SetMatchReplaceEnabled {
@@ -602,6 +633,40 @@ impl WriteHandle {
         recv_ack(rx).await
     }
 
+    /// Add a network-scope rule, idempotently: an identical rule (same
+    /// workspace, kind and normalized pattern) is not duplicated, its id is
+    /// returned with `created == false`. SQLite's UNIQUE would not catch the
+    /// global case (NULLs never compare equal), so the check lives in the op.
+    pub async fn add_scope_rule(&self, rule: NewScopeRule) -> Result<(i64, bool)> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::AddScopeRule { rule, reply }).await?;
+        rx.await.map_err(|_| StoreError::WriterGone)?
+    }
+
+    /// Delete a scope rule; `false` when no rule had that id.
+    pub async fn delete_scope_rule(&self, id: i64) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::DeleteScopeRule { id, reply }).await?;
+        Ok(rx.await.map_err(|_| StoreError::WriterGone)?? > 0)
+    }
+
+    /// Delete the scope rules selected by `target` (and `kind`, when given);
+    /// returns how many were removed.
+    pub async fn clear_scope_rules(
+        &self,
+        target: ScopeClearTarget,
+        kind: Option<ScopeKind>,
+    ) -> Result<usize> {
+        let (reply, rx) = oneshot::channel();
+        self.send(WriteOp::ClearScopeRules {
+            target,
+            kind,
+            reply,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterGone)?
+    }
+
     /// Delete a match/replace rule, awaiting ack.
     pub async fn delete_match_replace(&self, id: i64) -> Result<()> {
         let (reply, rx) = oneshot::channel();
@@ -881,6 +946,22 @@ fn handle_op(conn: &Connection, op: WriteOp) {
                 .map(|_| ())
                 .map_err(Into::into),
         ),
+        WriteOp::AddScopeRule { rule, reply } => {
+            let _ = reply.send(do_add_scope_rule(conn, &rule));
+        }
+        WriteOp::DeleteScopeRule { id, reply } => {
+            let _ = reply.send(
+                conn.execute("DELETE FROM scope_rules WHERE id = ?1", [id])
+                    .map_err(Into::into),
+            );
+        }
+        WriteOp::ClearScopeRules {
+            target,
+            kind,
+            reply,
+        } => {
+            let _ = reply.send(do_clear_scope_rules(conn, target, kind));
+        }
         WriteOp::SetMatchReplaceEnabled { id, enabled, reply } => ack(
             reply,
             conn.execute(
@@ -967,8 +1048,8 @@ fn ack(reply: Option<AckReply>, result: Result<()>) {
 
 fn do_flow_start(conn: &Connection, f: &FlowStart) -> Result<i64> {
     conn.execute(
-        "INSERT INTO flows(workspace_id, ts_start, exec_id, client_addr, dst_ip, dst_port, sni, scheme, protocol, intercepted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO flows(workspace_id, ts_start, exec_id, client_addr, dst_ip, dst_port, sni, scheme, protocol, intercepted, blocked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             f.workspace_id,
             f.ts_start,
@@ -980,9 +1061,55 @@ fn do_flow_start(conn: &Connection, f: &FlowStart) -> Result<i64> {
             f.scheme,
             f.protocol.as_str(),
             f.intercepted as i64,
+            f.blocked,
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Insert a scope rule unless an identical one exists (`IS` compares NULL
+/// workspaces as equal, which a UNIQUE index would not).
+fn do_add_scope_rule(conn: &Connection, r: &NewScopeRule) -> Result<(i64, bool)> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM scope_rules WHERE workspace_id IS ?1 AND kind = ?2 AND pattern = ?3
+             ORDER BY id LIMIT 1",
+            rusqlite::params![r.workspace_id, r.kind.as_str(), r.pattern],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok((id, false));
+    }
+    conn.execute(
+        "INSERT INTO scope_rules(workspace_id, kind, pattern, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![r.workspace_id, r.kind.as_str(), r.pattern, now_millis()],
+    )?;
+    Ok((conn.last_insert_rowid(), true))
+}
+
+/// Delete the scope rules a clear selects; returns the row count.
+fn do_clear_scope_rules(
+    conn: &Connection,
+    target: ScopeClearTarget,
+    kind: Option<ScopeKind>,
+) -> Result<usize> {
+    let kind = kind.map(ScopeKind::as_str);
+    let n = match target {
+        ScopeClearTarget::Global => conn.execute(
+            "DELETE FROM scope_rules WHERE workspace_id IS NULL AND (?1 IS NULL OR kind = ?1)",
+            rusqlite::params![kind],
+        )?,
+        ScopeClearTarget::Workspace(ws) => conn.execute(
+            "DELETE FROM scope_rules WHERE workspace_id = ?1 AND (?2 IS NULL OR kind = ?2)",
+            rusqlite::params![ws, kind],
+        )?,
+        ScopeClearTarget::All => conn.execute(
+            "DELETE FROM scope_rules WHERE ?1 IS NULL OR kind = ?1",
+            rusqlite::params![kind],
+        )?,
+    };
+    Ok(n)
 }
 
 fn do_request(conn: &Connection, flow_id: i64, d: &RequestData) -> Result<()> {

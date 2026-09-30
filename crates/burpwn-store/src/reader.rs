@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::model::{
     Attack, AttackResult, ExecRecord, ExecStats, FlowDetail, FlowFilter, FlowRow, Group, Hook,
     HookAction, HookPhase, HookScope, MatchKind, MatchReplaceRule, Note, Protocol, RequestData,
-    ResponseData, Tag, Workspace, WsDirection, WsMessage,
+    ResponseData, ScopeKind, ScopeRule, Tag, Workspace, WsDirection, WsMessage,
 };
 
 /// Raw column tuple for a `requests` row: (method, authority, path, http_version,
@@ -75,7 +75,7 @@ impl Reader {
         let mut sql = format!(
             "SELECT f.id, f.workspace_id, f.ts_start, f.ts_end, f.protocol, f.scheme,
                     f.dst_ip, f.dst_port, f.sni, f.intercepted,
-                    r.method, r.authority, r.path, resp.status
+                    r.method, r.authority, r.path, resp.status, f.blocked
              FROM flows f{group_join}
              LEFT JOIN requests r ON r.flow_id = f.id
              LEFT JOIN responses resp ON resp.flow_id = f.id
@@ -129,6 +129,9 @@ impl Reader {
             sql.push_str(" AND COALESCE(respb.size, 0) <= ?");
             params.push(Box::new(max));
         }
+        if filter.blocked_only {
+            sql.push_str(" AND f.blocked IS NOT NULL");
+        }
         if let Some(ref needle) = filter.header_contains {
             // Substring over decoded request + response headers. Headers are
             // almost always uncompressed (well under COMPRESS_THRESHOLD); a
@@ -163,7 +166,7 @@ impl Reader {
             .query_row(
                 "SELECT f.id, f.workspace_id, f.ts_start, f.ts_end, f.protocol, f.scheme,
                         f.dst_ip, f.dst_port, f.sni, f.intercepted,
-                        r.method, r.authority, r.path, resp.status,
+                        r.method, r.authority, r.path, resp.status, f.blocked,
                         f.exec_id, f.client_addr
                  FROM flows f
                  LEFT JOIN requests r ON r.flow_id = f.id
@@ -172,8 +175,8 @@ impl Reader {
                 [id],
                 |row| {
                     let flow = row_to_flow(row)?;
-                    let exec_id: Option<String> = row.get(14)?;
-                    let client_addr: String = row.get(15)?;
+                    let exec_id: Option<String> = row.get(15)?;
+                    let client_addr: String = row.get(16)?;
                     Ok((flow, exec_id, client_addr))
                 },
             )
@@ -591,6 +594,51 @@ impl Reader {
         collect(rows)
     }
 
+    /// List every network-scope rule (global and per workspace), by id, with the
+    /// owning workspace's name joined in.
+    ///
+    /// A row whose `kind` this build does not understand fails the whole call
+    /// (same reasoning as [`Reader::list_hooks`]: the proxy then keeps its
+    /// previous rule set rather than silently enforcing a partial one).
+    pub fn list_scope_rules(&self) -> Result<Vec<ScopeRule>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.workspace_id, w.name, s.kind, s.pattern, s.created_at
+             FROM scope_rules s LEFT JOIN workspaces w ON w.id = s.workspace_id
+             ORDER BY s.id",
+        )?;
+        type ScopeRow = (i64, Option<i64>, Option<String>, String, String, i64);
+        let rows = stmt.query_map([], |r| -> rusqlite::Result<ScopeRow> {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in collect(rows)? {
+            let (id, workspace_id, workspace, kind, pattern, created_at) = row;
+            let Some(kind) = ScopeKind::parse(&kind) else {
+                return Err(crate::StoreError::UnsupportedRow {
+                    table: "scope_rules",
+                    detail: format!("unknown kind {kind:?}"),
+                });
+            };
+            out.push(ScopeRule {
+                id,
+                workspace_id,
+                workspace,
+                kind,
+                pattern,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// List every hook in APPLICATION order (`ord`, then id) — the order the
     /// proxy applies them in, so the snapshot it loads needs no re-sorting.
     ///
@@ -802,8 +850,8 @@ fn row_to_group(r: &rusqlite::Row) -> rusqlite::Result<Group> {
     })
 }
 
-/// Map a flows-join row (15+ columns; first 14 are the [`FlowRow`] shape) into a
-/// [`FlowRow`].
+/// Map a flows-join row (first 15 columns are the [`FlowRow`] shape, the 15th
+/// being `f.blocked`) into a [`FlowRow`].
 fn row_to_flow(row: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
     let protocol: String = row.get(4)?;
     let status: Option<i64> = row.get(13)?;
@@ -824,6 +872,7 @@ fn row_to_flow(row: &rusqlite::Row) -> rusqlite::Result<FlowRow> {
         authority: row.get(11)?,
         path: row.get(12)?,
         status: status.map(|s| u16::try_from(s).unwrap_or(0)),
+        blocked: row.get(14)?,
     })
 }
 

@@ -868,3 +868,475 @@ async fn a_ws_drop_hook_refuses_a_message_and_leaves_the_socket_alive() {
         b"echo:hello"
     );
 }
+
+// --- network scope ------------------------------------------------------------
+
+/// A loopback origin that counts every TCP connection it accepts: the proof
+/// that a scope-blocked flow never reached it (zero connections, not merely
+/// "no response").
+async fn spawn_counting_origin() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let io = TokioIo::new(sock);
+                let svc = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .body(Full::new(Bytes::from_static(b"origin")))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    (addr, count)
+}
+
+fn scope_rules(rules: &[(i64, burpwn_store::model::ScopeKind, &str)]) -> burpwn_proxy::RuleSet {
+    burpwn_proxy::RuleSet::new(
+        rules
+            .iter()
+            .map(|(id, kind, pat)| burpwn_proxy::scope::Rule {
+                id: *id,
+                workspace_id: None,
+                workspace: None,
+                kind: *kind,
+                pattern: burpwn_proxy::scope::Pattern::parse(pat).unwrap(),
+            })
+            .collect(),
+    )
+}
+
+/// One absolute-form request with an explicit URI host and Host header.
+async fn raw_request(
+    proxy: SocketAddr,
+    uri: &str,
+    host_header: &str,
+) -> (hyper::StatusCode, hyper::HeaderMap, Vec<u8>) {
+    let tcp = TcpStream::connect(proxy).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", host_header)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+
+async fn blocked_flows(store: &Store, at_least: usize) -> Vec<burpwn_store::model::FlowRow> {
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        rows = store
+            .reader()
+            .list_flows(&FlowFilter {
+                blocked_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        if rows.len() >= at_least && rows.iter().all(|r| r.ts_end.is_some()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rows
+}
+
+/// A request to a destination the scope refuses gets a synthetic 403 naming
+/// the reason and the code, the origin sees NO connection at all, and the flow
+/// is recorded (request + the 403) with its `blocked` reason. The same request
+/// passes once the destination is allowed.
+#[tokio::test]
+async fn a_scope_blocked_request_never_reaches_the_origin_and_is_recorded() {
+    use burpwn_store::model::ScopeKind;
+    use std::sync::atomic::Ordering;
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Allow, "*.allowed.test")]));
+
+    let uri = format!("http://{origin}/secret");
+    let (status, headers, body) = raw_request(proxy, &uri, &origin.to_string()).await;
+    assert_eq!(status, 403);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.starts_with("burpwn: blocked by scope (not in allowlist"),
+        "{body}"
+    );
+    let err = headers.get("burpwn-error").unwrap().to_str().unwrap();
+    assert!(err.starts_with("BW-NETWORK-003"), "{err}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the origin must see nothing"
+    );
+
+    let rows = blocked_flows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]
+        .blocked
+        .as_deref()
+        .unwrap()
+        .starts_with("not in allowlist"));
+    assert_eq!(rows[0].status, Some(403));
+    let detail = store.reader().get_flow(rows[0].id).unwrap().unwrap();
+    assert_eq!(detail.request.unwrap().path, "/secret");
+    assert!(String::from_utf8_lossy(&detail.response.unwrap().body).contains("blocked by scope"));
+
+    // A deny rule decides the same way, naming itself.
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(7, ScopeKind::Deny, "127.0.0.1")]));
+    let (status, _, body) = raw_request(proxy, &uri, &origin.to_string()).await;
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("deny rule #7 127.0.0.1"));
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    // Allowed: goes through.
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(2, ScopeKind::Allow, "127.0.0.0/8")]));
+    let (status, _, body) = raw_request(proxy, &uri, &origin.to_string()).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"origin");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+/// The destination IP is allowed, but the request declares another host: on a
+/// shared address that host is what the origin would serve, so it is refused.
+#[tokio::test]
+async fn a_spoofed_host_on_an_allowed_ip_is_blocked() {
+    use burpwn_store::model::ScopeKind;
+    use std::sync::atomic::Ordering;
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Allow, "127.0.0.0/8")]));
+    let uri = format!("http://{origin}/");
+    let (status, _, body) = raw_request(proxy, &uri, "evil.test").await;
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("evil.test"));
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+/// The explicit proxy checks a NAME before resolving it: a refused name is not
+/// looked up at all. `.invalid` never resolves, so a lookup would have turned
+/// into a 502 "dns failure"; the 403 proves none happened.
+#[tokio::test]
+async fn a_refused_name_is_not_even_resolved() {
+    use burpwn_store::model::ScopeKind;
+
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(3, ScopeKind::Deny, "*.blocked.invalid")]));
+    let (status, _, body) =
+        raw_request(proxy, "http://api.blocked.invalid/x", "api.blocked.invalid").await;
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("deny rule #3 *.blocked.invalid"));
+    let rows = blocked_flows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].dst_ip, "0.0.0.0", "never resolved");
+}
+
+/// TLS: the scope is decided on the ClientHello (SNI) BEFORE the MITM or the
+/// passthrough could dial the origin. The client gets an alert, the origin no
+/// connection, and the flow is recorded with its SNI and reason.
+#[tokio::test]
+async fn a_scope_blocked_tls_connection_is_refused_after_the_client_hello() {
+    use burpwn_store::model::ScopeKind;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Deny, "blocked.test")]));
+
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    tcp.write_all(format!("CONNECT {origin} HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = tcp.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("200"));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from("blocked.test").unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .expect("the proxy answers the ClientHello promptly");
+    assert!(res.is_err(), "the handshake must be refused");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the origin must see nothing"
+    );
+    let rows = blocked_flows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sni.as_deref(), Some("blocked.test"));
+    assert_eq!(
+        rows[0].blocked.as_deref(),
+        Some("TLS refused before handshake (no MITM, no upstream): deny rule #1 blocked.test")
+    );
+    assert_eq!(rows[0].protocol, burpwn_store::model::Protocol::TlsPassthru);
+}
+
+/// Open a `CONNECT` tunnel to `target` through the proxy and return the stream
+/// right after the `200`.
+async fn connect_tunnel(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    tcp.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    // Read exactly the CONNECT answer, not a byte of what follows.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = tcp.read(&mut byte).await.unwrap();
+        assert_eq!(n, 1, "proxy closed during CONNECT");
+        head.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&head).contains("200"));
+    tcp
+}
+
+/// Raw TCP (neither TLS nor HTTP) to a refused destination: the tunnel is
+/// closed, the origin sees no connection, the flow is recorded as raw TCP.
+#[tokio::test]
+async fn a_scope_blocked_raw_tcp_stream_never_reaches_the_origin() {
+    use burpwn_store::model::{Protocol, ScopeKind};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(4, ScopeKind::Deny, "127.0.0.1")]));
+
+    let mut tcp = connect_tunnel(proxy, origin).await;
+    tcp.write_all(b"\x00\x01SSH-ish binary hello\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+        .await
+        .expect("the proxy closes the refused stream")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "nothing comes back");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the origin must see nothing"
+    );
+    let rows = blocked_flows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].protocol, Protocol::RawTcp);
+    assert_eq!(rows[0].blocked.as_deref(), Some("deny rule #4 127.0.0.1"));
+}
+
+/// A WebSocket upgrade to a refused destination gets the 403, never a 101,
+/// and the origin sees nothing.
+#[tokio::test]
+async fn a_scope_blocked_websocket_upgrade_never_reaches_the_origin() {
+    use burpwn_store::model::{Protocol, ScopeKind};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Allow, "127.0.0.0/8")]));
+
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    let req = format!(
+        "GET http://{origin}/ws HTTP/1.1\r\nHost: evil.test\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(head.contains("declared name evil.test"), "{head}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the origin must see nothing"
+    );
+    let rows = blocked_flows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].protocol, Protocol::Ws);
+}
+
+/// HTTP/1.1 keep-alive: the scope is decided per REQUEST, not per connection.
+/// The second request on the same connection changes its Host and is refused.
+#[tokio::test]
+async fn a_keep_alive_connection_is_rechecked_when_the_host_changes() {
+    use burpwn_store::model::ScopeKind;
+    use std::sync::atomic::Ordering;
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Allow, "127.0.0.0/8")]));
+
+    let tcp = connect_tunnel(proxy, origin).await;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let send = |host: String| {
+        Request::builder()
+            .uri("/")
+            .header("host", host)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let r1 = sender.send_request(send(origin.to_string())).await.unwrap();
+    assert_eq!(r1.status(), 200);
+    let _ = r1.into_body().collect().await;
+    sender.ready().await.unwrap();
+    let r2 = sender.send_request(send("evil.test".into())).await.unwrap();
+    assert_eq!(r2.status(), 403, "same connection, new Host: re-checked");
+    let body = r2.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("evil.test"));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "only the first request left"
+    );
+}
+
+/// HTTP/2 multiplexes requests for several authorities on one connection:
+/// each stream is judged on its own `:authority`.
+#[tokio::test]
+async fn h2_streams_with_mixed_authorities_are_judged_one_by_one() {
+    use burpwn_store::model::ScopeKind;
+    use std::sync::atomic::Ordering;
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, _store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Allow, "127.0.0.0/8")]));
+
+    // h2c prior knowledge inside the tunnel.
+    let tcp = connect_tunnel(proxy, origin).await;
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        TokioIo::new(tcp),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = |uri: String| {
+        Request::builder()
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let ok = sender.send_request(req(format!("http://{origin}/ok")));
+    let bad = sender.send_request(req("http://evil.test/x".into()));
+    let (ok, bad) = tokio::join!(ok, bad);
+    let (ok, bad) = (ok.unwrap(), bad.unwrap());
+    assert_eq!(ok.status(), 200);
+    assert_eq!(bad.status(), 403);
+    let body = bad.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("evil.test"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "only the allowed stream left"
+    );
+}
+
+/// Match/replace runs AFTER the first scope check: a rule rewriting the host
+/// to an out-of-scope name is caught by the re-check on what will leave.
+#[tokio::test]
+async fn a_match_replace_host_rewrite_is_rechecked() {
+    use burpwn_store::model::{MatchKind, NewMatchReplaceRule, ScopeKind};
+    use std::sync::atomic::Ordering;
+
+    let (origin, hits) = spawn_counting_origin().await;
+    let (proxy, store, _dir, handle) = spawn_proxy_handle().await;
+    handle
+        .scope()
+        .set_rules(scope_rules(&[(1, ScopeKind::Allow, "127.0.0.0/8")]));
+    store
+        .writer()
+        .add_match_replace(NewMatchReplaceRule {
+            enabled: true,
+            scope: String::new(),
+            match_kind: MatchKind::Host,
+            pattern: r"^127\.0\.0\.1".into(),
+            replacement: "evil.test".into(),
+            on_request: true,
+        })
+        .await
+        .unwrap();
+
+    let uri = format!("http://{origin}/");
+    let (status, _, body) = raw_request(proxy, &uri, &origin.to_string()).await;
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("evil.test"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the origin must see nothing"
+    );
+    let rows = blocked_flows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+}

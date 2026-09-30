@@ -25,6 +25,12 @@ In any security-audit / pentest session that performs **remote operations**
 - **Create a session first** (`burpwn session new --name <engagement>`), and use
   one session (or per-target workspaces) so the whole engagement is one queryable
   capture set.
+- **Set the network scope before touching the target**:
+  `burpwn scope allow '*.target.tld'` (plus any in-scope IP/CIDR), and
+  `burpwn scope deny` what must never be hit (production, third parties, cloud
+  metadata). Once an allow rule exists, the proxy refuses every other
+  destination before a single packet leaves — a stray redirect or a tool's
+  phone-home cannot take the engagement out of scope.
 - The one thing you must NOT wrap is your own non-target traffic — burpwn already
   excludes the agent's LLM calls by construction (they stay outside the sandbox);
   only the target-facing tooling goes through `burpwn exec`.
@@ -59,6 +65,7 @@ burpwn doctor                      # preflight + LIVE sandbox probe (--quick ski
 burpwn ca init                     # generate the CA if absent (idempotent)
 burpwn session new --name pentest  # create a session (DB + runtime files)
 burpwn session use pentest         # make it active
+burpwn scope allow '*.target.example' 203.0.113.0/24   # pin traffic to the authorised targets
 ```
 
 `burpwn session list` shows sessions; `burpwn session rm <name>` deletes one.
@@ -90,6 +97,7 @@ Inspect what was captured:
 burpwn req list                                  # recent flows
 burpwn req list --host target.example --status 200 --method POST --limit 20
 burpwn req list --protocol h2 --port 443 --json  # h1|h2|ws|dns|rawtcp|tls-passthru
+burpwn req list --blocked                        # flows the network scope refused
 burpwn req show <id>                              # summary of one flow
 burpwn req show <id> --raw                        # verbatim request/response bytes
 burpwn req search 'csrf_token'                    # full-text search bodies
@@ -214,6 +222,41 @@ burpwn intercept scope target.example --path /admin --method POST
 burpwn intercept scope --clear
 ```
 
+This only selects what parks; it never blocks traffic (that is `burpwn scope`).
+
+## Network scope — where traffic may go
+
+An allowlist and a denylist of destinations, global or per workspace, enforced
+by the proxy BEFORE any upstream contact (no DNS query, no SYN) and by
+`req replay` / `fuzz` too. **Deny always wins; one allow rule makes everything
+else blocked.**
+
+```sh
+burpwn scope allow '*.target.example'           # the apex AND every subdomain (never nottarget.example)
+burpwn scope allow 203.0.113.0/24 api.partner.example:8443
+burpwn scope deny admin.target.example 169.254.169.254
+burpwn scope allow staging.target.example --workspace staging   # that workspace only
+burpwn scope list                               # every rule; --workspace W = its effective set
+burpwn scope test api.target.example:443        # verdict + deciding rule, sends nothing
+burpwn scope rm <id>                            # also: scope clear [--workspace W | --all] [--kind allow|deny]
+```
+
+Patterns: `host` (exact), `*.host`, IP, CIDR, each with an optional `:port`
+(`[2001:db8::1]:443` for IPv6). A bare `*` is refused. The effective set of a
+workspace is the global rules plus its own. `Host: evil.com` sent to an allowed
+IP is still refused: every declared name (Host, SNI) must be allowed too.
+
+**A blocked flow means OUT OF SCOPE, not a target defense.** It shows up as a
+`403` whose body reads `burpwn: blocked by scope (<reason>)` (header
+`burpwn-error: BW-NETWORK-003`), a TLS `access_denied` alert, a closed raw
+socket, a DNS `REFUSED`, or a replay/fuzz failing with `BW-NETWORK-003`. It is
+recorded: `burpwn req list --blocked` lists them (status `blocked`). Check with
+`burpwn scope test <host:port>` before concluding anything, and widen the scope
+only if the destination really is authorised. Hook `exec` commands run under
+workspace `default` and are held to its scope — allow the login endpoint.
+
+Not to be confused with `intercept scope`, which only picks which flows park.
+
 ## Match/replace rules (auto-rewrite)
 
 Positional args: `<scope> <kind> <pattern> <replacement>`. `kind` is
@@ -322,8 +365,9 @@ their metadata, not their bytes — and HTTP/2 is re-encoded as HTTP/1.1. Reach 
 it to hand a scenario to Wireshark or an IDS; never to argue about what was on
 the wire.
 
-`burpwn workspace use <name>` only records the choice in config — you must still
-pass `--workspace` on `exec`/`req` to actually scope.
+`burpwn workspace use <name>` only resolves the name to its id and prints it — it
+persists nothing. Pass `--workspace` explicitly on `exec`/`req`/`scope` to use a
+workspace; network scope rules added without it are GLOBAL.
 
 **Groups** are named, described SUBSETS of a session's flows — the equivalent of
 a Burp highlight, and the right place to record a scenario you had to work out.
@@ -349,7 +393,7 @@ flows.
 ## CLI vs MCP
 
 - **CLI / hook (default):** use the commands above, or rely on the `init` hook.
-- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 42 tools
+- **MCP:** if the agent is already MCP-connected, `burpwn mcp` exposes 48 tools
   over stdio — the full loop is usable MCP-only, no shell needed. Session/query:
   `session_list`, `session_current`, `session_stats`, `req_list`, `req_show`,
   `req_search`, `workspace_list`, `workspace_new`, `tag_list`, `tag_add`,
@@ -366,6 +410,9 @@ flows.
   `session_auth_refresh`, `session_auth_status`. Interception: `intercept_enable`,
   `intercept_disable`, `intercept_list`, `await_intercept` (long-poll),
   `intercept_forward` (takes `method`/`path`), `intercept_scope`, `intercept_drop`.
+  Hooks: `hook_add`, `hook_list`, `hook_set_enabled`, `hook_rm`, `hook_test`.
+  Network scope: `scope_allow`, `scope_deny`, `scope_list`, `scope_rm`,
+  `scope_clear`, `scope_test`; `req_list` takes `blocked=true`.
   Use MCP when connected; otherwise use the CLI. Register it with
   `burpwn mcp register --agent <framework>`, then start it with
   `burpwn mcp [--session <n>]`.

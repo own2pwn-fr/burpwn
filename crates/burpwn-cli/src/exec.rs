@@ -769,6 +769,7 @@ mod tests {
             scheme: "https".into(),
             protocol: Protocol::H1,
             intercepted: false,
+            blocked: None,
         };
         let mine1 = w.flow_start(mk(Some("exec-mine"))).await.unwrap();
         let _other = w.flow_start(mk(Some("exec-other"))).await.unwrap();
