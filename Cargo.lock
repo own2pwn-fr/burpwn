@@ -311,6 +311,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "brotli",
+ "burpwn-error",
  "burpwn-sandbox",
  "burpwn-store",
  "burpwn-tls",

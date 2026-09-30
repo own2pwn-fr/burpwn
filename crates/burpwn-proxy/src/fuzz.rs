@@ -476,6 +476,11 @@ pub struct HttpReplaySender {
     /// stale `Authorization` is exactly what makes an Intruder run useless, and
     /// this path never went through the proxy's own hook point.
     pub hooks: std::sync::Arc<Vec<burpwn_store::model::Hook>>,
+    /// The network scope every rendered request is checked against BEFORE it
+    /// is sent (`None` = no rules). A payload placed in the `Host` header can
+    /// change what the request declares, so this is per request, on top of the
+    /// caller's up-front check of the base target.
+    pub scope: Option<crate::scope::ReplayScope>,
 }
 
 #[async_trait]
@@ -486,6 +491,24 @@ impl RequestSender for HttpReplaySender {
         // header would otherwise shift every payload offset the operator gave
         // against the template.
         apply_request_hooks(&self.hooks, &mut parsed)?;
+        if let Some(scope) = &self.scope {
+            // An absolute-form request target (`GET http://other/x`) is sent as
+            // is on h1 and becomes `:authority` on h2: it is declared too.
+            let target_authority = parsed
+                .path
+                .parse::<http::Uri>()
+                .ok()
+                .and_then(|u| u.authority().map(|a| a.as_str().to_string()));
+            let mut names = vec![self.sni.as_str(), parsed.authority.as_str()];
+            names.extend(target_authority.as_deref());
+            let v = scope.check(&names);
+            if let Some(reason) = v.blocked_reason() {
+                anyhow::bail!(
+                    "{}: blocked by scope ({reason}); not sent",
+                    burpwn_error::ErrorCode::NetworkBlockedByScope.id()
+                );
+            }
+        }
         let resp = crate::replay_once(
             &self.scheme,
             &self.sni,
@@ -822,5 +845,52 @@ mod tests {
             Some(AttackMode::ClusterBomb)
         );
         assert_eq!(AttackMode::from_str_opt("nope"), None);
+    }
+
+    /// Each rendered fuzz request is re-checked against the scope: a payload
+    /// that turns the `Host` into a refused name fails that request with the
+    /// scope code, and nothing reaches the target.
+    #[tokio::test]
+    async fn the_replay_sender_refuses_a_request_the_scope_blocks() {
+        use crate::scope::{Pattern, ReplayScope, Rule, RuleSet};
+        use burpwn_store::model::ScopeKind;
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = origin.local_addr().unwrap();
+        let sender = HttpReplaySender {
+            scheme: "http".into(),
+            sni: "127.0.0.1".into(),
+            addr,
+            hooks: Arc::new(Vec::new()),
+            scope: Some(ReplayScope {
+                rules: Arc::new(RuleSet::new(vec![Rule {
+                    id: 1,
+                    workspace_id: None,
+                    workspace: None,
+                    kind: ScopeKind::Deny,
+                    pattern: Pattern::parse("evil.test").unwrap(),
+                }])),
+                workspace_id: 1,
+                dst_ip: addr.ip(),
+                dst_port: addr.port(),
+                resolved_name: None,
+            }),
+        };
+        for raw in [
+            &b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n"[..],
+            // Userinfo in the Host payload is not the host.
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:80@evil.test\r\n\r\n",
+            // An absolute-form target declares its own authority.
+            b"GET http://evil.test/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        ] {
+            let err = sender.send(raw).await.unwrap_err().to_string();
+            assert!(
+                err.contains("BW-NETWORK-003"),
+                "{}: {err}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        let accepted = tokio::time::timeout(Duration::from_millis(200), origin.accept()).await;
+        assert!(accepted.is_err(), "nothing may reach the target");
     }
 }

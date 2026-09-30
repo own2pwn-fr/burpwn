@@ -46,6 +46,8 @@ fn json_mode_emits_exactly_one_envelope_line() {
         vec!["--json", "tag", "list"],
         vec!["--json", "group", "list"],
         vec!["--json", "hook", "list"],
+        vec!["--json", "scope", "list"],
+        vec!["--json", "scope", "test", "example.com"],
         vec!["--json", "decode", "base64", "aGk="],
     ] {
         let out = burpwn(home, &args);
@@ -61,6 +63,64 @@ fn json_mode_emits_exactly_one_envelope_line() {
         assert_eq!(v["ok"], serde_json::json!(true), "{args:?}: {text}");
         assert!(!text.contains('\u{1b}'), "{args:?} coloured the envelope");
     }
+}
+
+/// `scope allow` / `list` / `test` / `rm` round trip through the real binary:
+/// normalized patterns, idempotence, the effective set of a workspace, the
+/// verdict, and the codes of the two scope-specific failures.
+#[test]
+fn scope_round_trip_through_the_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    assert!(burpwn(home, &["session", "new"]).status.success());
+    let json = |args: &[&str]| -> serde_json::Value {
+        let mut full = vec!["--json"];
+        full.extend_from_slice(args);
+        let text = stdout(&burpwn(home, &full));
+        let line = text.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
+        serde_json::from_str(line).unwrap_or_else(|e| panic!("{args:?}: {e} in {text}"))
+    };
+
+    let v = json(&["scope", "allow", "*.Toto.FR.", "10.0.0.0/8:22"]);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["data"]["rules"][0]["pattern"], "*.toto.fr");
+    assert_eq!(v["data"]["rules"][1]["pattern"], "10.0.0.0/8:22");
+    let id = v["data"]["rules"][0]["id"].as_i64().unwrap();
+    let again = json(&["scope", "allow", "*.toto.fr"]);
+    assert_eq!(again["data"]["rules"][0]["id"], id);
+    assert_eq!(again["data"]["rules"][0]["created"], false);
+    let v = json(&["scope", "deny", "admin.toto.fr", "--workspace", "target"]);
+    assert_eq!(v["data"]["rules"][0]["scope"], "target");
+
+    let all = json(&["scope", "list"]);
+    assert_eq!(all["data"]["rules"].as_array().unwrap().len(), 3);
+    let eff = json(&["scope", "list", "--workspace", "target"]);
+    assert_eq!(eff["data"]["workspace"], "target");
+    assert_eq!(eff["data"]["rules"].as_array().unwrap().len(), 3);
+
+    let t = json(&[
+        "scope",
+        "test",
+        "admin.toto.fr:443",
+        "--workspace",
+        "target",
+    ]);
+    assert_eq!(t["data"]["verdict"], "blocked");
+    assert_eq!(t["data"]["rule"]["kind"], "deny");
+    let t = json(&["scope", "test", "api.toto.fr:443"]);
+    assert_eq!(t["data"]["verdict"], "allowed");
+    let t = json(&["scope", "test", "nottoto.fr"]);
+    assert_eq!(t["data"]["verdict"], "blocked");
+
+    let bad = json(&["scope", "allow", "*"]);
+    assert_eq!(bad["ok"], false);
+    assert_eq!(bad["diagnostic"]["code"], "BW-INPUT-015");
+    let missing = json(&["scope", "rm", "4242"]);
+    assert_eq!(missing["diagnostic"]["code"], "BW-INPUT-014");
+    let rm = json(&["scope", "rm", &id.to_string()]);
+    assert_eq!(rm["data"]["removed"], serde_json::json!([id]));
+    let cleared = json(&["scope", "clear", "--all"]);
+    assert_eq!(cleared["data"]["removed"], 2);
 }
 
 /// A failure in `--json` mode is still one line, and still on stdout — an agent

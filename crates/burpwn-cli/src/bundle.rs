@@ -289,6 +289,7 @@ mod tests {
                 scheme: "https".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();

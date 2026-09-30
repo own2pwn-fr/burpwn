@@ -249,6 +249,94 @@ impl BurpwnServer {
 
     // --- groups (named collections of flows) ------------------------------
 
+    // --- network scope ----------------------------------------------------
+
+    #[tool(
+        description = "ALLOW destinations in the network scope: once any allow rule applies to a workspace (global or its own), sandboxed traffic of that workspace may ONLY reach allowed destinations — everything else is refused by the proxy before any packet leaves (no DNS query, no SYN), and req_replay / fuzz refuse it too. Use it first thing on an engagement to pin the agent to the authorised targets: scope_allow(patterns=['*.target.com', '203.0.113.0/24']). Patterns: 'host' (exactly), '*.host' (the host AND every subdomain, strict label match: never 'nothost' or 'host.evil.com'), IP, CIDR, each with an optional port ('api.target.com:8443', '[2001:db8::1]:443'). Omit workspace for a global rule; workspace='name' scopes it to one workspace (created if missing). Idempotent: an identical rule returns its existing id with created=false. Blocked flows are still recorded (req_list blocked=true). Not the same thing as intercept scoping."
+    )]
+    async fn scope_allow(
+        &self,
+        Parameters(params): Parameters<ScopeAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::scope_add(
+            self.paths(),
+            self.session(),
+            burpwn_store::model::ScopeKind::Allow,
+            &params,
+        )
+        .await
+        .map_err(|e| self.err(e))
+        .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "DENY destinations in the network scope: traffic to a matching destination is refused by the proxy before any packet leaves, whatever the allow rules say (deny always wins), and req_replay / fuzz refuse it too. Use it to fence off what must never be touched — production, a third party, cloud metadata: scope_deny(patterns=['admin.target.com', '169.254.169.254', '*.payments-provider.com']). Same pattern syntax, workspace semantics and idempotence as scope_allow."
+    )]
+    async fn scope_deny(
+        &self,
+        Parameters(params): Parameters<ScopeAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::scope_add(
+            self.paths(),
+            self.session(),
+            burpwn_store::model::ScopeKind::Deny,
+            &params,
+        )
+        .await
+        .map_err(|e| self.err(e))
+        .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "List the network scope rules: every rule (scope='global' or the workspace name), or with workspace='name' the EFFECTIVE set for that workspace (global rules + its own). Read it when a request comes back 403 'burpwn: blocked by scope' or a replay fails with BW-NETWORK-003."
+    )]
+    async fn scope_list(
+        &self,
+        Parameters(params): Parameters<ScopeListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::scope_list(self.paths(), self.session(), &params)
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Delete network scope rules by id (from scope_list). Every id must exist, or nothing is removed."
+    )]
+    async fn scope_rm(
+        &self,
+        Parameters(params): Parameters<ScopeRmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::scope_rm(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Delete network scope rules in bulk: the GLOBAL rules by default, one workspace's own rules with workspace='name', or everything with all=true; kind='allow'|'deny' narrows it. Clearing every allow rule lifts the allowlist (everything not denied is reachable again)."
+    )]
+    async fn scope_clear(
+        &self,
+        Parameters(params): Parameters<ScopeClearParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::scope_clear(self.paths(), self.session(), &params)
+            .await
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
+    #[tool(
+        description = "Check whether a target is inside the network scope BEFORE touching it: scope_test(target='api.target.com:443') returns verdict allowed|blocked, the reason and the deciding rule, plus for a host the verdict of a DNS query for it. Pure evaluation: nothing is resolved or sent. Target: 'host', 'host:port', 'ip', 'ip:port' or '[v6]:port'; without a port only port-less rules apply; a host is not resolved, so IP/CIDR allow rules are only evaluated when you test the address."
+    )]
+    async fn scope_test(
+        &self,
+        Parameters(params): Parameters<ScopeTestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        handlers::scope_test(self.paths(), self.session(), &params)
+            .map_err(|e| self.err(e))
+            .and_then(ok_json)
+    }
+
     // --- hooks ------------------------------------------------------------
 
     #[tool(

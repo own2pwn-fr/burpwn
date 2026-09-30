@@ -113,6 +113,7 @@ pub async fn dispatch(cli: Cli, paths: &Paths) -> Result<i32> {
         Command::Intercept { action } => cmd_intercept(&out, paths, action).await,
         Command::MatchReplace { action } => cmd_match_replace(&out, paths, action).await,
         Command::Hook { action } => cmd_hook(&out, paths, action).await,
+        Command::Scope { action } => cmd_scope(&out, paths, action).await,
         Command::Workspace { action } => cmd_workspace(&out, paths, action).await,
         Command::Tag { action } => cmd_tag(&out, paths, action).await,
         Command::Note { action } => cmd_note(&out, paths, action).await,
@@ -1654,6 +1655,7 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
         port: args.port,
         limit: args.limit,
         offset: args.offset,
+        blocked_only: args.blocked,
         ..Default::default()
     };
     let rows = store.reader().list_flows(&filter)?;
@@ -1665,6 +1667,9 @@ fn req_list(out: &Output, paths: &Paths, session: &str, args: ReqListArgs) -> Re
         }
         if let Some(g) = &args.group {
             scope.push(format!("group {g}"));
+        }
+        if args.blocked {
+            scope.push("blocked by scope".into());
         }
         t.footer(scope.join("  ·  "));
         listing(r, &t, "(no flows)")
@@ -1718,6 +1723,13 @@ fn req_show(out: &Output, paths: &Paths, session: &str, id: i64, raw: bool) -> R
                 Cell::new(format!("{} bytes body", resp.body.len())),
             ]);
         }
+        if let Some(reason) = &detail.flow.blocked {
+            t.row(vec![
+                Cell::new("blocked"),
+                Cell::styled("by scope", palette::BAD),
+                Cell::new(format!("{reason} (nothing was sent upstream)")),
+            ]);
+        }
         if !detail.tags.is_empty() {
             t.row(vec![
                 Cell::new("tags"),
@@ -1767,6 +1779,7 @@ fn flow_detail_json(detail: &burpwn_store::model::FlowDetail) -> Value {
         "dst_ip": detail.flow.dst_ip,
         "dst_port": detail.flow.dst_port,
         "sni": detail.flow.sni,
+        "blocked": detail.flow.blocked,
         "exec_id": detail.exec_id,
         "client_addr": detail.client_addr,
         "request": req,
@@ -2344,6 +2357,154 @@ async fn cmd_hook(out: &Output, paths: &Paths, action: HookAction) -> Result<i32
 
 // --- workspace / tag / note ------------------------------------------------
 
+// --- scope (network allow/deny list) ----------------------------------------
+
+/// The scope rule listing: id, kind, pattern, scope (`global` or a workspace).
+fn scope_table() -> Table {
+    Table::new(vec![
+        Column::right("id"),
+        Column::left("kind"),
+        Column::left("pattern").truncatable(),
+        Column::left("scope"),
+    ])
+}
+
+fn scope_row(rule: &Value) -> Vec<Cell> {
+    let kind = rule["kind"].as_str().unwrap_or_default().to_string();
+    let style = if kind == "deny" {
+        palette::BAD
+    } else {
+        palette::GOOD
+    };
+    vec![
+        Cell::styled(num(&rule["id"]), palette::IDENT),
+        Cell::styled(kind, style),
+        Cell::new(rule["pattern"].as_str().unwrap_or_default()),
+        Cell::new(rule["scope"].as_str().unwrap_or_default()),
+    ]
+}
+
+async fn cmd_scope(out: &Output, paths: &Paths, action: ScopeAction) -> Result<i32> {
+    use burpwn_store::model::ScopeKind;
+    let session = paths.active_session();
+    let store = open_store(paths, &session)?;
+    match action {
+        ScopeAction::Allow(args) => {
+            scope_add(out, &store, ScopeKind::Allow, args).await?;
+        }
+        ScopeAction::Deny(args) => {
+            scope_add(out, &store, ScopeKind::Deny, args).await?;
+        }
+        ScopeAction::List { workspace } => {
+            let v = crate::scope::list(&store, workspace.as_deref())?;
+            out.emit(v.clone(), |r| {
+                let mut t = scope_table();
+                let rules = v["rules"].as_array().cloned().unwrap_or_default();
+                for rule in &rules {
+                    t.row(scope_row(rule));
+                }
+                if !t.is_empty() {
+                    t.footer(match &workspace {
+                        Some(w) => format!("{} rule(s) in effect for workspace {w}", rules.len()),
+                        None => format!("{} rule(s)", rules.len()),
+                    });
+                }
+                listing(r, &t, "(no scope rules: every destination is allowed)")
+            });
+        }
+        ScopeAction::Rm { ids } => {
+            let v = crate::scope::rm(&store, &ids).await?;
+            let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+            out.ok(format!("removed scope rule(s) {}", list.join(", ")), v);
+        }
+        ScopeAction::Clear {
+            workspace,
+            all,
+            kind,
+        } => {
+            let v = crate::scope::clear(&store, workspace.as_deref(), all, kind.map(Into::into))
+                .await?;
+            let what = match (&workspace, all) {
+                (Some(w), _) => format!("workspace {w}'s own"),
+                (None, true) => "all".to_string(),
+                (None, false) => "global".to_string(),
+            };
+            let kind_txt = kind.map(|k| match k {
+                ScopeKindArg::Allow => " allow",
+                ScopeKindArg::Deny => " deny",
+            });
+            out.ok(
+                format!(
+                    "cleared {} {what}{} scope rule(s)",
+                    num(&v["removed"]),
+                    kind_txt.unwrap_or("")
+                ),
+                v,
+            );
+        }
+        ScopeAction::Test { target, workspace } => {
+            let v = crate::scope::test(&store, &target, workspace.as_deref())?;
+            out.emit(v.clone(), |r| {
+                let mut kv = crate::render::kv_pair();
+                let verdict = v["verdict"].as_str().unwrap_or_default().to_string();
+                let style = if v["allowed"] == true {
+                    palette::GOOD
+                } else {
+                    palette::BAD
+                };
+                kv.row(vec![Cell::new("target"), Cell::new(target.clone())]);
+                kv.row(vec![
+                    Cell::new("workspace"),
+                    Cell::new(v["workspace"].as_str().unwrap_or_default()),
+                ]);
+                kv.row(vec![Cell::new("connection"), Cell::styled(verdict, style)]);
+                kv.row(vec![
+                    Cell::new("reason"),
+                    Cell::new(v["reason"].as_str().unwrap_or_default()),
+                ]);
+                if let Some(dns) = v["dns"].as_object() {
+                    kv.row(vec![
+                        Cell::new("dns query"),
+                        Cell::new(format!(
+                            "{} ({})",
+                            dns["verdict"].as_str().unwrap_or_default(),
+                            dns["reason"].as_str().unwrap_or_default()
+                        )),
+                    ]);
+                }
+                if let Some(note) = v["note"].as_str() {
+                    kv.row(vec![Cell::new("note"), Cell::new(note)]);
+                }
+                kv.render(r)
+            });
+        }
+    }
+    Ok(0)
+}
+
+async fn scope_add(
+    out: &Output,
+    store: &Store,
+    kind: burpwn_store::model::ScopeKind,
+    args: ScopeAddArgs,
+) -> Result<()> {
+    let v = crate::scope::add(store, kind, &args.patterns, args.workspace.as_deref()).await?;
+    out.emit(v.clone(), |r| {
+        let mut t = scope_table();
+        let rules = v["rules"].as_array().cloned().unwrap_or_default();
+        for rule in &rules {
+            t.row(scope_row(rule));
+        }
+        let fresh = rules.iter().filter(|r| r["created"] == true).count();
+        t.footer(format!(
+            "{fresh} added, {} already present",
+            rules.len() - fresh
+        ));
+        t.render(r)
+    });
+    Ok(())
+}
+
 async fn cmd_workspace(out: &Output, paths: &Paths, action: WorkspaceAction) -> Result<i32> {
     let session = paths.active_session();
     let store = open_store(paths, &session)?;
@@ -2506,9 +2667,12 @@ fn flow_table(rows: &[burpwn_store::model::FlowRow]) -> Table {
             .as_deref()
             .or(r.sni.as_deref())
             .unwrap_or(&r.dst_ip);
-        let (status, style) = match r.status {
-            Some(s) => (s.to_string(), palette::status(s)),
-            None => ("-".to_string(), palette::MUTED),
+        // A scope-blocked flow says so in the status column: its 403 (or its
+        // absent response) is burpwn's, not the origin's.
+        let (status, style) = match (r.blocked.as_ref(), r.status) {
+            (Some(_), _) => ("blocked".to_string(), palette::BAD),
+            (None, Some(s)) => (s.to_string(), palette::status(s)),
+            (None, None) => ("-".to_string(), palette::MUTED),
         };
         t.row(vec![
             Cell::styled(r.id.to_string(), palette::IDENT),
@@ -3432,6 +3596,7 @@ mod tests {
                 scheme: "http".into(),
                 protocol: Protocol::H1,
                 intercepted: false,
+                blocked: None,
             })
             .await
             .unwrap();
@@ -4195,6 +4360,7 @@ mod tests {
             path: Some(long.clone()),
             status: Some(403),
             intercepted: false,
+            blocked: None,
         }];
         let t = flow_table(&rows);
         let pretty = t.render(&Render::pretty(80).without_color());

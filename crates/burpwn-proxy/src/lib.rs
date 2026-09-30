@@ -22,6 +22,8 @@
 //! - [`HookEngine`] (re-exported) — hooks: an action (header/query edit, drop,
 //!   or a sandboxed command whose output is injected) applied to every message
 //!   matching a scope, on one phase.
+//! - [`ScopeEngine`] (re-exported) — the network scope: allow/deny destination
+//!   rules checked before any upstream contact (see [`scope`]).
 
 pub mod classify;
 pub mod decode;
@@ -35,6 +37,7 @@ pub mod mitm;
 pub mod passthrough;
 pub mod rawtcp;
 pub mod replay;
+pub mod scope;
 mod util;
 pub mod wire;
 pub mod ws;
@@ -70,7 +73,14 @@ pub use crate::intercept::{
 };
 pub use crate::mitm::TlsInfo;
 pub use crate::replay::{replay_once, ReplayResponse};
+pub use crate::scope::{Identity, RuleSet, ScopeEngine, Verdict};
 pub use crate::wire::{PassedConn, L4};
+
+/// Prefix of the `blocked` reason of a TLS connection the scope refused on its
+/// ClientHello. Such a flow is recorded as `tls-passthru` (nothing was ever
+/// decrypted), so the reason itself says the connection was refused before any
+/// TLS handshake or MITM took place.
+pub const TLS_REFUSED_PREFIX: &str = "TLS refused before handshake (no MITM, no upstream): ";
 
 /// Configuration for constructing a [`Proxy`].
 #[derive(Debug, Clone)]
@@ -105,8 +115,22 @@ pub struct Proxy {
     pinned: PinnedHosts,
     intercept: InterceptController,
     hooks: HookEngine,
+    scope: ScopeEngine,
     workspace_id: i64,
     exec_id: Option<String>,
+}
+
+/// What a front-end knows about a connection beyond its [`PassedConn`].
+#[derive(Debug, Clone, Default)]
+struct ConnHint {
+    /// The name burpwn itself resolved to obtain `dst_ip` (explicit proxy: the
+    /// `CONNECT` / absolute-URI host). A scope identity, and a justification of
+    /// the destination for an allow host rule.
+    resolved_name: Option<String>,
+    /// Set when the front-end already refused the connection by scope (the
+    /// explicit proxy checks the name BEFORE resolving it, so a refused name is
+    /// never even looked up). The connection is recorded blocked, never forwarded.
+    preblocked: Option<String>,
 }
 
 impl Proxy {
@@ -126,6 +150,7 @@ impl Proxy {
             pinned: PinnedHosts::new(),
             intercept: InterceptController::new(),
             hooks: HookEngine::new(),
+            scope: ScopeEngine::new(),
             workspace_id: cfg.workspace_id,
             exec_id: cfg.exec_id,
         })
@@ -142,6 +167,74 @@ impl Proxy {
     /// connections that are already open.
     pub fn hooks(&self) -> HookEngine {
         self.hooks.clone()
+    }
+
+    /// The network scope, for the daemon to load rules into. ONE engine per
+    /// proxy (rules + the DNS name cache), shared by every connection, so a
+    /// `burpwn scope` edit reaches connections that are already open.
+    pub fn scope(&self) -> ScopeEngine {
+        self.scope.clone()
+    }
+
+    /// The scope's blocking reason for a connection about to be forwarded to
+    /// `conn.dst_ip:dst_port`, or `None` when it may go. `sni` is the TLS SNI
+    /// when known (a declared name).
+    fn conn_block_reason(
+        &self,
+        conn: &PassedConn,
+        sni: Option<&str>,
+        hint: &ConnHint,
+    ) -> Option<String> {
+        if let Some(reason) = &hint.preblocked {
+            return Some(reason.clone());
+        }
+        let declared: Vec<Identity> = sni.and_then(Identity::from_authority).into_iter().collect();
+        let v = self.scope.check_conn(
+            conn.workspace_id,
+            Some(conn.dst_ip),
+            conn.dst_port,
+            &declared,
+            hint.resolved_name.as_deref(),
+        );
+        v.blocked_reason().map(str::to_string)
+    }
+
+    /// Record a connection the scope refused: a flow row with the destination,
+    /// the SNI if any and the reason, no bodies. Nothing was sent upstream.
+    async fn record_blocked_conn(
+        &self,
+        conn: &PassedConn,
+        client_addr: String,
+        sni: Option<String>,
+        protocol: burpwn_store::model::Protocol,
+        scheme: &str,
+        reason: String,
+    ) {
+        let (workspace_id, exec_id) = self.flow_attr(conn);
+        tracing::info!(dst = %conn.dst_ip, port = conn.dst_port, ?sni, %reason, "connection blocked by scope");
+        let now = util::now_millis();
+        match self
+            .writer
+            .flow_start(burpwn_store::model::FlowStart {
+                workspace_id,
+                ts_start: now,
+                exec_id,
+                client_addr,
+                dst_ip: conn.dst_ip.to_string(),
+                dst_port: conn.dst_port,
+                sni,
+                scheme: scheme.into(),
+                protocol,
+                intercepted: false,
+                blocked: Some(reason),
+            })
+            .await
+        {
+            Ok(id) => {
+                let _ = self.writer.flow_end(id, now).await;
+            }
+            Err(e) => tracing::warn!(error = %e, "could not record a scope-blocked flow"),
+        }
     }
 
     /// The set of hosts that rejected MITM (spliced through).
@@ -178,16 +271,49 @@ impl Proxy {
         client_addr: String,
     ) -> anyhow::Result<()> {
         let prefix = classify::peek(&mut stream).await?;
+        self.dispatch_classified(stream, prefix, conn, client_addr, ConnHint::default())
+            .await
+    }
+
+    /// Route a classified stream to its protocol path. Every path checks the
+    /// scope before it opens anything upstream: cleartext HTTP per request (the
+    /// upstream is dialed lazily, per request, after the check), TLS once the
+    /// ClientHello (SNI) is read and before MITM or passthrough, raw TCP here.
+    async fn dispatch_classified<S>(
+        &self,
+        stream: S,
+        prefix: Vec<u8>,
+        conn: PassedConn,
+        client_addr: String,
+        hint: ConnHint,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         match classify::classify(&prefix) {
             Class::Tls => {
-                self.handle_tls_generic(stream, prefix, conn, client_addr)
+                self.handle_tls_generic(stream, prefix, conn, client_addr, hint)
                     .await
             }
             Class::CleartextHttp => {
-                self.serve_cleartext(stream, prefix, conn, client_addr)
+                self.serve_cleartext(stream, prefix, conn, client_addr, hint)
                     .await
             }
             Class::RawTcp => {
+                // No name will ever arrive on a raw stream: the identities are
+                // the destination and what the DNS cache knows about it.
+                if let Some(reason) = self.conn_block_reason(&conn, None, &hint) {
+                    self.record_blocked_conn(
+                        &conn,
+                        client_addr,
+                        None,
+                        burpwn_store::model::Protocol::RawTcp,
+                        "tcp",
+                        reason,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 let (ws, exec) = self.flow_attr(&conn);
                 rawtcp::run(
                     stream,
@@ -206,13 +332,16 @@ impl Proxy {
     }
 
     /// Build an [`HttpContext`] for a plaintext origin.
-    fn cleartext_ctx(&self, conn: &PassedConn, client_addr: String) -> HttpContext {
+    fn cleartext_ctx(&self, conn: &PassedConn, client_addr: String, hint: ConnHint) -> HttpContext {
         let (workspace_id, exec_id) = self.flow_attr(conn);
         HttpContext {
             writer: self.writer.clone(),
             intercept: self.intercept.clone(),
             rules: self.rules(),
             hooks: self.hooks.clone(),
+            scope: self.scope.clone(),
+            resolved_name: hint.resolved_name,
+            preblocked: hint.preblocked,
             workspace_id,
             exec_id,
             client_addr,
@@ -237,13 +366,14 @@ impl Proxy {
         prefix: Vec<u8>,
         conn: PassedConn,
         client_addr: String,
+        hint: ConnHint,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let is_h2 = prefix.starts_with(b"PRI * HTTP/2.0");
         let replay = PrefixedStream::new(prefix, stream);
-        let ctx = self.cleartext_ctx(&conn, client_addr);
+        let ctx = self.cleartext_ctx(&conn, client_addr, hint);
         if is_h2 {
             http::serve_h2(replay, ctx).await?;
         } else {
@@ -256,16 +386,43 @@ impl Proxy {
     /// over the decrypted stream.
     async fn handle_tls_generic<S>(
         &self,
-        stream: S,
+        mut stream: S,
         prefix: Vec<u8>,
         conn: PassedConn,
         client_addr: String,
+        hint: ConnHint,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Scope, BEFORE anything else touches the connection: read the whole
+        // ClientHello here for its SNI, decide, and only then hand the bytes to
+        // MITM (which never dials the origin itself — the leaf is minted locally
+        // from the SNI / dst IP — but whose HTTP layer and passthrough fallback
+        // do) or to passthrough (which dials immediately).
+        let hello = mitm::read_client_hello(&mut stream, prefix).await?;
+        let sni = mitm::parse_sni(&hello);
+        if let Some(reason) = self.conn_block_reason(&conn, sni.as_deref(), &hint) {
+            // A fatal `access_denied` alert, so the client fails fast with a
+            // meaningful error instead of waiting on a silent socket.
+            let _ = stream.write_all(&mitm::ACCESS_DENIED_ALERT).await;
+            let _ = stream.shutdown().await;
+            // Recorded as `tls-passthru` (no bytes were decrypted: the closest
+            // existing protocol), so the reason says plainly that the TLS
+            // connection was refused before any handshake or MITM.
+            self.record_blocked_conn(
+                &conn,
+                client_addr,
+                sni,
+                burpwn_store::model::Protocol::TlsPassthru,
+                "https",
+                format!("{TLS_REFUSED_PREFIX}{reason}"),
+            )
+            .await;
+            return Ok(());
+        }
         let outcome =
-            match mitm::try_mitm(stream, prefix, conn.dst_ip, &self.leaves, &self.pinned).await {
+            match mitm::try_mitm(stream, hello, conn.dst_ip, &self.leaves, &self.pinned).await {
                 Ok(o) => o,
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
                     // Client rejected our leaf; host now pinned for the next
@@ -291,6 +448,9 @@ impl Proxy {
                     intercept: self.intercept.clone(),
                     rules: self.rules(),
                     hooks: self.hooks.clone(),
+                    scope: self.scope.clone(),
+                    resolved_name: hint.resolved_name.clone(),
+                    preblocked: None,
                     workspace_id,
                     exec_id,
                     client_addr,
@@ -392,7 +552,8 @@ impl Proxy {
             std_sock.set_nonblocking(true)?;
             let sock = tokio::net::UdpSocket::from_std(std_sock)?;
             let (ws, exec) = self.flow_attr(&conn);
-            let cfg = crate::dns::DnsConfig::from_host(ws, exec, self.hooks.clone());
+            let cfg =
+                crate::dns::DnsConfig::from_host(ws, exec, self.hooks.clone(), self.scope.clone());
             return crate::dns::serve_socket(sock, cfg, self.writer.clone())
                 .await
                 .map_err(Into::into);
@@ -510,9 +671,9 @@ impl Proxy {
                 }
             }
         };
-        let addr = match resolve_first(&host, port).await {
-            Some(a) => a,
-            None => return bad_gateway("burpwn: dns failure"),
+        let (addr, hint) = match self.explicit_resolve(&host, port).await {
+            Ok(v) => v,
+            Err(()) => return bad_gateway("burpwn: dns failure"),
         };
         let conn = PassedConn {
             dst_ip: addr.ip(),
@@ -521,8 +682,37 @@ impl Proxy {
             workspace_id: self.workspace_id,
             exec_id: String::new(), // explicit proxy: fall back to daemon defaults
         };
-        let ctx = self.cleartext_ctx(&conn, client_addr);
+        let ctx = self.cleartext_ctx(&conn, client_addr, hint);
         crate::http::handle_explicit(req, ctx).await
+    }
+
+    /// Resolve an explicit-proxy target, scope FIRST: a name the scope refuses
+    /// is not looked up at all (the lookup would itself be a packet about an
+    /// out-of-scope destination). A refused name yields the unspecified address
+    /// plus a `preblocked` hint: the shared paths then record the flow blocked
+    /// and never dial anything. `Err` = the (allowed) name did not resolve.
+    async fn explicit_resolve(&self, host: &str, port: u16) -> Result<(SocketAddr, ConnHint), ()> {
+        let is_ip = host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
+        if !is_ip {
+            let v = self.scope.check_dns(self.workspace_id, host);
+            if let Some(reason) = v.blocked_reason() {
+                let unspecified =
+                    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+                return Ok((
+                    unspecified,
+                    ConnHint {
+                        resolved_name: Some(scope::normalize_name(host)),
+                        preblocked: Some(reason.to_string()),
+                    },
+                ));
+            }
+        }
+        let addr = resolve_first(host, port).await.ok_or(())?;
+        let hint = ConnHint {
+            resolved_name: (!is_ip).then(|| scope::normalize_name(host)),
+            preblocked: None,
+        };
+        Ok((addr, hint))
     }
 
     /// Handle a `CONNECT host:port` tunnel: answer `200`, then treat the tunneled
@@ -543,9 +733,10 @@ impl Proxy {
 
         let (host, port) =
             split_hostport(&target).ok_or_else(|| anyhow::anyhow!("malformed CONNECT target"))?;
-        let addr = resolve_first(&host, port)
+        let (addr, hint) = self
+            .explicit_resolve(&host, port)
             .await
-            .ok_or_else(|| anyhow::anyhow!("could not resolve {host}"))?;
+            .map_err(|()| anyhow::anyhow!("could not resolve {host}"))?;
         let conn = PassedConn {
             dst_ip: addr.ip(),
             dst_port: addr.port(),
@@ -558,30 +749,11 @@ impl Proxy {
         let (leftover, inner) = replay.into_parts();
         let mut combined = PrefixedStream::new(leftover, inner);
         let inner_prefix = classify::peek(&mut combined).await?;
-        match classify::classify(&inner_prefix) {
-            Class::Tls => {
-                // Pin the connect host as the SNI hint via the leaf generator;
-                // MITM works over any AsyncRead+Write, feed the wrapped stream.
-                self.handle_tls_generic(combined, inner_prefix, conn, peer.to_string())
-                    .await
-            }
-            Class::CleartextHttp => {
-                self.serve_cleartext(combined, inner_prefix, conn, peer.to_string())
-                    .await
-            }
-            Class::RawTcp => rawtcp::run(
-                combined,
-                inner_prefix,
-                conn.dst_ip,
-                conn.dst_port,
-                peer.to_string(),
-                &self.writer,
-                self.workspace_id,
-                self.exec_id.clone(),
-            )
+        // Same dispatch as the transparent path (TLS → MITM, cleartext, raw),
+        // scope checks included; the CONNECT host rides along as the name burpwn
+        // resolved.
+        self.dispatch_classified(combined, inner_prefix, conn, peer.to_string(), hint)
             .await
-            .map_err(Into::into),
-        }
     }
 
     // ---- DNS front-end ----------------------------------------------------
@@ -589,8 +761,12 @@ impl Proxy {
     /// Run the DNS decode/forward UDP server on `addr`, forwarding to the host's
     /// first resolver (or 1.1.1.1).
     pub async fn dns_listener(&self, addr: SocketAddr) -> anyhow::Result<()> {
-        let cfg =
-            dns::DnsConfig::from_host(self.workspace_id, self.exec_id.clone(), self.hooks.clone());
+        let cfg = dns::DnsConfig::from_host(
+            self.workspace_id,
+            self.exec_id.clone(),
+            self.hooks.clone(),
+            self.scope.clone(),
+        );
         dns::serve(addr, cfg, self.writer.clone()).await?;
         Ok(())
     }
