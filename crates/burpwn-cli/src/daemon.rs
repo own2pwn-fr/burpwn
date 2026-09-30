@@ -99,6 +99,7 @@ impl ControlState {
     /// Used by the connection handler *after* the `Pending` response has been
     /// written, so a client disconnect mid-long-poll never orphans the entry
     /// (see [`handle_connection`]).
+    #[allow(clippy::result_large_err)] // `Err` hands the caller's own value back, it is not an error to propagate
     async fn park_if_enabled(&self, p: PendingIntercept) -> Result<(), PendingIntercept> {
         let mut parked = self.parked.lock().await;
         if !self.intercept.is_enabled() {
